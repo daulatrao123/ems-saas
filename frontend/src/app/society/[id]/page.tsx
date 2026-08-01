@@ -34,7 +34,7 @@ export default function SocietyDetail() {
   const [settingResetDay, setSettingResetDay] = useState(false);
   const eventsEndRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => { const role = localStorage.getItem("role"); if (role !== "super_admin" && role !== "society_admin") router.push("/login"); }, [router]);
+  useEffect(() => { const role = localStorage.getItem("role"); if (!role || (role !== "super_admin" && role !== "society_admin" && role !== "member")) router.push("/login"); const isAdmin = role === "super_admin" || role === "society_admin"; }, [router]);
 
   const fetchSociety = useCallback(async () => { try { const res = await api.get("/api/super-admin/societies"); setSociety(res.data.find((s: any) => s.id === societyId) || null); } catch {} }, [societyId]);
   const fetchPiState = useCallback(async () => { if (!societyId) return; try { const res = await api.get("/api/admin/pi-state?society_id=" + societyId); setPiState(res.data.connected ? res.data : null); } catch { setPiState(null); } }, [societyId]);
