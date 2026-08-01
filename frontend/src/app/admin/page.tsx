@@ -31,7 +31,7 @@ export default function AdminDashboard() {
   const [wingDisplayNames, setWingDisplayNames] = useState<Record<string, string>>({});
   const eventsEndRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => { const _r = localStorage.getItem("role"); if (_r === "member") { router.push("/member"); return; } if (_r !== "society_admin" && _r !== "super_admin") { router.push("/login"); return; } }, [router]);
+  const _r = typeof window !== "undefined" ? localStorage.getItem("role") : "";`n  useEffect(() => { if (_r === "member") { router.push("/member"); return; } if (_r !== "society_admin" && _r !== "super_admin") { router.push("/login"); return; } }, [router]);
 
   const societyId = typeof window !== "undefined" ? (() => { try { const t = localStorage.getItem("token") || ""; if (t && t.includes(".")) return JSON.parse(atob(t.split(".")[1])).society_id || ""; return JSON.parse(t).society_id || ""; } catch(e) { return ""; } })() : "";
 
