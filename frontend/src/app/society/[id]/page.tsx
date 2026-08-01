@@ -48,7 +48,7 @@ export default function SocietyDetail() {
   const sendCmd = async (command: string, wing: string = "", label: string = "", params: Record<string, any> = {}) => {
     setCmdLoading(command); setRespLabel(label || command); setRespBody("Queuing..."); setRespOk(true);
     try {
-      const res = await api.post("/api/admin/pi-command", { society_id: societyId, command, wing });
+      const res = await api.post("/api/admin/pi-command", { society_id: societyId, command, wing, params });
       if (res.data.success) { setRespBody("Command queued. Pi executes within 30s."); setRespOk(true); setTimeout(fetchPiState, 5000); }
       else { setRespBody("Failed: " + (res.data.message || "Unknown")); setRespOk(false); }
     } catch (e: any) { setRespBody("Error: " + (e.message || "Network error")); setRespOk(false); }
