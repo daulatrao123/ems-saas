@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api";
@@ -33,7 +33,7 @@ export default function AdminDashboard() {
 
   useEffect(() => { if (localStorage.getItem("role") !== "society_admin") { router.push("/login"); return; } }, [router]);
 
-  const societyId = typeof window !== "undefined" ? (JSON.parse(localStorage.getItem("token") || "{}").society_id || "") : "";
+  const societyId = typeof window !== "undefined" ? (() => { try { const t = localStorage.getItem("token") || ""; if (t && t.includes(".")) return JSON.parse(atob(t.split(".")[1])).society_id || ""; return JSON.parse(t).society_id || ""; } catch(e) { return ""; } })() : "";
 
   useEffect(() => {
     const saved = localStorage.getItem("socDisplayName_" + societyId);

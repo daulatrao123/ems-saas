@@ -17,7 +17,7 @@ export default function MemberDashboard() {
 
   useEffect(() => { if (localStorage.getItem("role") !== "member") router.push("/login"); }, [router]);
 
-  const societyId = typeof window !== "undefined" ? (JSON.parse(localStorage.getItem("token") || "{}").society_id || "") : "";
+  const societyId = typeof window !== "undefined" ? (() => { try { const t = localStorage.getItem("token") || ""; if (t && t.includes(".")) return JSON.parse(atob(t.split(".")[1])).society_id || ""; return JSON.parse(t).society_id || ""; } catch(e) { return ""; } })() : "";
 
   const fetchPiState = useCallback(async () => {
     if (!societyId) return;
