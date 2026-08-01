@@ -126,7 +126,7 @@ export default function AdminDashboard() {
 
   return (
     <div className="flex h-screen overflow-hidden">
-      <Sidebar role="society_admin" />
+      <Sidebar role={_r || "society_admin"} />
       <main className="flex-1 overflow-y-auto p-6 pt-20" style={{ background: "#0a0e17" }}>
         <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
           <div className="flex items-center gap-3">
