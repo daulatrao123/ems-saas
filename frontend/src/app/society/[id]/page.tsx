@@ -90,6 +90,7 @@ export default function SocietyDetail() {
   const isOnline = piState && (Date.now() - new Date(piState.last_sync).getTime()) < 360000;
   const uptime = piState ? Math.floor(piState.uptime_seconds / 3600) + "h " + Math.floor((piState.uptime_seconds % 3600) / 60) + "m" : "--";
   const sinceSync = piState ? Math.floor((Date.now() - new Date(piState.last_sync).getTime()) / 1000) + "s ago" : "--";
+  const nextResetDate = piState ? (() => { const d = new Date(); let m = d.getMonth(), y = d.getFullYear(); if (d.getDate() >= piState.reset_day) { m++; if (m > 11) { m = 0; y++; } } return new Date(y, m, piState.reset_day).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }); })() : "--";
   const role = typeof window !== "undefined" ? localStorage.getItem("role") : "";
   const isSuperAdmin = role === "super_admin";
   const resetDayLocked = piState?.reset_day_lock_until ? new Date(piState.reset_day_lock_until) > new Date() : false;
@@ -158,11 +159,12 @@ export default function SocietyDetail() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2 mb-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 mb-4">
           {[
             { label: "Active Wing", value: activeWing || "--", color: "text-cyan-400" },
             { label: "Wings", value: String(wings.length), color: "text-emerald-400" },
             { label: "Reset Day", value: piState ? piState.reset_day + "th" : "--", color: "text-amber-400" },
+            { label: "Next Reset", value: nextResetDate, color: "text-pink-400" },
             { label: "CPU Temp", value: piState ? piState.cpu_temp + "\u00B0C" : "--", color: piState && piState.cpu_temp > 70 ? "text-red-400" : "text-purple-400" },
             { label: "Uptime", value: uptime, color: "text-blue-400" },
             { label: "Boots", value: piState ? String(piState.boot_count) : "--", color: "text-orange-400" },
