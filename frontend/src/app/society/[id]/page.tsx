@@ -143,7 +143,7 @@ export default function SocietyDetail() {
   return (
     <div className="flex h-screen overflow-hidden">
       <Sidebar role="super_admin" />
-      <main className="flex-1 overflow-y-auto p-6 md:ml-64" style={{ background: "#0a0e17" }}>
+      <main className="flex-1 overflow-y-auto p-6 mt-10" style={{ background: "#0a0e17" }}>
         <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
           <div className="flex items-center gap-3">
             <button onClick={() => router.push("/super-admin")} className="px-3 py-2 border border-gray-700 text-gray-400 text-xs rounded-lg hover:border-cyan-500 hover:text-cyan-400">&#8592; Back</button>
@@ -158,7 +158,7 @@ export default function SocietyDetail() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 mb-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2 mb-4">
           {[
             { label: "Active Wing", value: activeWing || "--", color: "text-cyan-400" },
             { label: "Wings", value: String(wings.length), color: "text-emerald-400" },
