@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from passlib.context import CryptContext
+import bcrypt
 from jose import JWTError, jwt
 from datetime import datetime, timezone, timedelta
 
@@ -36,7 +36,6 @@ def get_db():
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
 SECRET_KEY = os.getenv("SECRET_KEY", "ems_super_secret_2026")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 _keepalive_ts = time.time()
 
 def load_db():
@@ -114,7 +113,7 @@ def seed_db():
     db = load_db()
     if not any(u.get("role") == "super_admin" for u in db["users"]):
         db["users"].extend([
-            {"id": next_id(db["users"]), "email": "admin@ems.com", "name": "Super Admin", "password": pwd_context.hash("admin123"), "role": "super_admin", "society_id": None},
+            {"id": next_id(db["users"]), "email": "admin@ems.com", "name": "Super Admin", "password": bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8"), "role": "super_admin", "society_id": None},
         ])
         save_db(db)
 
