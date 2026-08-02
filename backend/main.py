@@ -1,8 +1,6 @@
 import os, json, time
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,17 +20,6 @@ def get_db():
         conn.autocommit = True
         return conn
     except: return None
-
-
-NEON_DB_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_WRC1zyOo8IKX@ep-hidden-shadow-az9k7nq9.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
-
-def get_db():
-    try:
-        conn = psycopg2.connect(NEON_DB_URL)
-        conn.autocommit = True
-        return conn
-    except: return None
-
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
 SECRET_KEY = os.getenv("SECRET_KEY", "ems_super_secret_2026")
@@ -117,7 +104,6 @@ def seed_db():
         ])
         save_db(db)
 
-    # Migration: normalize pi_state/pi_events/pi_commands keys to int
     for nk in ["pi_state", "pi_events", "pi_commands"]:
         if nk in db and db[nk]:
             rebuilt = {int(k): v for k, v in db[nk].items()}
@@ -134,7 +120,7 @@ async def auto_seed():
 def login(user: UserLogin):
     db = load_db()
     db_user = next((u for u in db["users"] if u["email"] == user.email), None)
-    if not db_user or not pwd_context.verify(user.password, db_user["password"]):
+    if not db_user or not bcrypt.checkpw(user.password.encode("utf-8"), db_user["password"].encode("utf-8")):
         raise HTTPException(status_code=400, detail="Invalid credentials")
     token = create_token({"id": db_user["id"], "role": db_user["role"], "society_id": db_user.get("society_id")})
     return {"token": token, "role": db_user["role"], "name": db_user["name"], "society_id": db_user.get("society_id")}
@@ -220,13 +206,13 @@ def save_user(data: dict):
     if uid:
         for u in db["users"]:
             if u["id"] == uid:
-                if data.get("password"): u["password"] = pwd_context.hash(data["password"])
+                if data.get("password"): u["password"] = bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
                 for k in ["email", "name", "role", "society_id"]:
                     if k in data and k != "password": u[k] = data[k]
                 break
     else:
         if not data.get("password"): raise HTTPException(400, "Password required")
-        user = {"id": next_id(db["users"]), "email": data["email"], "name": data["name"], "role": data["role"], "society_id": data.get("society_id") or None, "password": pwd_context.hash(data["password"])}
+        user = {"id": next_id(db["users"]), "email": data["email"], "name": data["name"], "role": data["role"], "society_id": data.get("society_id") or None, "password": bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")}
         db["users"].append(user)
     save_db(db)
     return {"message": "Saved"}
