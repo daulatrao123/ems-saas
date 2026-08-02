@@ -26,17 +26,32 @@ SECRET_KEY = os.getenv("SECRET_KEY", "ems_super_secret_2026")
 _keepalive_ts = time.time()
 
 def load_db():
+    default = {"users": [], "societies": [], "pi_state": {}, "pi_events": {}, "pi_commands": [], "firmware_versions": []}
+    conn = get_db()
+    if conn:
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT key, data FROM saas_data")
+                rows = cur.fetchall()
+                db = default.copy()
+                for row in rows:
+                    val = row["data"]
+                    if row["key"] in ["pi_state", "pi_events", "pi_commands"] and val:
+                        val = {int(k): v for k, v in val.items()}
+                    db[row["key"]] = val
+                return db
+        except Exception as e:
+            print(f"NEON LOAD ERROR: {e}")
+        finally:
+            conn.close()
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
-            try:
-                db = json.load(f)
-            except:
-                return {"users": [], "societies": [], "pi_state": {}, "pi_events": {}, "pi_commands": [], "firmware_versions": []}
+            try: db = json.load(f)
+            except: return default
             for nk in ["pi_state", "pi_events", "pi_commands"]:
-                if nk in db and db[nk]:
-                    db[nk] = {int(k): v for k, v in db[nk].items()}
+                if nk in db and db[nk]: db[nk] = {int(k): v for k, v in db[nk].items()}
             return db
-    return {"users": [], "societies": [], "pi_state": {}, "pi_events": {}, "pi_commands": {}, "firmware_versions": []}
+    return default
 
 def save_db(data):
     conn = get_db()
