@@ -484,4 +484,19 @@ def member_dashboard(user: dict = Depends(get_current_user)):
         wings_data[wid] = {"used_days": w.get("used_days", 0), "target_days": w.get("target_days", 0), "name": w.get("name", wid), "display_name": w.get("display_name", ""), "clicks": w.get("clicks", 0)}
     return {"connected": True, "active_wing": pi.get("active_wing"), "wings": wings_data, "reset_day": pi.get("reset_day", 22), "firmware_version": pi.get("firmware_version", "?"), "cpu_temp": pi.get("cpu_temp", 0), "uptime_seconds": pi.get("uptime_seconds", 0), "last_sync": pi.get("last_sync")}
 
-)
+
+
+@app.get("/api/member/events")
+def member_events(since: int = 0, user: dict = Depends(get_current_user)):
+    if user.get("role") != "member":
+        raise HTTPException(status_code=403, detail="Members only")
+    sid = user.get("society_id")
+    if not sid:
+        raise HTTPException(status_code=400, detail="No society assigned")
+    db = load_db()
+    events = db.get("pi_events", {}).get(int(sid), [])
+    return {"events": events[since:], "total": len(events), "next": len(events)}
+
+@app.get("/api/member/status")
+def member_status(user: dict = Depends(get_current_user)):
+    raise HTTPException(status_code=404, detail="Not found")
