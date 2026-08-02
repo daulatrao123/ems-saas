@@ -416,4 +416,4 @@ def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_a
 
 @app.get("/api/member/status")
 def member_status(user: dict = Depends(get_current_user)):
-    raise HTTPException(status_code=404, detail="Not found") 
+    raise HTTPException(status_code=404, detail="Not found")# force update 
