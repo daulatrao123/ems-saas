@@ -464,6 +464,24 @@ def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_a
         wings_data[wid] = {"used_days": w.get("used_days", 0), "target_days": w.get("target_days", 0), "status": "ACTIVE" if pi.get("active_wing") == wid else "IDLE", "name": w.get("name", wid), "display_name": w.get("display_name", ""), "disabled": w.get("disabled", False), "physical_toggle": w.get("physical_toggle", "UNKNOWN"), "clicks": w.get("clicks", 0)}
     return {"connected": True, "active_wing": pi.get("active_wing"), "reset_day": pi.get("reset_day", 22), "quota_lock_until": pi.get("quota_lock_until", ""), "reset_day_lock_until": pi.get("reset_day_lock_until", ""), "wings": wings_data, "emergency_stop": pi.get("emergency_stop", False), "watchdog_enabled": pi.get("watchdog_enabled", False), "last_reboot_reason": pi.get("last_reboot_reason", ""), "firmware_version": pi.get("firmware_version", "?")}
 
-@app.get("/api/member/status")
-def member_status(user: dict = Depends(get_current_user)):
-    raise HTTPException(status_code=404, detail="Not found")
+
+
+@app.get("/api/member/dashboard")
+def member_dashboard(user: dict = Depends(get_current_user)):
+    if user.get("role") != "member":
+        raise HTTPException(status_code=403, detail="Members only")
+    sid = user.get("society_id")
+    if not sid:
+        raise HTTPException(status_code=400, detail="No society assigned")
+    db = load_db()
+    pi = db.get("pi_state", {}).get(int(sid))
+    if not pi:
+        return {"connected": False}
+    wings_data = {}
+    for wid, w in pi.get("wings", {}).items():
+        if w.get("target_days", 0) == 0:
+            continue
+        wings_data[wid] = {"used_days": w.get("used_days", 0), "target_days": w.get("target_days", 0), "name": w.get("name", wid), "display_name": w.get("display_name", ""), "clicks": w.get("clicks", 0)}
+    return {"connected": True, "active_wing": pi.get("active_wing"), "wings": wings_data, "reset_day": pi.get("reset_day", 22), "firmware_version": pi.get("firmware_version", "?"), "cpu_temp": pi.get("cpu_temp", 0), "uptime_seconds": pi.get("uptime_seconds", 0), "last_sync": pi.get("last_sync")}
+
+)

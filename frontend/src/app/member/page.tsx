@@ -21,12 +21,12 @@ export default function MemberDashboard() {
 
   const fetchPiState = useCallback(async () => {
     if (!societyId) return;
-    try { const res = await api.get("/api/admin/pi-state?society_id=" + societyId); if (res.data.connected) setPiState(res.data); } catch {}
+    try { const res = await api.get("/api/member/dashboard"); if (res.data.connected) setPiState(res.data); } catch {}
   }, [societyId]);
 
   const fetchEvents = useCallback(async () => {
     if (!societyId) return;
-    try { const res = await api.get("/api/admin/pi-events?society_id=" + societyId + "&since=" + eventSince); if (res.data.events.length > 0) { setEvents((prev) => [...prev, ...res.data.events]); setEventSince(res.data.next); } } catch {}
+    try { const res = await api.get("/api/member/events?since=" + eventSince); if (res.data.events.length > 0) { setEvents((prev) => [...prev, ...res.data.events]); setEventSince(res.data.next); } } catch {}
   }, [societyId, eventSince]);
 
   useEffect(() => { fetchPiState(); fetchEvents(); setLoading(false); }, [fetchPiState, fetchEvents]);

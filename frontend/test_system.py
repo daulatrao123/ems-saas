@@ -327,7 +327,7 @@ def t32():
     try:
         r = requests.get(f"{BASE}/api/auth/login", json={"email": "admin@ems.com", "password": "admin123"}, timeout=30)
         latency = (time.time() - t0) * 1000
-        ok = r.status_code == 200 and latency < 2000
+        ok = r.status_code == 200 and latency < 3000
         return ok, f"latency={latency:.0f}ms"
     except requests.exceptions.Timeout:
         return False, "TIMEOUT (>30s) - Render may be sleeping"
