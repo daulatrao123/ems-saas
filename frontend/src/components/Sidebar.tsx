@@ -6,18 +6,15 @@ import { usePathname } from "next/navigation";
 export default function Sidebar({ role }: { role: string }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
-
   useEffect(() => { setOpen(false); }, [pathname]);
-  useEffect(() => {
-    document.body.style.overflow = open ? "hidden" : "";
-    return () => { document.body.style.overflow = ""; };
-  }, [open]);
+  useEffect(() => { document.body.style.overflow = open ? "hidden" : ""; return () => { document.body.style.overflow = ""; }; }, [open]);
 
-  const superAdminLinks = [{ href: "/super-admin", label: "All Societies" }];
-  const adminLinks = [{ href: "/admin", label: "Pi Control" }];
+  const name = typeof window !== "undefined" ? localStorage.getItem("name") || "" : "";
+  const superAdminLinks = [{ href: "/super-admin", label: "All Societies", icon: "\uD83C\uDFE2" }];
+  const adminLinks = [{ href: "/admin", label: "Dashboard", icon: "\uD83D\uDCCA" }];
   const links = role === "super_admin" ? superAdminLinks : adminLinks;
-
   const close = () => setOpen(false);
+  const handleLogout = () => { localStorage.clear(); window.location.href = "/login"; };
 
   return (
     <>
@@ -26,29 +23,34 @@ export default function Sidebar({ role }: { role: string }) {
           <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
         </button>
         <h1 className="text-lg font-bold text-cyan-400">EMS Cloud</h1>
+        <div className="ml-auto flex items-center gap-3">
+          <span className="text-xs text-gray-500">{name}</span>
+          <span className="text-[9px] px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 font-semibold uppercase">{role === "super_admin" ? "Super Admin" : role === "society_admin" ? "Admin" : "Member"}</span>
+        </div>
       </div>
-
-      {open && <div className="fixed inset-0 bg-black/60 z-40" onClick={close} />}
-
-      <aside className={"fixed inset-y-0 left-0 z-50 w-64 bg-gray-950 border-r border-gray-800 flex flex-col transform transition-transform duration-200 ease-in-out " + (open ? "translate-x-0" : "-translate-x-full")}>
-        <div className="flex items-center justify-between p-6 border-b border-gray-800">
-          <div>
-            <h1 className="text-2xl font-bold text-cyan-400">EMS Cloud</h1>
-            <p className="text-xs text-gray-500 mt-1 uppercase tracking-wider">{role.replace("_", " ")}</p>
-          </div>
-          <button onClick={close} className="p-2 -mr-2 -mt-1 text-gray-500 hover:text-white hover:bg-gray-800 rounded-lg transition-colors">
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+      {open && <div className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm" onClick={close} />}
+      <div className={"fixed top-0 left-0 z-50 h-full w-64 bg-gray-950 border-r border-gray-800 transform transition-transform duration-300 " + (open ? "translate-x-0" : "-translate-x-full")}>
+        <div className="h-14 border-b border-gray-800 flex items-center px-4 gap-3">
+          <span className="text-xl">\u26A1</span>
+          <h1 className="text-lg font-bold text-cyan-400">EMS Cloud</h1>
+        </div>
+        <div className="p-4">
+          <div className="text-xs text-gray-500 uppercase tracking-wider mb-2">{role === "super_admin" ? "Super Admin" : "Society Admin"}</div>
+          {name && <div className="text-sm text-gray-300 mb-4">{name}</div>}
+          <nav className="space-y-1">
+            {links.map((link) => (
+              <Link key={link.href} href={link.href} onClick={close} className={"flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all " + (pathname === link.href ? "bg-cyan-500/10 text-cyan-400 border border-cyan-500/20" : "text-gray-400 hover:text-white hover:bg-gray-800/50")}>
+                <span>{link.icon}</span><span>{link.label}</span>
+              </Link>
+            ))}
+          </nav>
+        </div>
+        <div className="absolute bottom-0 left-0 right-0 p-4 border-t border-gray-800">
+          <button onClick={handleLogout} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-400 hover:text-red-400 hover:bg-red-500/5 transition-all">
+            <span>\uD83D\uDEAA</span><span>Logout</span>
           </button>
         </div>
-        <nav className="flex-1 p-4 space-y-2">
-          {links.map((link) => (
-            <Link key={link.href} href={link.href} onClick={close} className={pathname === link.href ? "block px-4 py-3 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/50" : "block px-4 py-3 rounded-lg text-gray-400 hover:bg-gray-800 hover:text-white"}>{link.label}</Link>
-          ))}
-        </nav>
-        <div className="p-4 border-t border-gray-800">
-          <button onClick={() => { localStorage.clear(); window.location.href = "/login"; }} className="w-full text-left px-4 py-3 text-red-400 hover:bg-red-500/10 rounded-lg">Logout</button>
-        </div>
-      </aside>
+      </div>
     </>
   );
 }
