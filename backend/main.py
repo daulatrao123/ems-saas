@@ -1,7 +1,7 @@
 import os, json, time
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -120,9 +120,10 @@ def require_role(*allowed_roles):
         return user
     return checker
 
-def require_society_match(society_id: str = ""):
-    async def checker(user: dict = Depends(require_role("super_admin", "society_admin"))):
-        if user["role"] != "super_admin" and str(user.get("society_id")) != str(society_id):
+def require_society_access(request: Request):
+    async def checker(user: dict = Depends(get_current_user)):
+        if user.get("role") not in ["super_admin", "society_admin"]: raise HTTPException(403, "Insufficient")
+        if user["role"] != "super_admin" and str(user.get("society_id")) != str(request.query_params.get("society_id")):
             raise HTTPException(status_code=403, detail="Cannot access other society data")
         return user
     return checker
@@ -359,7 +360,7 @@ def download_firmware(version: str, key: str = ""):
     return PlainTextResponse(fv["code"], media_type="text/plain")
 
 @app.post("/api/admin/pi-command")
-def queue_command(data: dict, user: dict = Depends(require_role("super_admin", "society_admin"))):
+def queue_command(data: dict, user: dict = Depends(get_current_user)):
     db = load_db()
     sid = int(data.get("society_id", 0))
     if user["role"] != "super_admin" and str(user.get("society_id")) != str(sid):
@@ -387,7 +388,7 @@ def queue_command(data: dict, user: dict = Depends(require_role("super_admin", "
     return {"success": True, "message": "Command queued", "command": cmd}
 
 @app.get("/api/admin/pi-state")
-def get_pi_state(society_id: str, user: dict = Depends(require_society_match)):
+def get_pi_state(society_id: str, user: dict = Depends(require_society_access)):
     db = load_db()
     state = db.get("pi_state", {}).get(int(society_id))
     if not state: return {"connected": False}
@@ -396,13 +397,13 @@ def get_pi_state(society_id: str, user: dict = Depends(require_society_match)):
     return {"connected": True, **state}
 
 @app.get("/api/admin/pi-events")
-def get_pi_events(society_id: str, since: int = 0, user: dict = Depends(require_society_match)):
+def get_pi_events(society_id: str, since: int = 0, user: dict = Depends(require_society_access)):
     db = load_db()
     events = db.get("pi_events", {}).get(int(society_id), [])
     return {"events": events[since:], "total": len(events), "next": len(events)}
 
 @app.get("/api/admin/dashboard")
-def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_match)):
+def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_access)):
     db = load_db()
     if not society_id: return {"error": "society_id required"}
     pi = db.get("pi_state", {}).get(int(society_id))
