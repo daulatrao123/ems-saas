@@ -1,4 +1,8 @@
 import os, json, time
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +13,26 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI(title="EMS SaaS API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+NEON_DB_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_WRC1zyOo8IKX@ep-hidden-shadow-az9k7nq9.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
+
+def get_db():
+    try:
+        conn = psycopg2.connect(NEON_DB_URL)
+        conn.autocommit = True
+        return conn
+    except: return None
+
+
+NEON_DB_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_WRC1zyOo8IKX@ep-hidden-shadow-az9k7nq9.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
+
+def get_db():
+    try:
+        conn = psycopg2.connect(NEON_DB_URL)
+        conn.autocommit = True
+        return conn
+    except: return None
+
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
 SECRET_KEY = os.getenv("SECRET_KEY", "ems_super_secret_2026")
@@ -29,6 +53,20 @@ def load_db():
     return {"users": [], "societies": [], "pi_state": {}, "pi_events": {}, "pi_commands": {}, "firmware_versions": []}
 
 def save_db(data):
+    conn = get_db()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                for key in ["users", "societies", "pi_state", "pi_events", "pi_commands", "firmware_versions"]:
+                    val = data.get(key, [])
+                    if key in ["pi_state", "pi_events", "pi_commands"] and val:
+                        val = {str(k): v for k, v in val.items()}
+                    cur.execute("INSERT INTO saas_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s, updated_at = NOW()", (key, json.dumps(val), json.dumps(val)))
+            return
+        except Exception as e:
+            print(f"NEON SAVE ERROR: {e}")
+        finally:
+            conn.close()
     with open(DB_FILE, "w") as f: json.dump(data, f, indent=2)
 
 def next_id(items):
