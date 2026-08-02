@@ -22,7 +22,8 @@ def get_db():
         conn = psycopg2.connect(NEON_DB_URL)
         conn.autocommit = True
         return conn
-    except: return None
+    except:
+        return None
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
 SECRET_KEY = os.getenv("SECRET_KEY", "ems_super_secret_2026")
@@ -54,10 +55,13 @@ def load_db():
             conn.close()
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
-            try: db = json.load(f)
-            except: return default
+            try:
+                db = json.load(f)
+            except:
+                return default
             for nk in ["pi_state", "pi_events", "pi_commands"]:
-                if nk in db and db[nk]: db[nk] = {int(k): v for k, v in db[nk].items()}
+                if nk in db and db[nk]:
+                    db[nk] = {int(k): v for k, v in db[nk].items()}
             _db_cache["data"] = db
             _db_cache["ts"] = now
             return db
@@ -80,15 +84,17 @@ def save_db(data):
             print(f"NEON SAVE ERROR: {e}")
         finally:
             conn.close()
-    with open(DB_FILE, "w") as f: json.dump(data, f, indent=2)
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 def next_id(items):
-    if not items: return "1"
+    if not items:
+        return "1"
     return str(max(int(x.get("id", "0")) for x in items) + 1)
 
 def create_token(data: dict):
     to_encode = data.copy()
-    to_encode.update({"exp": datetime.utcnow() + timedelta(days=30)})
+    to_encode.update({"exp": datetime.now(timezone.utc) + timedelta(days=30)})
     return jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
 
 def version_gt(v1, v2):
@@ -96,10 +102,13 @@ def version_gt(v1, v2):
         p1 = [int(x) for x in str(v1).split(".")]
         p2 = [int(x) for x in str(v2).split(".")]
         for a, b in zip(p1, p2):
-            if a > b: return True
-            if a < b: return False
+            if a > b:
+                return True
+            if a < b:
+                return False
         return len(p1) > len(p2)
-    except: return False
+    except:
+        return False
 
 class UserLogin(BaseModel):
     email: str
@@ -120,13 +129,18 @@ def require_role(*allowed_roles):
         return user
     return checker
 
-def require_society_access(request: Request):
-    async def checker(user: dict = Depends(get_current_user)):
-        if user.get("role") not in ["super_admin", "society_admin"]: raise HTTPException(403, "Insufficient")
-        if user["role"] != "super_admin" and str(user.get("society_id")) != str(request.query_params.get("society_id")):
-            raise HTTPException(status_code=403, detail="Cannot access other society data")
-        return user
-    return checker
+# FIXED: Direct dependency instead of broken factory pattern.
+# The old version was a factory that returned a function, but FastAPI
+# passed that function object as `user` — the auth checks never ran.
+async def require_society_access(
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
+    if user.get("role") not in ["super_admin", "society_admin"]:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    if user["role"] != "super_admin" and str(user.get("society_id")) != str(request.query_params.get("society_id")):
+        raise HTTPException(status_code=403, detail="Cannot access other society data")
+    return user
 
 @app.get("/keepalive")
 def keepalive():
@@ -155,11 +169,13 @@ def seed_db():
     if not any(u.get("email") == "admin@prestine.com" for u in db["users"]):
         db["users"].append({"id": next_id(db["users"]), "email": "admin@prestine.com", "name": "Prestine Admin", "role": "society_admin", "society_id": "1", "password": bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8")})
     if not any(u.get("email") == "member@prestine.com" for u in db["users"]):
-        db["users"].append({"id": next_id(db["users"]), "email": "member@prestine.com", "name": "Prestine Member", "role": "member", "society_id": "1", "password": bcrypt.hashpw(b"member123", bcrypt.gensalt()).decode("utf-8")})
-    if "pi_state" not in db: db["pi_state"] = {}
+        db["users"].append({"id": next_id(db["users"]), "email": "member@prestine.com", "name": "Prestine Member", "role": "member", "society_id": "1", "password": bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8")})
+    if "pi_state" not in db:
+        db["pi_state"] = {}
     if not db["pi_state"].get(1):
         db["pi_state"][1] = {"active_wing": "A", "wings": {"A": {"name": "A", "display_name": "Wing A", "used_days": 3, "target_days": 30, "clicks": 15, "disabled": False, "physical_toggle": True}, "B": {"name": "B", "display_name": "Wing B", "used_days": 3, "target_days": 30, "clicks": 22, "disabled": False, "physical_toggle": True}, "C": {"name": "C", "display_name": "Wing C", "used_days": 2, "target_days": 30, "clicks": 8, "disabled": False, "physical_toggle": False}}, "reset_day": 1, "emergency_stop": False, "firmware_version": "2.1.0", "uptime_seconds": 5094, "cpu_temp": 47.2, "disk_free_mb": 1024, "last_sync": datetime.now(timezone.utc).isoformat(), "boot_count": 42, "last_shutdown_reason": None, "clock_source": "ntp", "locked": False, "pending_start": False, "quota_lock_until": "", "reset_day_lock_until": "", "watchdog_enabled": True, "last_reboot_reason": "scheduled"}
-    if "pi_events" not in db: db["pi_events"] = {}
+    if "pi_events" not in db:
+        db["pi_events"] = {}
     if not db["pi_events"].get(1):
         now_iso = datetime.now(timezone.utc).isoformat()
         db["pi_events"][1] = [{"id": 1, "timestamp": now_iso, "type": "system", "message": "System started"}, {"id": 2, "timestamp": now_iso, "type": "sync", "message": "Data synced"}, {"id": 3, "timestamp": now_iso, "type": "click", "message": "Wing A clicked"}, {"id": 4, "timestamp": now_iso, "type": "system", "message": "Health check passed"}, {"id": 5, "timestamp": now_iso, "type": "sync", "message": "State updated"}]
@@ -195,7 +211,8 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
         wings = pi.get("wings", {}) if pi else {}
         wing_toggles = {}
         for wid, w in wings.items():
-            if w.get("target_days", 0) == 0: continue
+            if w.get("target_days", 0) == 0:
+                continue
             wing_toggles[wid] = {"name": w.get("name", wid), "used_days": w.get("used_days", 0), "target_days": w.get("target_days", 0), "clicks": w.get("clicks", 0), "disabled": w.get("disabled", False), "physical_toggle": w.get("physical_toggle", "UNKNOWN"), "display_name": w.get("display_name", "")}
         result.append({"id": s["id"], "name": s["name"], "location": s["location"], "plan": s["plan"], "status": s.get("status", "active"), "tailscale_ip": s.get("tailscale_ip", ""), "pi_port": s.get("pi_port", 5000), "api_key": s.get("api_key", ""), "society_code": s.get("society_code", ""), "pi_online": online, "last_sync": pi.get("last_sync") if pi else None, "active_wing": pi.get("active_wing") if pi else None, "emergency_stop": pi.get("emergency_stop", False) if pi else False, "firmware_version": pi.get("firmware_version", "?") if pi else None, "quota_lock_until": pi.get("quota_lock_until", "") if pi else "", "reset_day": pi.get("reset_day", 22) if pi else 22, "reset_day_lock_until": pi.get("reset_day_lock_until", "") if pi else "", "wings": wing_toggles, "watchdog_enabled": pi.get("watchdog_enabled", False) if pi else False, "last_reboot_reason": pi.get("last_reboot_reason", "") if pi else ""})
     return result
@@ -207,7 +224,9 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
     society = {"name": data.get("name", ""), "location": data.get("location", ""), "plan": data.get("plan", "Basic"), "status": "active", "tailscale_ip": data.get("tailscale_ip", ""), "pi_port": int(data.get("pi_port", 5000)), "api_key": data.get("api_key", ""), "society_code": data.get("society_code", "")}
     if sid:
         for s in db["societies"]:
-            if s["id"] == sid: s.update(society); break
+            if s["id"] == sid:
+                s.update(society)
+                break
     else:
         society["id"] = next_id(db["societies"])
         db["societies"].append(society)
@@ -241,12 +260,15 @@ def save_user(data: dict, user: dict = Depends(require_role("super_admin"))):
     if uid:
         for u in db["users"]:
             if u["id"] == uid:
-                if data.get("password"): u["password"] = bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+                if data.get("password"):
+                    u["password"] = bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
                 for k in ["email", "name", "role", "society_id"]:
-                    if k in data and k != "password": u[k] = data[k]
+                    if k in data and k != "password":
+                        u[k] = data[k]
                 break
     else:
-        if not data.get("password"): raise HTTPException(400, "Password required")
+        if not data.get("password"):
+            raise HTTPException(400, "Password required")
         new_user = {"id": next_id(db["users"]), "email": data["email"], "name": data["name"], "role": data["role"], "society_id": data.get("society_id") or None, "password": bcrypt.hashpw(data["password"].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")}
         db["users"].append(new_user)
     save_db(db)
@@ -263,7 +285,8 @@ def delete_user(data: dict, user: dict = Depends(require_role("super_admin"))):
 def get_firmware_versions(user: dict = Depends(require_role("super_admin"))):
     db = load_db()
     versions = db.get("firmware_versions", [])
-    for v in versions: v.pop("code", None)
+    for v in versions:
+        v.pop("code", None)
     return versions
 
 @app.post("/api/super-admin/firmware/save")
@@ -273,16 +296,22 @@ def save_firmware_version(data: dict, user: dict = Depends(require_role("super_a
     code = data.get("code", "")
     changelog = data.get("changelog", "")
     forced = data.get("forced", False)
-    if not version or not code: raise HTTPException(400, "Version and code required")
-    if "firmware_versions" not in db: db["firmware_versions"] = []
+    if not version or not code:
+        raise HTTPException(400, "Version and code required")
+    if "firmware_versions" not in db:
+        db["firmware_versions"] = []
     existing = next((v for v in db["firmware_versions"] if v["version"] == version), None)
     if existing:
-        existing["code"] = code; existing["changelog"] = changelog; existing["forced"] = forced; existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+        existing["code"] = code
+        existing["changelog"] = changelog
+        existing["forced"] = forced
+        existing["updated_at"] = datetime.now(timezone.utc).isoformat()
     else:
         db["firmware_versions"].insert(0, {"version": version, "code": code, "changelog": changelog, "forced": forced, "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()})
     if forced:
         for v in db["firmware_versions"]:
-            if v["version"] != version: v["forced"] = False
+            if v["version"] != version:
+                v["forced"] = False
     save_db(db)
     return {"message": "Saved"}
 
@@ -298,7 +327,8 @@ def delete_firmware_version(data: dict, user: dict = Depends(require_role("super
 def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))):
     db = load_db()
     version = data.get("version")
-    if "firmware_versions" not in db: db["firmware_versions"] = []
+    if "firmware_versions" not in db:
+        db["firmware_versions"] = []
     for v in db["firmware_versions"]:
         v["forced"] = (v["version"] == version)
     save_db(db)
@@ -320,23 +350,30 @@ def pi_sync(payload: dict):
         sid = int(society["id"])
     society["online"] = True
     society["last_seen"] = datetime.now(timezone.utc).isoformat()
-    if payload.get("key"): society["api_key"] = payload["key"]
+    if payload.get("key"):
+        society["api_key"] = payload["key"]
     wings = {}
     for wid, w in payload.get("wings", {}).items():
         wings[wid] = {"name": w.get("name", wid), "display_name": w.get("display_name", ""), "used_days": w.get("usedDays", 0), "target_days": w.get("targetDays", 0), "clicks": w.get("clicks", 0), "disabled": w.get("disabled", False), "physical_toggle": w.get("physicalToggle", "UNKNOWN")}
     pi_state = {"active_wing": payload.get("activeWing"), "wings": wings, "reset_day": payload.get("resetDay", 22), "emergency_stop": payload.get("emergencyStop", False), "firmware_version": payload.get("firmwareVersion", "?"), "uptime_seconds": payload.get("uptimeSeconds", 0), "cpu_temp": payload.get("cpuTemp", 0), "disk_free_mb": payload.get("diskFreeMB", 0), "last_sync": datetime.now(timezone.utc).isoformat(), "boot_count": payload.get("bootCount", 0), "last_shutdown_reason": payload.get("lastShutdownReason", ""), "clock_source": payload.get("clockSource", ""), "locked": payload.get("locked", False), "pending_start": payload.get("pendingStart", False), "quota_lock_until": payload.get("quota_lock_until", ""), "reset_day_lock_until": payload.get("reset_day_lock_until", ""), "watchdog_enabled": payload.get("watchdog_enabled", False), "last_reboot_reason": payload.get("last_reboot_reason", "")}
-    if "pi_state" not in db: db["pi_state"] = {}
+    if "pi_state" not in db:
+        db["pi_state"] = {}
     db["pi_state"][sid] = pi_state
-    if "pi_events" not in db: db["pi_events"] = {}
-    if sid not in db["pi_events"]: db["pi_events"][sid] = []
-    for ev in payload.get("events", []): db["pi_events"][sid].append(ev)
-    if len(db["pi_events"][sid]) > 500: db["pi_events"][sid] = db["pi_events"][sid][-500:]
+    if "pi_events" not in db:
+        db["pi_events"] = {}
+    if sid not in db["pi_events"]:
+        db["pi_events"][sid] = []
+    for ev in payload.get("events", []):
+        db["pi_events"][sid].append(ev)
+    if len(db["pi_events"][sid]) > 500:
+        db["pi_events"][sid] = db["pi_events"][sid][-500:]
     save_db(db)
     reply = {"success": True, "command": None}
     cmds = db.get("pi_commands", {})
     if sid in cmds and cmds[sid].get("command"):
         reply["command"] = cmds[sid]["command"]
-        if cmds[sid].get("wing"): reply["wing"] = cmds[sid]["wing"]
+        if cmds[sid].get("wing"):
+            reply["wing"] = cmds[sid]["wing"]
         reply["params"] = cmds[sid].get("params", {})
         cmds[sid] = {"command": None, "wing": None, "params": {}, "queued_at": None}
     fw_versions = db.get("firmware_versions", [])
@@ -354,9 +391,11 @@ def download_firmware(version: str, key: str = ""):
     db = load_db()
     if key:
         society = next((s for s in db["societies"] if s.get("api_key") == key), None)
-        if not society: raise HTTPException(403, "Invalid API key")
+        if not society:
+            raise HTTPException(403, "Invalid API key")
     fv = next((v for v in db.get("firmware_versions", []) if v["version"] == version), None)
-    if not fv: raise HTTPException(404, "Version not found")
+    if not fv:
+        raise HTTPException(404, "Version not found")
     return PlainTextResponse(fv["code"], media_type="text/plain")
 
 @app.post("/api/admin/pi-command")
@@ -375,14 +414,21 @@ def queue_command(data: dict, user: dict = Depends(get_current_user)):
             lock_until = datetime.fromisoformat(pi["quota_lock_until"])
             if datetime.now(timezone.utc) < lock_until:
                 raise HTTPException(400, f"Quota locked until {pi['quota_lock_until']}")
-        except: pass
+        except HTTPException:
+            raise
+        except:
+            pass
     if not skip_locks and cmd == "set_reset_day" and pi.get("reset_day_lock_until", ""):
         try:
             lock_until = datetime.fromisoformat(pi["reset_day_lock_until"])
             if datetime.now(timezone.utc) < lock_until:
                 raise HTTPException(400, f"Reset day locked until {pi['reset_day_lock_until']}")
-        except: pass
-    if "pi_commands" not in db: db["pi_commands"] = {}
+        except HTTPException:
+            raise
+        except:
+            pass
+    if "pi_commands" not in db:
+        db["pi_commands"] = {}
     db["pi_commands"][sid] = {"command": cmd, "wing": wing, "params": params, "queued_at": datetime.now(timezone.utc).isoformat()}
     save_db(db)
     return {"success": True, "message": "Command queued", "command": cmd}
@@ -391,7 +437,8 @@ def queue_command(data: dict, user: dict = Depends(get_current_user)):
 def get_pi_state(society_id: str, user: dict = Depends(require_society_access)):
     db = load_db()
     state = db.get("pi_state", {}).get(int(society_id))
-    if not state: return {"connected": False}
+    if not state:
+        return {"connected": False}
     filtered_wings = {wid: w for wid, w in state.get("wings", {}).items() if w.get("target_days", 0) > 0}
     state["wings"] = filtered_wings
     return {"connected": True, **state}
@@ -405,15 +452,18 @@ def get_pi_events(society_id: str, since: int = 0, user: dict = Depends(require_
 @app.get("/api/admin/dashboard")
 def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_access)):
     db = load_db()
-    if not society_id: return {"error": "society_id required"}
+    if not society_id:
+        return {"error": "society_id required"}
     pi = db.get("pi_state", {}).get(int(society_id))
-    if not pi: return {"connected": False}
+    if not pi:
+        return {"connected": False}
     wings_data = {}
     for wid, w in pi.get("wings", {}).items():
-        if w.get("target_days", 0) == 0: continue
+        if w.get("target_days", 0) == 0:
+            continue
         wings_data[wid] = {"used_days": w.get("used_days", 0), "target_days": w.get("target_days", 0), "status": "ACTIVE" if pi.get("active_wing") == wid else "IDLE", "name": w.get("name", wid), "display_name": w.get("display_name", ""), "disabled": w.get("disabled", False), "physical_toggle": w.get("physical_toggle", "UNKNOWN"), "clicks": w.get("clicks", 0)}
     return {"connected": True, "active_wing": pi.get("active_wing"), "reset_day": pi.get("reset_day", 22), "quota_lock_until": pi.get("quota_lock_until", ""), "reset_day_lock_until": pi.get("reset_day_lock_until", ""), "wings": wings_data, "emergency_stop": pi.get("emergency_stop", False), "watchdog_enabled": pi.get("watchdog_enabled", False), "last_reboot_reason": pi.get("last_reboot_reason", ""), "firmware_version": pi.get("firmware_version", "?")}
 
 @app.get("/api/member/status")
 def member_status(user: dict = Depends(get_current_user)):
-    raise HTTPException(status_code=404, detail="Not found")# force update 
+    raise HTTPException(status_code=404, detail="Not found")
