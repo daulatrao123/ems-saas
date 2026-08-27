@@ -848,10 +848,17 @@ def get_pi_state(society_id: str, user: dict = Depends(require_society_access)):
     filtered = {wid: w for wid, w in state.get("wings", {}).items() if wing_is_visible(w)}
     return {"connected": True, **{k: v for k, v in state.items() if k != "wings"}, "wings": filtered}
 
+def map_events(raw):
+    out = []
+    for e in raw:
+        if isinstance(e, dict) and e.get("message"):
+            out.append({"id": e.get("id",0), "ts": e.get("timestamp",""), "level": (e.get("type","") or "").upper(), "msg": e.get("message","")})
+    return out
+
 @app.get("/api/admin/pi-events")
 def get_pi_events(society_id: str, since: int = 0, user: dict = Depends(require_society_access)):
     db = load_db()
-    events = db.get("pi_events", {}).get(int(society_id), [])
+    events = map_events(db.get("pi_events", {}).get(int(society_id), []))
     return {"events": events[since:], "total": len(events), "next": len(events)}
 
 # ================================================================
@@ -900,5 +907,5 @@ def member_events(since: int = 0, user: dict = Depends(get_current_user)):
     if not sid:
         raise HTTPException(400, "No society assigned")
     db = load_db()
-    events = db.get("pi_events", {}).get(int(sid), [])
+    events = map_events(db.get("pi_events", {}).get(int(sid), []))
     return {"events": events[since:], "total": len(events), "next": len(events)}
