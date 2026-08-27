@@ -699,6 +699,7 @@ def pi_sync(payload: dict):
     }
 
     db.setdefault("pi_state", {})
+    pi_state["last_sync"] = datetime.now(timezone.utc).isoformat()
     db["pi_state"][sid] = pi_state
 
     db.setdefault("pi_events", {})
