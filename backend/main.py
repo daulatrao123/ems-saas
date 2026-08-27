@@ -13,7 +13,7 @@ import os
 import json
 import time
 import psycopg
-from psycopg.rows import RealDictCursor
+from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -130,7 +130,7 @@ def load_db() -> dict:
     conn = get_db()
     if conn:
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SELECT key, data FROM saas_data")
                 rows = cur.fetchall()
                 db = default.copy()
