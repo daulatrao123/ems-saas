@@ -714,7 +714,7 @@ def pi_sync(payload: dict):
     cmds = db.get("pi_commands", {}).get(sid, [])
     if isinstance(cmds, dict): cmds = [cmds]; db.setdefault("pi_commands", {}); db["pi_commands"][sid] = cmds
     for cmd in cmds:
-        if pc.get("status") == "pending":
+        if cmd.get("status") == "pending":
             reply["command"] = cmd["command"]
             reply["command_id"] = cmd["id"]
             if cmd.get("wing"): reply["wing"] = cmd["wing"]
