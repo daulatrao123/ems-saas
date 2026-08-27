@@ -36,13 +36,29 @@ ALLOWED_ORIGINS = [
 
 app = FastAPI(title="EMS SaaS API", version="3.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
-)
+# ================================================================
+# AUTO-CREATE TABLE ON STARTUP
+# ================================================================
+
+@app.on_event("startup")
+def ensure_db_schema():
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS saas_data (
+                    key   TEXT PRIMARY KEY,
+                    data  JSONB NOT NULL DEFAULT '{}',
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+        conn.close()
+        print("DB schema verified OK")
+    except Exception as e:
+        print(f"DB SCHEMA CHECK ERROR: {e}")
 
 # ================================================================
 # EXCEPTION HANDLERS — CORS on every error
@@ -73,6 +89,14 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
         content={"detail": "Internal server error"},
         headers=_cors_headers(request.headers.get("origin", "")),
     )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+)
 
 # ================================================================
 # CONFIG — secrets from env only
@@ -106,7 +130,7 @@ VALID_COMMANDS = {
 # ================================================================
 
 _db_cache = {"data": None, "ts": 0}
-DB_CACHE_TTL = 2
+DB_CACHE_TTL = 30
 INT_KEYS = ("pi_state", "pi_events", "pi_commands")
 
 def get_db():

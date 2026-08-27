@@ -34,22 +34,22 @@ export default function SocietyDetail() {
   const [settingResetDay, setSettingResetDay] = useState(false);
   const eventsEndRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => { const role = localStorage.getItem("role"); if (!role || (role !== "super_admin" && role !== "society_admin" && role !== "member")) router.push("/login"); const isAdmin = role === "super_admin" || role === "society_admin"; }, [router]);
+  useEffect(() => { const role = localStorage.getItem("role"); if (!role || (role !== "super_admin" && role !== "society_admin" && role !== "member")) router.push("/login"); }, [router]);
 
   const fetchSociety = useCallback(async () => { try { const res = await api.get("/api/super-admin/societies"); setSociety(res.data.find((s: any) => s.id === societyId) || null); } catch {} }, [societyId]);
   const fetchPiState = useCallback(async () => { if (!societyId) return; try { const res = await api.get("/api/admin/pi-state?society_id=" + societyId); setPiState(res.data.connected ? res.data : null); } catch { setPiState(null); } }, [societyId]);
   const fetchEvents = useCallback(async () => { if (!societyId) return; try { const res = await api.get("/api/admin/pi-events?society_id=" + societyId + "&since=" + eventSince); if (res.data.events.length > 0) { setEvents((p) => [...p, ...res.data.events]); setEventSince(res.data.next); } } catch {} }, [societyId, eventSince]);
 
   useEffect(() => { fetchSociety(); fetchPiState(); fetchEvents(); setLoading(false); }, [fetchSociety, fetchPiState, fetchEvents]);
-  useEffect(() => { const i = setInterval(fetchPiState, 10000); return () => clearInterval(i); }, [fetchPiState]);
-  useEffect(() => { const i = setInterval(fetchEvents, 10000); return () => clearInterval(i); }, [fetchEvents]);
+  useEffect(() => { const i = setInterval(fetchPiState, 20000); return () => clearInterval(i); }, [fetchPiState]);
+  useEffect(() => { const i = setInterval(fetchEvents, 25000); return () => clearInterval(i); }, [fetchEvents]);
   useEffect(() => { eventsEndRef.current && (eventsEndRef.current.scrollTop = eventsEndRef.current.scrollHeight); }, [events]);
 
   const sendCmd = async (command: string, wing: string = "", label: string = "", params: Record<string, any> = {}) => {
     setCmdLoading(command); setRespLabel(label || command); setRespBody("Queuing..."); setRespOk(true);
     try {
       const res = await api.post("/api/admin/pi-command", { society_id: societyId, command, wing, params });
-      if (res.data.success) { setRespBody("Command queued. Pi executes within 30s."); setRespOk(true); setTimeout(fetchPiState, 5000); }
+      if (res.data.success) { setRespBody("Command queued. Pi will execute on next sync."); setRespOk(true); setTimeout(fetchPiState, 8000); }
       else { setRespBody("Failed: " + (res.data.message || "Unknown")); setRespOk(false); }
     } catch (e: any) { setRespBody("Error: " + (e.message || "Network error")); setRespOk(false); }
     setCmdLoading(null);
@@ -87,14 +87,12 @@ export default function SocietyDetail() {
 
   const wings = piState ? Object.entries(piState.wings as Record<string, WingData>) : [];
   const activeWing = piState?.active_wing || null;
-  const isOnline = piState && (Date.now() - new Date(piState.last_sync).getTime()) < 360000;
+  const isOnline = piState && (Date.now() - new Date(piState.last_sync).getTime()) < 600000;
   const uptime = piState ? Math.floor(piState.uptime_seconds / 3600) + "h " + Math.floor((piState.uptime_seconds % 3600) / 60) + "m" : "--";
   const sinceSync = piState ? Math.floor((Date.now() - new Date(piState.last_sync).getTime()) / 1000) + "s ago" : "--";
   const nextResetDate = piState ? (() => { const d = new Date(); let m = d.getMonth(), y = d.getFullYear(); if (d.getDate() >= piState.reset_day) { m++; if (m > 11) { m = 0; y++; } } return new Date(y, m, piState.reset_day).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }); })() : "--";
   const role = typeof window !== "undefined" ? localStorage.getItem("role") : "";
   const isSuperAdmin = role === "super_admin";
-  const resetDayLocked = piState?.reset_day_lock_until ? new Date(piState.reset_day_lock_until) > new Date() : false;
-  const quotaLocked = piState?.quota_lock_until ? new Date(piState.quota_lock_until) > new Date() : false;
 
   const sendAllCalcDays = async () => {
     if (!isOnline || !societyId) return;
@@ -103,13 +101,10 @@ export default function SocietyDetail() {
     setRespBody("Sending...");
     setRespOk(true);
     try {
-      const wingsPayload: Record<string, number> = {};
-      for (const [w, d] of Object.entries(calcResult)) { if (d > 0) wingsPayload[w] = d; }
-      const params: Record<string, any> = { wings: wingsPayload, skip_locks: isSuperAdmin };
-      if (!isSuperAdmin) { params.lock_until = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(); }
-      const res = await api.post("/api/admin/pi-command", { society_id: societyId, command: "set_days", params });
-      if (res.data.success) { setRespBody("Sent " + Object.keys(wingsPayload).length + " wings. Pi will apply within 30s."); setRespOk(true); setTimeout(fetchPiState, 5000); }
-      else { setRespBody("Failed: " + (res.data.message || "Unknown")); setRespOk(false); }
+      for (const [w, d] of Object.entries(calcResult)) {
+        if (d > 0) await sendCmd("set_days", w, "Set Wing " + w + " to " + d + " days", { days: d });
+      }
+      setRespBody("Sent " + Object.keys(calcResult).filter((_, i) => calcResult[Object.keys(calcResult)[i]] > 0).length + " wing day settings.");
     } catch (e: any) { setRespBody("Error: " + (e.message || "Network error")); setRespOk(false); }
     setSendingDays(false);
   };
@@ -122,9 +117,8 @@ export default function SocietyDetail() {
     setRespBody("Queuing...");
     setRespOk(true);
     try {
-      const lockUntil = isSuperAdmin ? null : new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
-      const res = await api.post("/api/admin/pi-command", { society_id: societyId, command: "set_reset_day", params: { day, lock_until: lockUntil, skip_locks: isSuperAdmin } });
-      if (res.data.success) { setRespBody("Reset day set to " + day + "th." + (lockUntil ? " Locked 3 months until " + new Date(lockUntil).toLocaleDateString() + "." : "")); setRespOk(true); setTimeout(fetchPiState, 5000); }
+      const res = await api.post("/api/admin/pi-command", { society_id: societyId, command: "set_reset_day", params: { day } });
+      if (res.data.success) { setRespBody("Reset day set to " + day + "th. Pi will apply on next sync."); setRespOk(true); setTimeout(fetchPiState, 8000); }
       else { setRespBody("Failed: " + (res.data.message || "Unknown")); setRespOk(false); }
     } catch (e: any) { setRespBody("Error: " + (e.message || "Network error")); setRespOk(false); }
     setSettingResetDay(false);
@@ -133,9 +127,7 @@ export default function SocietyDetail() {
   const confirmResetDay = () => {
     const day = parseInt(resetDayInput);
     if (!day || day < 1 || day > 28) return;
-    let msg = "Set reset day to " + day + "th of every month?\n\nAll wings will reset to 0 days on this date.";
-    if (!isSuperAdmin) msg += "\n\nThis will be LOCKED for 3 months.";
-    if (!window.confirm(msg)) return;
+    if (!window.confirm("Set reset day to " + day + "th of every month?\n\nAll wings will reset to 0 days on this date.")) return;
     sendResetDay();
   };
 
@@ -143,7 +135,7 @@ export default function SocietyDetail() {
 
   return (
     <div className="flex h-screen overflow-hidden">
-      <Sidebar role="super_admin" />
+      <Sidebar role={isSuperAdmin ? "super_admin" : "society_admin"} />
       <main className="flex-1 overflow-y-auto p-6 mt-10" style={{ background: "#0a0e17" }}>
         <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
           <div className="flex items-center gap-3">
@@ -178,12 +170,9 @@ export default function SocietyDetail() {
         </div>
 
         {piState?.emergency_stop && (
-          <div className="bg-red-500/20 border border-red-500/50 rounded-xl p-4 mb-4 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <span className="text-2xl">&#9888;&#65039;</span>
-              <div><div className="text-red-400 font-bold text-sm">EMERGENCY STOP ACTIVE</div><div className="text-red-400/60 text-xs">All relays off.</div></div>
-            </div>
-            <button onClick={() => sendCmd("restart")} disabled={cmdLoading === "restart"} className="px-4 py-2 bg-emerald-500 text-black font-bold text-xs rounded-lg disabled:opacity-40">RESTART</button>
+          <div className="bg-red-500/20 border border-red-500/50 rounded-xl p-4 mb-4 flex items-center gap-3">
+            <span className="text-2xl">&#9888;&#65039;</span>
+            <div><div className="text-red-400 font-bold text-sm">EMERGENCY STOP ACTIVE (Hardware)</div><div className="text-red-400/60 text-xs">Physical E-Stop pressed. All relays off. Release the button to resume.</div></div>
           </div>
         )}
 
@@ -191,7 +180,7 @@ export default function SocietyDetail() {
           <div className="bg-gray-900/50 border border-gray-800 rounded-xl p-8 mb-4 text-center">
             <div className="text-4xl mb-3 opacity-30">&#128225;</div>
             <div className="text-gray-400 font-semibold mb-2">Waiting for Pi Connection</div>
-            <div className="text-gray-600 text-xs max-w-md mx-auto">Pi firmware v1.0.0+ must be running. Society Code: <code className="text-amber-400">{society?.society_code || societyId}</code> | API Key: <code className="text-amber-400">{society?.api_key ? society.api_key.slice(0, 7) + "..." : "Not set"}</code></div>
+            <div className="text-gray-600 text-xs max-w-md mx-auto">Pi must be running and syncing to this society. API Key: <code className="text-amber-400">{society?.api_key ? society.api_key.slice(0, 7) + "..." : "Not set — edit society to add"}</code></div>
           </div>
         )}
 
@@ -222,8 +211,8 @@ export default function SocietyDetail() {
                       </div>
                     </div>
                     <div className="flex gap-2 mb-2">
-                      <button onClick={() => { if (window.confirm("Switch to Wing " + id + "?\n\nActive relay will change.")) sendCmd("switch", id, "Switch to " + id); }} disabled={cmdLoading !== null || !isOnline || piState?.emergency_stop} className="flex-1 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-black text-[10px] font-bold rounded disabled:opacity-30">SWITCH TO</button>
-                      <button onClick={() => { if (window.confirm("Turn OFF all wings?\n\nAll relays will be de-energized.")) sendCmd("off_all", "", "Turn off"); }} disabled={cmdLoading !== null || !isOnline || !isActive || piState?.emergency_stop} className="flex-1 py-1.5 bg-red-500 hover:bg-red-600 text-white text-[10px] font-bold rounded disabled:opacity-30">TURN OFF</button>
+                      <button onClick={() => { if (window.confirm("Switch to Wing " + id + "?")) sendCmd("set_active_wing", id, "Switch to " + id); }} disabled={cmdLoading !== null || !isOnline || piState?.emergency_stop} className="flex-1 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-black text-[10px] font-bold rounded disabled:opacity-30">SWITCH TO</button>
+                      <button onClick={() => { if (window.confirm("Turn OFF Wing " + id + "?")) sendCmd("off_wing", id, "Turn off " + id); }} disabled={cmdLoading !== null || !isOnline || piState?.emergency_stop} className="flex-1 py-1.5 bg-red-500 hover:bg-red-600 text-white text-[10px] font-bold rounded disabled:opacity-30">TURN OFF</button>
                     </div>
                     <div className="flex justify-between text-[10px] mb-1">
                       <span className="text-gray-500">Days: {w.used_days} / {w.target_days}</span>
@@ -251,9 +240,9 @@ export default function SocietyDetail() {
               <div className="px-4 py-3 border-b border-gray-800 bg-gray-800/50"><h2 className="text-xs font-semibold text-gray-300">&#9881; System Controls</h2></div>
               <div className="p-4 grid grid-cols-2 gap-2">
                 {[
-                  { label: "Reset Days", cmd: "reset", icon: "&#128260;", danger: false },
+                  { label: "Reset Days", cmd: "reset_days", icon: "&#128260;", danger: false },
                   { label: "OFF All", cmd: "off_all", icon: "&#128465;", danger: true },
-                  { label: "Restart", cmd: "restart", icon: "&#128260;", danger: false },
+                  { label: "Restart EMS", cmd: "restart", icon: "&#128260;", danger: false },
                   { label: "Reboot Pi", cmd: "reboot", icon: "&#128260;", danger: true },
                 ].map((b) => (
                   <button key={b.cmd} onClick={() => { if (window.confirm(b.danger ? "⚠️ " + b.label + "\n\nThis affects the EMS system." : b.label + "?")) sendCmd(b.cmd, "", b.label); }} disabled={cmdLoading !== null || !isOnline} className={"p-2 rounded-lg border text-[9px] font-semibold flex flex-col items-center gap-1 transition-all disabled:opacity-30 " + (b.danger ? "border-gray-800 text-gray-400 hover:border-red-500 hover:text-red-400 hover:bg-red-500/5" : "border-gray-800 text-gray-400 hover:border-cyan-500 hover:text-cyan-400 hover:bg-cyan-500/5")}>
@@ -275,22 +264,19 @@ export default function SocietyDetail() {
                   <input type="number" className="w-14 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-center text-gray-200 focus:outline-none focus:border-cyan-500" value={lcdTime} onChange={(e) => setLcdTime(e.target.value)} min="1" max="300" />
                 </div>
                 <div className="flex gap-2">
-                  <button onClick={() => { if (!lcd1 && !lcd2) return; if (window.confirm("Send to LCD display?\nLine 1: " + lcd1 + "\nLine 2: " + lcd2)) sendCmd("lcd", "", "LCD: " + lcd1 + " | " + lcd2, { line1: lcd1, line2: lcd2 }); }} disabled={cmdLoading !== null || !isOnline || (!lcd1 && !lcd2)} className="flex-1 py-1.5 bg-cyan-500 text-black text-[10px] font-bold rounded disabled:opacity-30">SEND</button>
+                  <button onClick={() => { if (!lcd1 && !lcd2) return; sendCmd("lcd_display", "", "LCD: " + lcd1 + " | " + lcd2, { line1: lcd1, line2: lcd2, duration: parseInt(lcdTime) || 10 }); }} disabled={cmdLoading !== null || !isOnline || (!lcd1 && !lcd2)} className="flex-1 py-1.5 bg-cyan-500 text-black text-[10px] font-bold rounded disabled:opacity-30">SEND</button>
                   <button onClick={() => { setLcd1(""); setLcd2(""); }} className="px-3 py-1.5 border border-gray-700 text-gray-500 text-[10px] rounded hover:border-red-500 hover:text-red-400">CLEAR</button>
                 </div>
               </div>
             </div>
 
             <div className="bg-gray-900/80 border border-gray-800 rounded-xl overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-800 bg-gray-800/50 flex items-center justify-between">
-                <h2 className="text-xs font-semibold text-gray-300">&#128197; Set Reset Date</h2>
-                {resetDayLocked && !isSuperAdmin && <span className="text-[9px] text-amber-400">Locked until {piState?.reset_day_lock_until ? new Date(piState.reset_day_lock_until).toLocaleDateString() : "--"}</span>}
-              </div>
+              <div className="px-4 py-3 border-b border-gray-800 bg-gray-800/50"><h2 className="text-xs font-semibold text-gray-300">&#128197; Set Reset Date</h2></div>
               <div className="p-4">
                 <div className="flex gap-2 items-center">
                   <span className="text-[10px] text-gray-500">Day (1-28):</span>
-                  <input type="number" className="w-16 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-center text-gray-200 focus:outline-none focus:border-cyan-500" value={resetDayInput} onChange={(e) => setResetDayInput(e.target.value)} min="1" max="28" disabled={resetDayLocked && !isSuperAdmin} />
-                  <button onClick={confirmResetDay} disabled={settingResetDay || !isOnline || cmdLoading !== null || (resetDayLocked && !isSuperAdmin)} className="px-4 py-1.5 bg-amber-500/20 border border-amber-500/30 text-amber-400 text-[10px] font-bold rounded hover:bg-amber-500/30 disabled:opacity-30">{settingResetDay ? "Setting..." : "SET"}</button>
+                  <input type="number" className="w-16 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-center text-gray-200 focus:outline-none focus:border-cyan-500" value={resetDayInput} onChange={(e) => setResetDayInput(e.target.value)} min="1" max="28" />
+                  <button onClick={confirmResetDay} disabled={settingResetDay || !isOnline || cmdLoading !== null} className="px-4 py-1.5 bg-amber-500/20 border border-amber-500/30 text-amber-400 text-[10px] font-bold rounded hover:bg-amber-500/30 disabled:opacity-30">{settingResetDay ? "Setting..." : "SET"}</button>
                 </div>
                 {piState?.reset_day && <div className="text-[9px] text-gray-600 mt-2">Current: {piState.reset_day}th of each month</div>}
               </div>
@@ -335,7 +321,7 @@ export default function SocietyDetail() {
                       {Object.entries(calcResult).map(([id, days]) => (
                         <div key={id} className="flex justify-between text-[10px]"><span className="text-gray-500">Wing {id}</span><span className="text-cyan-400 font-bold font-mono">{days} days</span></div>
                       ))}
-                      <button onClick={() => { if (window.confirm("⚡ Send " + Object.keys(calcResult).length + " wing day settings to Pi?\n\nThis updates the Pi directly.")) sendAllCalcDays(); }} disabled={sendingDays || !isOnline || cmdLoading !== null || (quotaLocked && !isSuperAdmin)} className="w-full mt-2 py-1.5 bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 text-[10px] font-bold rounded hover:bg-cyan-500/30 disabled:opacity-30">{sendingDays ? "Sending..." : "SEND ALL DAYS TO PI"}</button>
+                      <button onClick={() => { if (window.confirm("Send " + Object.keys(calcResult).length + " wing day settings to Pi?")) sendAllCalcDays(); }} disabled={sendingDays || !isOnline || cmdLoading !== null} className="w-full mt-2 py-1.5 bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 text-[10px] font-bold rounded hover:bg-cyan-500/30 disabled:opacity-30">{sendingDays ? "Sending..." : "SEND ALL DAYS TO PI"}</button>
                     </div>
                   )}
                 </div>
