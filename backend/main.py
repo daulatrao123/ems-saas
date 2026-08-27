@@ -13,7 +13,7 @@ import os
 import json
 import time
 import psycopg
-frompsycopg.extras import RealDictCursor
+from psycopg.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
