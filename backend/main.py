@@ -13,7 +13,7 @@ import os
 import json
 import time
 import psycopg
-from psycopg.extras import RealDictCursor
+from psycopg.rows import RealDictCursor
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -113,7 +113,7 @@ def get_db():
     if not DATABASE_URL:
         return None
     try:
-        conn =psycopg.connect(DATABASE_URL, connect_timeout=10)
+        conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
         conn.autocommit = True
         return conn
     except Exception as e:
@@ -670,7 +670,7 @@ def pi_sync(payload: dict):
         "boot_count": int(payload.get("bootCount", 0)),
         "last_shutdown_reason": payload.get("lastShutdownReason", ""),
         "clock_source": payload.get("clockSource", ""),
-        "watchdog_enabled": bool(payload.get("watchdog_enabled", False)),
+        "watchdog_enabled": bool(payload.get("watchdogEnabled", False)),
         "last_reboot_reason": payload.get("lastRebootReason", ""),
     }
 
