@@ -12,8 +12,8 @@ Wing visibility: target_days > 0 AND physical_toggle == ON AND not disabled
 import os
 import json
 import time
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+frompsycopg.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -113,7 +113,7 @@ def get_db():
     if not DATABASE_URL:
         return None
     try:
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        conn =psycopg.connect(DATABASE_URL, connect_timeout=10)
         conn.autocommit = True
         return conn
     except Exception as e:
