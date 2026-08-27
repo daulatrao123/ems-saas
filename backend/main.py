@@ -741,16 +741,18 @@ def pi_command_ack(payload: dict):
     result = payload.get("result")
 
     db = load_db()
-    pending = db.get("pi_commands", {}).get(sid)
-    if not pending or pending.get("id") != str(command_id):
-        raise HTTPException(404, "Command not found or already acknowledged")
+    cmds = db.get("pi_commands", {}).get(sid, [])
+    if isinstance(cmds, dict): cmds = [cmds]
+    found = next((cmd for cmd in cmds if cmd.get("id") == str(command_id)), None)
+    if not found:
+        raise HTTPException(404, "Command not found")
 
-    pending["acked_at"] = datetime.now(timezone.utc).isoformat()
-    pending["status"] = "acknowledged" if success else "failed"
-    pending["error"] = None if success else error
-    pending["result"] = result
+    found["acked_at"] = datetime.now(timezone.utc).isoformat()
+    found["status"] = "acknowledged" if success else "failed"
+    found["error"] = None if success else error
+    found["result"] = result
     save_db(db)
-    return {"success": True, "status": pending["status"]}
+    return {"success": True, "status": found["status"]}
 
 # ================================================================
 # ADMIN — COMMAND QUEUE
