@@ -199,8 +199,17 @@ export default function SuperAdminDashboard() {
                 <div><label className="text-[10px] text-gray-500 uppercase tracking-wider mb-1 block">Society Code</label><input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" value={socForm.society_code} onChange={(e) => setSocForm({ ...socForm, society_code: e.target.value })} /></div>
                 <div><label className="text-[10px] text-gray-500 uppercase tracking-wider mb-1 block">Tailscale IP</label><input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" value={socForm.tailscale_ip} onChange={(e) => setSocForm({ ...socForm, tailscale_ip: e.target.value })} /></div>
                 <div>
-                  <label className="text-[10px] text-gray-500 uppercase tracking-wider mb-1 block">API Key</label>
-                  <div className="flex gap-2"><input className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-amber-400 font-mono focus:outline-none" value={socForm.api_key} readOnly /><button onClick={handleGenerateKey} className="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-black text-[10px] font-bold rounded whitespace-nowrap">Generate</button></div>
+                  <label className="text-[10px] text-gray-500 uppercase tracking-wider mb-1 block">Pi API Key</label>
+                  <div className="flex gap-2">
+                    <input
+                      className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-amber-400 font-mono focus:outline-none focus:border-amber-500"
+                      value={socForm.api_key}
+                      onChange={(e) => setSocForm({ ...socForm, api_key: e.target.value })}
+                      placeholder="Paste existing key or generate new"
+                    />
+                    <button onClick={handleGenerateKey} className="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-black text-[10px] font-bold rounded whitespace-nowrap">Generate</button>
+                  </div>
+                  <p className="text-[9px] text-gray-600 mt-1">Paste a key from an existing Pi device, or click Generate for a new one.</p>
                 </div>
               </div>
               <div className="flex gap-2 mt-5"><button onClick={saveSoc} className="flex-1 py-2 bg-cyan-500 text-black text-xs font-bold rounded hover:bg-cyan-600">Save</button><button onClick={() => setShowSocModal(false)} className="flex-1 py-2 border border-gray-700 text-gray-400 text-xs rounded hover:border-gray-500">Cancel</button></div>
