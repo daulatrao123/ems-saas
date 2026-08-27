@@ -711,14 +711,18 @@ def pi_sync(payload: dict):
     save_db(db)
 
     reply = {"success": True, "command": None}
-    pending = db.get("pi_commands", {}).get(sid)
-    if pending and pending.get("status") == "pending":
-        reply["command"] = pending["command"]
-        reply["command_id"] = pending["id"]
-        if pending.get("wing"):
-            reply["wing"] = pending["wing"]
-        reply["params"] = pending.get("params", {})
-
+    cmds = db.get("pi_commands", {}).get(sid, [])
+    if isinstance(cmds, dict): cmds = [cmds]; db.setdefault("pi_commands", {}); db["pi_commands"][sid] = cmds
+    for cmd in cmds:
+        if cmd.get("status") == "pending":
+            reply["command"] = cmd["command"]
+            reply["command_id"] = cmd["id"]
+            if cmd.get("wing"): reply["wing"] = cmd["wing"]
+            reply["params"] = cmd.get("params", {})
+            cmd["status"] = "sent"
+            cmd["sent_at"] = datetime.now(timezone.utc).isoformat()
+            break
+    save_db(db)
     return reply
 
 # ================================================================
@@ -769,28 +773,16 @@ def queue_command(data: dict, user: dict = Depends(get_current_user)):
 
     validate_command(command, params, wing)
 
-    db.setdefault("pi_commands", {})
-    existing = db["pi_commands"].get(sid)
-    if existing and existing.get("status") == "pending":
-        return {
-            "success": False,
-            "message": "A command is already pending. Wait for ACK.",
-            "pending_command": existing.get("command"),
-            "pending_id": existing.get("id"),
-        }
-
     command_id = str(int(time.time() * 1000))
-    db["pi_commands"][sid] = {
-        "id": command_id,
-        "command": command,
-        "wing": wing,
-        "params": params,
-        "queued_at": datetime.now(timezone.utc).isoformat(),
-        "status": "pending",
-        "acked_at": None,
-        "error": None,
-        "result": None,
+    new_cmd = {
+        "id": command_id, "command": command, "wing": wing, "params": params,
+        "queued_at": datetime.now(timezone.utc).isoformat(), "status": "pending",
+        "sent_at": None, "acked_at": None, "error": None, "result": None,
     }
+    db.setdefault("pi_commands", {})
+    if sid not in db["pi_commands"]: db["pi_commands"][sid] = []
+    if isinstance(db["pi_commands"][sid], dict): db["pi_commands"][sid] = [db["pi_commands"][sid]]
+    db["pi_commands"][sid].append(new_cmd)
     save_db(db)
     return {"success": True, "message": "Command queued", "command": command, "command_id": command_id}
 
@@ -822,7 +814,9 @@ def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_a
             "clicks": w.get("clicks", 0),
         }
 
-    cmd = db.get("pi_commands", {}).get(int(society_id))
+    cmds = db.get("pi_commands", {}).get(int(society_id), [])
+    if isinstance(cmds, dict): cmds = [cmds]
+    pc = next((c for c in cmds if c.get("status") in ("pending","sent")), None)
     return {
         "connected": True,
         "active_wing": pi.get("active_wing"),
@@ -836,10 +830,11 @@ def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_a
         "uptime_seconds": pi.get("uptime_seconds", 0),
         "last_sync": pi.get("last_sync"),
         "pending_command": {
-            "id": cmd.get("id"), "command": cmd.get("command"),
-            "status": cmd.get("status"), "queued_at": cmd.get("queued_at"),
-            "acked_at": cmd.get("acked_at"), "error": cmd.get("error"),
-        } if cmd else None,
+            "id": pc.get("id"), "command": pc.get("command"),
+            "status": pc.get("status"), "queued_at": pc.get("queued_at"),
+            "sent_at": pc.get("sent_at"), "acked_at": pc.get("acked_at"),
+            "error": pc.get("error"),
+        } if pc else None,
     }
 
 @app.get("/api/admin/pi-state")
