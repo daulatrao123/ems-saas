@@ -2,8 +2,8 @@
 import requests, time, uuid
 
 BACKEND_URL = "https://ems-saass.onrender.com"
-DEVICE_ID = "YOUR_DEVICE_ID_FROM_BOOTSTRAP"
-API_KEY = "YOUR_API_KEY_FROM_BOOTSTRAP"
+DEVICE_ID = "d9e8206b-a9f3-4294-91f8-df66d65bf417"
+API_KEY = "34a7574a-71cc-4f87-802b-4a514ca059b6"
 
 def simulate_pi():
     print(f"Starting Pi Simulator for Device {DEVICE_ID}...")

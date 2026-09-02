@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v4.1.0 — Industrial Production (Device & Config Separation)
+EMS SaaS Backend v4.1.1 — Industrial Production (Relational DB + Full Endpoints)
 ====================================
 - Decoupled Pi device identity from Society (supports multiple Pis per society).
 - Wing configuration owned by DB; Pi only reports runtime state.
@@ -42,7 +42,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:5500",
 ]
 
-app = FastAPI(title="EMS SaaS API", version="4.1.0-prod")
+app = FastAPI(title="EMS SaaS API", version="4.1.1-prod")
 
 DEFAULT_RESET_DAY = 15
 WING_ORDER = ["A", "B", "G"]
@@ -151,7 +151,7 @@ def ensure_db_schema():
                     action TEXT, details JSONB, created_at TIMESTAMPTZ
                 );
             """)
-        print("DB schema verified OK (Relational v4.1)")
+        print("DB schema verified OK (Relational v4.1.1)")
     except Exception as e:
         print(f"DB SCHEMA CHECK ERROR: {e}")
     finally:
@@ -453,6 +453,178 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
     finally:
         conn.close()
 
+@app.post("/api/super-admin/societies/save")
+def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            sid = data.get("id")
+            society = {
+                "name": data.get("name", ""), "location": data.get("location", ""),
+                "plan": data.get("plan", "Basic"), "status": "active",
+                "tailscale_ip": data.get("tailscale_ip", ""),
+                "pi_port": int(data.get("pi_port", 5000)),
+                "society_code": data.get("society_code", ""),
+            }
+            
+            if sid:
+                cur.execute("""UPDATE societies SET name=%s, location=%s, plan=%s, status=%s, 
+                               tailscale_ip=%s, pi_port=%s, society_code=%s WHERE id=%s""",
+                            (society["name"], society["location"], society["plan"], society["status"],
+                             society["tailscale_ip"], society["pi_port"], society["society_code"], sid))
+            else:
+                cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code) 
+                               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                            (society["name"], society["location"], society["plan"], society["status"],
+                             society["tailscale_ip"], society["pi_port"], society["society_code"]))
+                new_sid = cur.fetchone()[0]
+                log_audit(user, new_sid, "CREATE_SOCIETY", society)
+    finally:
+        conn.close()
+    return {"message": "Saved"}
+
+@app.post("/api/super-admin/societies/delete")
+def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            sid = data.get("id")
+            cur.execute("DELETE FROM societies WHERE id = %s", (sid,))
+            cur.execute("DELETE FROM pi_devices WHERE society_id = %s", (sid,))
+            cur.execute("DELETE FROM wing_configs WHERE society_id = %s", (sid,))
+            cur.execute("DELETE FROM users WHERE society_id = %s", (sid,))
+            log_audit(user, sid, "DELETE_SOCIETY", {})
+    finally:
+        conn.close()
+    return {"message": "Deleted"}
+
+# ================================================================
+# SUPER-ADMIN — USERS & FIRMWARE
+# ================================================================
+
+@app.get("/api/super-admin/users")
+def get_users(user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT u.id, u.email, u.name, u.role, u.society_id, s.name as society_name FROM users u LEFT JOIN societies s ON u.society_id = s.id")
+            users = cur.fetchall()
+            for u in users:
+                u["society_id"] = str(u["society_id"]) if u["society_id"] else None
+            return users
+    finally:
+        conn.close()
+
+@app.post("/api/super-admin/users/save")
+def save_user(data: dict, user: dict = Depends(require_role("super_admin"))):
+    role = data.get("role")
+    if role not in VALID_ROLES:
+        raise HTTPException(400, f"Invalid role. Must be one of {VALID_ROLES}")
+        
+    society_id = data.get("society_id")
+    if role != "super_admin" and not society_id:
+        raise HTTPException(400, "society_id is required for non-super_admin roles")
+        
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            uid = data.get("id")
+            if uid:
+                if data.get("password"):
+                    cur.execute("UPDATE users SET email=%s, name=%s, role=%s, society_id=%s, password=%s WHERE id=%s",
+                                (data["email"], data["name"], role, society_id, bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode(), uid))
+                else:
+                    cur.execute("UPDATE users SET email=%s, name=%s, role=%s, society_id=%s WHERE id=%s",
+                                (data["email"], data["name"], role, society_id, uid))
+            else:
+                if not data.get("password"):
+                    raise HTTPException(400, "Password required")
+                cur.execute("INSERT INTO users (email, name, role, society_id, password) VALUES (%s, %s, %s, %s, %s)",
+                            (data["email"], data["name"], role, society_id, bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()))
+    finally:
+        conn.close()
+    return {"message": "Saved"}
+
+@app.post("/api/super-admin/users/delete")
+def delete_user(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE id = %s", (data.get("id"),))
+    finally:
+        conn.close()
+    return {"message": "Deleted"}
+
+@app.get("/api/super-admin/firmware/versions")
+def get_firmware_versions(user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT version, changelog, forced, created_at, updated_at FROM firmware_versions ORDER BY created_at DESC")
+            versions = cur.fetchall()
+            return versions
+    finally:
+        conn.close()
+
+@app.post("/api/super-admin/firmware/save")
+def save_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            version = data.get("version", "").strip()
+            code = data.get("code", "")
+            changelog = data.get("changelog", "")
+            forced = data.get("forced", False)
+            if not version or not code:
+                raise HTTPException(400, "Version and code required")
+                
+            if forced:
+                cur.execute("UPDATE firmware_versions SET forced = FALSE")
+                
+            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at) 
+                           VALUES (%s, %s, %s, %s, %s, %s) 
+                           ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s""",
+                        (version, code, changelog, forced, datetime.now(timezone.utc), datetime.now(timezone.utc), code, changelog, forced, datetime.now(timezone.utc)))
+    finally:
+        conn.close()
+    return {"message": "Saved"}
+
+@app.post("/api/super-admin/firmware/delete")
+def delete_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM firmware_versions WHERE version = %s", (data.get("version"),))
+    finally:
+        conn.close()
+    return {"message": "Deleted"}
+
+@app.post("/api/super-admin/firmware/force")
+def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE firmware_versions SET forced = FALSE")
+            cur.execute("UPDATE firmware_versions SET forced = TRUE WHERE version = %s", (data.get("version"),))
+    finally:
+        conn.close()
+    return {"message": "Force flag updated"}
+
+@app.get("/api/pi/firmware-download")
+def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-Key")):
+    if not x_api_key:
+        raise HTTPException(403, "API key required in X-Api-Key header")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT code FROM firmware_versions WHERE version = %s", (version,))
+            fv = cur.fetchone()
+            if not fv:
+                raise HTTPException(404, "Version not found")
+            return PlainTextResponse(fv["code"], media_type="text/plain")
+    finally:
+        conn.close()
+
 # ================================================================
 # PI SYNC & COMMAND ACK
 # ================================================================
@@ -554,7 +726,7 @@ def pi_command_ack(payload: dict):
 # ================================================================
 
 def get_device_for_society(cur, sid: int) -> str:
-    cur.execute("SELECT id FROM pi_devices WHERE society_id = %s ORDER BY created_at DESC LIMIT 1", (sid,))
+    cur.execute("SELECT id FROM pi_devices WHERE society_id = %s ORDER BY last_seen DESC LIMIT 1", (sid,))
     dev = cur.fetchone()
     if not dev: raise HTTPException(404, "No device configured for this society")
     return dev["id"]
