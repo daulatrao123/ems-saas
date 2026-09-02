@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v3.0 — Production
+EMS SaaS Backend v3.3.2 — Production Deployment Candidate
 ====================================
 Wings: A, B, G
 Reset Day: 15 (default, configurable per society)
@@ -12,8 +12,11 @@ Wing visibility: target_days > 0 AND physical_toggle == ON AND not disabled
 import os
 import json
 import time
+import uuid
+import threading
 import psycopg
 from psycopg.rows import dict_row
+from contextlib import contextmanager
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,8 +26,16 @@ from jose import JWTError, jwt
 from datetime import datetime, timezone, timedelta
 
 # ================================================================
-# CORS
+# CONFIG
 # ================================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    print("WARNING: DATABASE_URL not configured — local JSON only")
+
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is required.")
 
 ALLOWED_ORIGINS = [
     "https://ems-saas-three.vercel.app",
@@ -34,7 +45,141 @@ ALLOWED_ORIGINS = [
     "http://localhost:5500",
 ]
 
-app = FastAPI(title="EMS SaaS API", version="3.0.0")
+app = FastAPI(title="EMS SaaS API", version="3.3.2-prod")
+
+DEFAULT_RESET_DAY = 15
+WING_ORDER = ["A", "B", "G"]
+PI_ONLINE_THRESHOLD_SECONDS = 120
+VALID_ROLES = {"super_admin", "society_admin", "member"}
+
+VALID_COMMANDS = {
+    "set_active_wing", "set_days", "set_reset_day", "restart",
+    "reboot", "reset_days", "off_wing", "off_all", "lcd_display",
+}
+
+# ================================================================
+# DATABASE & CONCURRENCY CONTROL
+# ================================================================
+
+_db_cache = {"data": None, "ts": 0}
+DB_CACHE_TTL = 30
+INT_KEYS = ("pi_state", "pi_events", "pi_commands")
+
+# Global lock to prevent concurrent read-modify-write race conditions
+_db_write_lock = threading.Lock()
+
+def get_db():
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
+        conn.autocommit = True
+        return conn
+    except Exception as e:
+        print(f"DB CONNECT ERROR: {e}")
+        return None
+
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
+
+def load_db() -> dict:
+    now = time.time()
+    if _db_cache["data"] and (now - _db_cache["ts"]) < DB_CACHE_TTL:
+        return _db_cache["data"]
+        
+    default = {"users": [], "societies": [], "pi_state": {}, "pi_events": {}, "pi_commands": {}, "firmware_versions": []}
+    
+    if DATABASE_URL:
+        conn = get_db()
+        if conn:
+            try:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("SELECT key, data FROM saas_data")
+                    rows = cur.fetchall()
+                    db = default.copy()
+                    for row in rows:
+                        db[row["key"]] = row["data"]
+                    for k in INT_KEYS:
+                        if k in db and db[k]:
+                            db[k] = {int(ik): iv for ik, iv in db[k].items()}
+                    _db_cache["data"] = db
+                    _db_cache["ts"] = now
+                    return db
+            except Exception as e:
+                print(f"NEON LOAD ERROR: {e}")
+                raise HTTPException(status_code=500, detail="Database read failed")
+            finally:
+                conn.close()
+        else:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+    else:
+        if os.path.exists(DB_FILE):
+            try:
+                with open(DB_FILE, "r") as f:
+                    db = json.load(f)
+                for k in INT_KEYS:
+                    if k in db and db[k]:
+                        db[k] = {int(ik): iv for ik, iv in db[k].items()}
+                _db_cache["data"] = db
+                _db_cache["ts"] = now
+                return db
+            except Exception:
+                pass
+                
+    return default
+
+def save_db(data: dict) -> None:
+    if DATABASE_URL:
+        conn = get_db()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    for key in list(data.keys()):
+                        val = data.get(key, [])
+                        if key in INT_KEYS and val:
+                            val = {str(ik): iv for ik, iv in val.items()}
+                        cur.execute(
+                            "INSERT INTO saas_data (key, data) VALUES (%s, %s) "
+                            "ON CONFLICT (key) DO UPDATE SET data = %s, updated_at = NOW()",
+                            (key, json.dumps(val), json.dumps(val)),
+                        )
+                # Cache ONLY after successful persistence
+                _db_cache["data"] = data
+                _db_cache["ts"] = time.time()
+            except Exception as e:
+                print(f"NEON SAVE ERROR: {e}")
+                raise HTTPException(status_code=500, detail="Database write failed")
+            finally:
+                conn.close()
+        else:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+    else:
+        try:
+            with open(DB_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+            _db_cache["data"] = data
+            _db_cache["ts"] = time.time()
+        except Exception as e:
+            print(f"LOCAL FILE SAVE ERROR: {e}")
+            raise HTTPException(status_code=500, detail="Local file write failed")
+
+@contextmanager
+def db_transaction():
+    """
+    Context manager that handles locking, loading, and saving.
+    Guarantees the lock is released exactly once, even if load_db fails.
+    """
+    _db_write_lock.acquire()
+    try:
+        db = load_db()
+        yield db
+        save_db(db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"DB TRANSACTION ERROR: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during DB transaction")
+    finally:
+        _db_write_lock.release()
 
 # ================================================================
 # AUTO-CREATE TABLE ON STARTUP
@@ -61,7 +206,7 @@ def ensure_db_schema():
         print(f"DB SCHEMA CHECK ERROR: {e}")
 
 # ================================================================
-# EXCEPTION HANDLERS — CORS on every error
+# EXCEPTION HANDLERS
 # ================================================================
 
 def _cors_headers(origin: str) -> dict:
@@ -70,151 +215,32 @@ def _cors_headers(origin: str) -> dict:
         "Access-Control-Allow-Origin": valid,
         "Access-Control-Allow-Credentials": "true",
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Api-Key",
     }
 
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-        headers=_cors_headers(request.headers.get("origin", "")),
-    )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=_cors_headers(request.headers.get("origin", "")))
 
 @app.exception_handler(Exception)
 async def unhandled_exc_handler(request: Request, exc: Exception):
     print(f"UNHANDLED {request.method} {request.url}: {type(exc).__name__}: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"},
-        headers=_cors_headers(request.headers.get("origin", "")),
-    )
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"}, headers=_cors_headers(request.headers.get("origin", "")))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Api-Key"],
 )
-
-# ================================================================
-# CONFIG — secrets from env only
-# ================================================================
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    print("WARNING: DATABASE_URL not configured — local JSON only")
-
-SECRET_KEY = os.getenv("SECRET_KEY")
-if not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY environment variable is required.")
-
-DEFAULT_RESET_DAY = 15
-WING_ORDER = ["A", "B", "G"]
-
-VALID_COMMANDS = {
-    "set_active_wing",
-    "set_days",
-    "set_reset_day",
-    "restart",
-    "reboot",
-    "reset_days",
-    "off_wing",
-    "off_all",
-    "lcd_display",
-}
-
-# ================================================================
-# DATABASE
-# ================================================================
-
-_db_cache = {"data": None, "ts": 0}
-DB_CACHE_TTL = 30
-INT_KEYS = ("pi_state", "pi_events", "pi_commands")
-
-def get_db():
-    if not DATABASE_URL:
-        return None
-    try:
-        conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        print(f"DB CONNECT ERROR: {e}")
-        return None
-
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
-
-def load_db() -> dict:
-    now = time.time()
-    if _db_cache["data"] and (now - _db_cache["ts"]) < DB_CACHE_TTL:
-        return _db_cache["data"]
-    default = {"users": [], "societies": [], "pi_state": {}, "pi_events": {}, "pi_commands": {}, "firmware_versions": []}
-    conn = get_db()
-    if conn:
-        try:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT key, data FROM saas_data")
-                rows = cur.fetchall()
-                db = default.copy()
-                for row in rows:
-                    db[row["key"]] = row["data"]
-                for k in INT_KEYS:
-                    if k in db and db[k]:
-                        db[k] = {int(ik): iv for ik, iv in db[k].items()}
-                _db_cache["data"] = db
-                _db_cache["ts"] = now
-                return db
-        except Exception as e:
-            print(f"NEON LOAD ERROR: {e}")
-        finally:
-            conn.close()
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r") as f:
-                db = json.load(f)
-            for k in INT_KEYS:
-                if k in db and db[k]:
-                    db[k] = {int(ik): iv for ik, iv in db[k].items()}
-            _db_cache["data"] = db
-            _db_cache["ts"] = now
-            return db
-        except Exception:
-            pass
-    return default
-
-def save_db(data: dict) -> None:
-    _db_cache["data"] = data
-    _db_cache["ts"] = time.time()
-    conn = get_db()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                for key in list(data.keys()):
-                    val = data.get(key, [])
-                    if key in INT_KEYS and val:
-                        val = {str(ik): iv for ik, iv in val.items()}
-                    cur.execute(
-                        "INSERT INTO saas_data (key, data) VALUES (%s, %s) "
-                        "ON CONFLICT (key) DO UPDATE SET data = %s, updated_at = NOW()",
-                        (key, json.dumps(val), json.dumps(val)),
-                    )
-            return
-        except Exception as e:
-            print(f"NEON SAVE ERROR: {e}")
-        finally:
-            conn.close()
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=2)
 
 # ================================================================
 # UTILITIES
 # ================================================================
 
 def next_id(items: list) -> str:
-    if not items:
-        return "1"
+    if not items: return "1"
     return str(max(int(x.get("id", "0")) for x in items) + 1)
 
 def create_token(data: dict) -> str:
@@ -222,14 +248,17 @@ def create_token(data: dict) -> str:
     payload["exp"] = datetime.now(timezone.utc) + timedelta(days=30)
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
-def version_gt(v1: str, v2: str) -> bool:
+def is_pi_online(pi_state: dict) -> bool:
+    if not pi_state: return False
+    last_sync_str = pi_state.get("last_sync")
+    if not last_sync_str: return False
     try:
-        p1 = [int(x) for x in str(v1).split(".")]
-        p2 = [int(x) for x in str(v2).split(".")]
-        for a, b in zip(p1, p2):
-            if a > b: return True
-            if a < b: return False
-        return len(p1) > len(p2)
+        if last_sync_str.endswith("Z"):
+            last_sync_str = last_sync_str[:-1] + "+00:00"
+        last_sync = datetime.fromisoformat(last_sync_str)
+        if last_sync.tzinfo is None:
+            last_sync = last_sync.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - last_sync).total_seconds() <= PI_ONLINE_THRESHOLD_SECONDS
     except Exception:
         return False
 
@@ -241,48 +270,29 @@ def wing_is_visible(w: dict) -> bool:
         and not bool(w.get("disabled", False))
     )
 
-# ================================================================
-# COMMAND VALIDATION
-# ================================================================
-
 def validate_command(command: str, params: dict, wing: str = "") -> None:
     if command not in VALID_COMMANDS:
         raise HTTPException(400, f"Unsupported command: {command}")
-
     if command in ("set_active_wing", "set_days", "off_wing"):
         if wing not in WING_ORDER:
             raise HTTPException(400, "Valid wing A, B or G is required")
-
     if command == "set_days":
-        try:
-            days = int(params.get("days"))
-        except Exception:
-            raise HTTPException(400, "days must be an integer")
-        if not 1 <= days <= 31:
-            raise HTTPException(400, "days must be between 1 and 31")
-
+        try: days = int(params.get("days"))
+        except: raise HTTPException(400, "days must be an integer")
+        if not 1 <= days <= 31: raise HTTPException(400, "days must be 1-31")
     if command == "set_reset_day":
-        try:
-            day = int(params.get("day"))
-        except Exception:
-            raise HTTPException(400, "day must be an integer")
-        if not 1 <= day <= 28:
-            raise HTTPException(400, "reset day must be 1-28")
-
+        try: day = int(params.get("day"))
+        except: raise HTTPException(400, "day must be an integer")
+        if not 1 <= day <= 28: raise HTTPException(400, "reset day must be 1-28")
     if command == "lcd_display":
         line1 = str(params.get("line1", ""))[:16]
         line2 = str(params.get("line2", ""))[:16]
-        if not line1 and not line2:
-            raise HTTPException(400, "LCD message cannot be empty")
+        if not line1 and not line2: raise HTTPException(400, "LCD message cannot be empty")
         params["line1"] = line1
         params["line2"] = line2
-        duration = params.get("duration", 10)
-        try:
-            dur = float(duration)
-        except Exception:
-            raise HTTPException(400, "duration must be a number")
-        if not 1 <= dur <= 120:
-            raise HTTPException(400, "duration must be 1-120 seconds")
+        try: dur = float(params.get("duration", 10))
+        except: raise HTTPException(400, "duration must be a number")
+        if not 1 <= dur <= 120: raise HTTPException(400, "duration must be 1-120 seconds")
         params["duration"] = dur
 
 # ================================================================
@@ -308,10 +318,7 @@ def require_role(*roles):
         return user
     return checker
 
-async def require_society_access(
-    request: Request,
-    user: dict = Depends(get_current_user),
-) -> dict:
+async def require_society_access(request: Request, user: dict = Depends(get_current_user)) -> dict:
     if user.get("role") not in ("super_admin", "society_admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     if user["role"] != "super_admin":
@@ -321,38 +328,30 @@ async def require_society_access(
             raise HTTPException(status_code=403, detail="Cannot access other society data")
     return user
 
-# ================================================================
-# PI AUTHENTICATION — strict, never overwrites stored key
-# ================================================================
-
 def authenticate_pi(payload: dict) -> tuple:
     try:
         sid = int(payload.get("societyId"))
     except Exception:
         raise HTTPException(400, "Invalid societyId")
-
+        
     supplied_key = str(payload.get("key", ""))
     if not supplied_key:
         raise HTTPException(401, "Pi API key required")
-
-    db = load_db()
-    society = next(
-        (s for s in db.get("societies", []) if int(s.get("id", 0)) == sid),
-        None,
-    )
+        
+    db = load_db() 
+    society = next((s for s in db.get("societies", []) if int(s.get("id", 0)) == sid), None)
     if not society:
-        raise HTTPException(403, "Society not registered. Create it in admin dashboard first.")
-
+        raise HTTPException(403, "Society not registered.")
+        
     stored_key = str(society.get("api_key", ""))
     if not stored_key:
         raise HTTPException(403, "No Pi API key configured for this society.")
     if supplied_key != stored_key:
         raise HTTPException(403, "Invalid Pi API key.")
-
     return sid, society
 
 # ================================================================
-# HEALTH
+# HEALTH & KEEPALIVE
 # ================================================================
 
 _keepalive_ts = time.time()
@@ -375,60 +374,55 @@ def health():
     return {"status": "ok", "uptime_keepalive": round(time.time() - _keepalive_ts)}
 
 # ================================================================
-# BOOTSTRAP — one-time, locked after first user
+# BOOTSTRAP
 # ================================================================
 
 @app.post("/api/bootstrap")
 def bootstrap():
-    db = load_db()
-    if db["users"]:
-        raise HTTPException(400, "System already initialized")
+    with db_transaction() as db:
+        if db["users"]:
+            raise HTTPException(400, "System already initialized")
 
-    now_iso = datetime.now(timezone.utc).isoformat()
+        bootstrap_pass = os.getenv("EMS_BOOTSTRAP_PASSWORD")
+        if not bootstrap_pass:
+            raise HTTPException(500, "EMS_BOOTSTRAP_PASSWORD env variable is not configured.")
 
-    db["societies"].append({
-        "id": "1",
-        "name": "Prestine Pacific",
-        "location": "Mumbai",
-        "plan": "Basic",
-        "status": "active",
-        "tailscale_ip": "",
-        "pi_port": 5000,
-        "api_key": "",
-        "society_code": "prestine",
-    })
-    db["users"].append({
-        "id": "1", "email": "admin@ems.com", "name": "Super Admin",
-        "password": bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode(),
-        "role": "super_admin", "society_id": None,
-    })
-    db["users"].append({
-        "id": "2", "email": "admin@prestine.com", "name": "Prestine Admin",
-        "password": bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode(),
-        "role": "society_admin", "society_id": "1",
-    })
-    db["users"].append({
-        "id": "3", "email": "member@prestine.com", "name": "Prestine Member",
-        "password": bcrypt.hashpw(b"member123", bcrypt.gensalt()).decode(),
-        "role": "member", "society_id": "1",
-    })
-    db["pi_state"][1] = {
-        "active_wing": "A",
-        "wings": {
-            "A": {"name": "A", "display_name": "Wing A", "used_days": 0, "target_days": 9, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
-            "B": {"name": "B", "display_name": "Wing B", "used_days": 0, "target_days": 12, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
-            "G": {"name": "G", "display_name": "Wing G", "used_days": 0, "target_days": 10, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
-        },
-        "reset_day": DEFAULT_RESET_DAY,
-        "emergency_stop": False,
-        "firmware_version": "0.0.0",
-        "uptime_seconds": 0, "cpu_temp": 0, "disk_free_mb": 0,
-        "last_sync": now_iso, "boot_count": 0, "last_shutdown_reason": None,
-        "clock_source": "ntp", "watchdog_enabled": True, "last_reboot_reason": None,
-    }
-    db["pi_events"][1] = [{"id": 1, "timestamp": now_iso, "type": "system", "message": "System bootstrapped"}]
-    db["pi_commands"][1] = None
-    save_db(db)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        db["societies"].append({
+            "id": "1", "name": "Prestine Pacific", "location": "Mumbai",
+            "plan": "Basic", "status": "active", "tailscale_ip": "",
+            "pi_port": 5000, "api_key": "", "society_code": "prestine",
+        })
+        db["users"].append({
+            "id": "1", "email": "admin@ems.com", "name": "Super Admin",
+            "password": bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(),
+            "role": "super_admin", "society_id": None,
+        })
+        db["users"].append({
+            "id": "2", "email": "admin@prestine.com", "name": "Prestine Admin",
+            "password": bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(),
+            "role": "society_admin", "society_id": "1",
+        })
+        db["users"].append({
+            "id": "3", "email": "member@prestine.com", "name": "Prestine Member",
+            "password": bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(),
+            "role": "member", "society_id": "1",
+        })
+        db["pi_state"][1] = {
+            "active_wing": "A", "wings": {
+                "A": {"name": "A", "display_name": "Wing A", "used_days": 0, "target_days": 9, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
+                "B": {"name": "B", "display_name": "Wing B", "used_days": 0, "target_days": 12, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
+                "G": {"name": "G", "display_name": "Wing G", "used_days": 0, "target_days": 10, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
+            },
+            "reset_day": DEFAULT_RESET_DAY, "emergency_stop": False, "firmware_version": "0.0.0",
+            "uptime_seconds": 0, "cpu_temp": 0, "disk_free_mb": 0, "last_sync": now_iso,
+            "boot_count": 0, "last_shutdown_reason": None, "clock_source": "ntp",
+            "watchdog_enabled": True, "last_reboot_reason": None,
+        }
+        db["pi_events"][1] = [{"id": str(uuid.uuid4()), "event_id": str(uuid.uuid4()), "timestamp": now_iso, "type": "system", "message": "System bootstrapped"}]
+        db["pi_commands"][1] = []
+        
     return {"message": "Initialized. Change default passwords and set society API key."}
 
 # ================================================================
@@ -442,8 +436,7 @@ def login(user: UserLogin):
     if not db_user or not bcrypt.checkpw(user.password.encode(), db_user["password"].encode()):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token({
-        "id": int(db_user["id"]),
-        "role": db_user["role"],
+        "id": int(db_user["id"]), "role": db_user["role"],
         "society_id": int(db_user["society_id"]) if db_user.get("society_id") else None,
     })
     return {
@@ -461,17 +454,10 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
     result = []
     for s in db["societies"]:
         pi = db.get("pi_state", {}).get(int(s["id"]))
-        online = False
-        if pi and pi.get("last_sync"):
-            try:
-                online = (datetime.now(timezone.utc) - datetime.fromisoformat(pi["last_sync"])).total_seconds() < 600
-            except Exception:
-                pass
+        online = is_pi_online(pi)
         wings = pi.get("wings", {}) if pi else {}
         wing_data = {}
         for wid, w in wings.items():
-            if not wing_is_visible(w):
-                continue
             wing_data[wid] = {
                 "name": w.get("name", wid),
                 "display_name": w.get("display_name", ""),
@@ -480,12 +466,18 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
                 "clicks": w.get("clicks", 0),
                 "disabled": w.get("disabled", False),
                 "physical_toggle": w.get("physical_toggle", "UNKNOWN"),
+                "visible": wing_is_visible(w),
             }
+            
+        raw_key = s.get("api_key", "")
+        masked_key = f"***{raw_key[-4:]}" if raw_key else ""
+            
         result.append({
             "id": s["id"], "name": s["name"], "location": s["location"],
             "plan": s["plan"], "status": s.get("status", "active"),
             "tailscale_ip": s.get("tailscale_ip", ""), "pi_port": s.get("pi_port", 5000),
-            "api_key": s.get("api_key", ""), "society_code": s.get("society_code", ""),
+            "api_key": masked_key,
+            "society_code": s.get("society_code", ""),
             "pi_online": online, "last_sync": pi.get("last_sync") if pi else None,
             "active_wing": pi.get("active_wing") if pi else None,
             "emergency_stop": pi.get("emergency_stop", False) if pi else False,
@@ -499,39 +491,44 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
 
 @app.post("/api/super-admin/societies/save")
 def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    sid = data.get("id")
-    society = {
-        "name": data.get("name", ""), "location": data.get("location", ""),
-        "plan": data.get("plan", "Basic"), "status": "active",
-        "tailscale_ip": data.get("tailscale_ip", ""),
-        "pi_port": int(data.get("pi_port", 5000)),
-        "api_key": data.get("api_key", ""), "society_code": data.get("society_code", ""),
-    }
-    if sid:
-        for s in db["societies"]:
-            if s["id"] == sid:
-                s.update(society)
-                break
-    else:
-        society["id"] = next_id(db["societies"])
-        db["societies"].append(society)
-    save_db(db)
+    with db_transaction() as db:
+        sid = data.get("id")
+        society = {
+            "name": data.get("name", ""), "location": data.get("location", ""),
+            "plan": data.get("plan", "Basic"), "status": "active",
+            "tailscale_ip": data.get("tailscale_ip", ""),
+            "pi_port": int(data.get("pi_port", 5000)),
+            "society_code": data.get("society_code", ""),
+        }
+        
+        if data.get("api_key") and not data["api_key"].startswith("***"):
+            society["api_key"] = data["api_key"]
+            
+        if sid:
+            for s in db["societies"]:
+                if s["id"] == sid:
+                    if "api_key" not in society: society["api_key"] = s.get("api_key", "")
+                    s.update(society)
+                    break
+        else:
+            society["id"] = next_id(db["societies"])
+            if "api_key" not in society: society["api_key"] = str(uuid.uuid4())
+            db["societies"].append(society)
+            
     return {"message": "Saved"}
 
 @app.post("/api/super-admin/societies/delete")
 def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    sid = data.get("id")
-    db["societies"] = [s for s in db["societies"] if s["id"] != sid]
-    for key in INT_KEYS:
-        db.get(key, {}).pop(int(sid), None)
-    db["users"] = [u for u in db["users"] if u.get("society_id") != sid]
-    save_db(db)
+    with db_transaction() as db:
+        sid = data.get("id")
+        db["societies"] = [s for s in db["societies"] if s["id"] != sid]
+        for key in INT_KEYS:
+            db.get(key, {}).pop(int(sid), None)
+        db["users"] = [u for u in db["users"] if u.get("society_id") != sid]
     return {"message": "Deleted"}
 
 # ================================================================
-# SUPER-ADMIN — USERS
+# SUPER-ADMIN — USERS & FIRMWARE
 # ================================================================
 
 @app.get("/api/super-admin/users")
@@ -549,102 +546,102 @@ def get_users(user: dict = Depends(require_role("super_admin"))):
 
 @app.post("/api/super-admin/users/save")
 def save_user(data: dict, user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    uid = data.get("id")
-    if uid:
-        for u in db["users"]:
-            if u["id"] == uid:
-                if data.get("password"):
-                    u["password"] = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()
-                for k in ("email", "name", "role", "society_id"):
-                    if k in data:
-                        u[k] = data[k]
-                break
-    else:
-        if not data.get("password"):
-            raise HTTPException(400, "Password required")
-        db["users"].append({
-            "id": next_id(db["users"]), "email": data["email"], "name": data["name"],
-            "role": data["role"], "society_id": data.get("society_id") or None,
-            "password": bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode(),
-        })
-    save_db(db)
+    role = data.get("role")
+    if role not in VALID_ROLES:
+        raise HTTPException(400, f"Invalid role. Must be one of {VALID_ROLES}")
+        
+    society_id = data.get("society_id")
+    if role != "super_admin" and not society_id:
+        raise HTTPException(400, "society_id is required for non-super_admin roles")
+        
+    with db_transaction() as db:
+        if role != "super_admin" and not any(s["id"] == str(society_id) for s in db["societies"]):
+            raise HTTPException(400, "Invalid society_id")
+            
+        uid = data.get("id")
+        if uid:
+            user_found = False
+            for u in db["users"]:
+                if u["id"] == uid:
+                    user_found = True
+                    if data.get("password"):
+                        u["password"] = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()
+                    u["email"] = data.get("email", u["email"])
+                    u["name"] = data.get("name", u["name"])
+                    u["role"] = role
+                    u["society_id"] = None if role == "super_admin" else str(society_id)
+                    break
+            if not user_found:
+                raise HTTPException(404, "User not found")
+        else:
+            if not data.get("password"):
+                raise HTTPException(400, "Password required")
+            db["users"].append({
+                "id": next_id(db["users"]), "email": data["email"], "name": data["name"],
+                "role": role, "society_id": None if role == "super_admin" else str(society_id),
+                "password": bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode(),
+            })
     return {"message": "Saved"}
 
 @app.post("/api/super-admin/users/delete")
 def delete_user(data: dict, user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    db["users"] = [u for u in db["users"] if u["id"] != data.get("id")]
-    save_db(db)
+    with db_transaction() as db:
+        db["users"] = [u for u in db["users"] if u["id"] != data.get("id")]
     return {"message": "Deleted"}
-
-# ================================================================
-# SUPER-ADMIN — FIRMWARE
-# ================================================================
 
 @app.get("/api/super-admin/firmware/versions")
 def get_firmware_versions(user: dict = Depends(require_role("super_admin"))):
     db = load_db()
     versions = db.get("firmware_versions", [])
-    for v in versions:
-        v.pop("code", None)
+    for v in versions: v.pop("code", None)
     return versions
 
 @app.post("/api/super-admin/firmware/save")
 def save_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    version = data.get("version", "").strip()
-    code = data.get("code", "")
-    changelog = data.get("changelog", "")
-    forced = data.get("forced", False)
-    if not version or not code:
-        raise HTTPException(400, "Version and code required")
-    if "firmware_versions" not in db:
-        db["firmware_versions"] = []
-    existing = next((v for v in db["firmware_versions"] if v["version"] == version), None)
-    if existing:
-        existing["code"] = code
-        existing["changelog"] = changelog
-        existing["forced"] = forced
-        existing["updated_at"] = datetime.now(timezone.utc).isoformat()
-    else:
-        db["firmware_versions"].insert(0, {
-            "version": version, "code": code, "changelog": changelog,
-            "forced": forced, "created_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
-    if forced:
-        for v in db["firmware_versions"]:
-            if v["version"] != version:
-                v["forced"] = False
-    save_db(db)
+    with db_transaction() as db:
+        version = data.get("version", "").strip()
+        code = data.get("code", "")
+        changelog = data.get("changelog", "")
+        forced = data.get("forced", False)
+        if not version or not code:
+            raise HTTPException(400, "Version and code required")
+            
+        if "firmware_versions" not in db: db["firmware_versions"] = []
+        existing = next((v for v in db["firmware_versions"] if v["version"] == version), None)
+        if existing:
+            existing.update({"code": code, "changelog": changelog, "forced": forced, "updated_at": datetime.now(timezone.utc).isoformat()})
+        else:
+            db["firmware_versions"].insert(0, {
+                "version": version, "code": code, "changelog": changelog, "forced": forced,
+                "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()
+            })
+        if forced:
+            for v in db["firmware_versions"]:
+                if v["version"] != version: v["forced"] = False
     return {"message": "Saved"}
 
 @app.post("/api/super-admin/firmware/delete")
 def delete_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    version = data.get("version")
-    db["firmware_versions"] = [v for v in db.get("firmware_versions", []) if v["version"] != version]
-    save_db(db)
+    with db_transaction() as db:
+        version = data.get("version")
+        db["firmware_versions"] = [v for v in db.get("firmware_versions", []) if v["version"] != version]
     return {"message": "Deleted"}
 
 @app.post("/api/super-admin/firmware/force")
 def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    version = data.get("version")
-    if "firmware_versions" not in db:
-        db["firmware_versions"] = []
-    for v in db["firmware_versions"]:
-        v["forced"] = (v["version"] == version)
-    save_db(db)
+    with db_transaction() as db:
+        version = data.get("version")
+        if "firmware_versions" not in db: db["firmware_versions"] = []
+        for v in db["firmware_versions"]:
+            v["forced"] = (v["version"] == version)
     return {"message": "Force flag updated"}
 
 @app.get("/api/pi/firmware-download")
-def download_firmware(version: str, key: str = ""):
-    if not key:
-        raise HTTPException(403, "API key required")
+def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-Key")):
+    if not x_api_key:
+        raise HTTPException(403, "API key required in X-Api-Key header")
     db = load_db()
-    society = next((s for s in db["societies"] if s.get("api_key") == key), None)
+    society = next((s for s in db["societies"] if s.get("api_key") == x_api_key), None)
     if not society:
         raise HTTPException(403, "Invalid API key")
     fv = next((v for v in db.get("firmware_versions", []) if v["version"] == version), None)
@@ -653,82 +650,95 @@ def download_firmware(version: str, key: str = ""):
     return PlainTextResponse(fv["code"], media_type="text/plain")
 
 # ================================================================
-# PI SYNC — camelCase → snake_case, strict auth
+# PI SYNC & COMMAND ACK
 # ================================================================
 
 @app.post("/api/pi/sync")
 def pi_sync(payload: dict):
     sid, society = authenticate_pi(payload)
-    db = load_db()
-    now = datetime.now(timezone.utc).isoformat()
+    with db_transaction() as db:
+        now = datetime.now(timezone.utc).isoformat()
 
-    wings = {}
-    for wid, w in payload.get("wings", {}).items():
-        physical_toggle = w.get("physicalToggle", "UNKNOWN")
-        if isinstance(physical_toggle, bool):
-            physical_toggle = "ON" if physical_toggle else "OFF"
-        physical_toggle = str(physical_toggle).upper()
-        if physical_toggle not in ("ON", "OFF", "UNKNOWN"):
-            physical_toggle = "UNKNOWN"
+        wings = {}
+        for wid, w in payload.get("wings", {}).items():
+            physical_toggle = w.get("physicalToggle", "UNKNOWN")
+            if isinstance(physical_toggle, bool):
+                physical_toggle = "ON" if physical_toggle else "OFF"
+            physical_toggle = str(physical_toggle).upper()
+            if physical_toggle not in ("ON", "OFF", "UNKNOWN"):
+                physical_toggle = "UNKNOWN"
 
-        wings[wid] = {
-            "name": w.get("name", wid),
-            "display_name": w.get("display_name", w.get("name", wid)),
-            "used_days": int(w.get("usedDays", 0)),
-            "target_days": int(w.get("targetDays", 0)),
-            "clicks": int(w.get("clicks", 0)),
-            "disabled": bool(w.get("disabled", False)),
-            "physical_toggle": physical_toggle,
+            wings[wid] = {
+                "name": w.get("name", wid),
+                "display_name": w.get("display_name", w.get("name", wid)),
+                "used_days": int(w.get("usedDays", 0)),
+                "target_days": int(w.get("targetDays", 0)),
+                "clicks": int(w.get("clicks", 0)),
+                "disabled": bool(w.get("disabled", False)),
+                "physical_toggle": physical_toggle,
+            }
+
+        pi_state = {
+            "active_wing": payload.get("activeWing"), "wings": wings,
+            "reset_day": int(payload.get("resetDay", DEFAULT_RESET_DAY)),
+            "emergency_stop": bool(payload.get("emergencyStop", False)),
+            "firmware_version": payload.get("firmwareVersion", "?"),
+            "uptime_seconds": int(payload.get("uptimeSeconds", 0)),
+            "cpu_temp": float(payload.get("cpuTemp", 0)),
+            "disk_free_mb": float(payload.get("diskFreeMB", 0)),
+            "last_sync": now,
+            "boot_count": int(payload.get("bootCount", 0)),
+            "last_shutdown_reason": payload.get("lastShutdownReason", ""),
+            "clock_source": payload.get("clockSource", ""),
+            "watchdog_enabled": bool(payload.get("watchdogEnabled", False)),
+            "last_reboot_reason": payload.get("lastRebootReason", ""),
         }
 
-    pi_state = {
-        "active_wing": payload.get("activeWing"),
-        "wings": wings,
-        "reset_day": int(payload.get("resetDay", DEFAULT_RESET_DAY)),
-        "emergency_stop": bool(payload.get("emergencyStop", False)),
-        "firmware_version": payload.get("firmwareVersion", "?"),
-        "uptime_seconds": int(payload.get("uptimeSeconds", 0)),
-        "cpu_temp": float(payload.get("cpuTemp", 0)),
-        "disk_free_mb": float(payload.get("diskFreeMB", 0)),
-        "last_sync": now,
-        "boot_count": int(payload.get("bootCount", 0)),
-        "last_shutdown_reason": payload.get("lastShutdownReason", ""),
-        "clock_source": payload.get("clockSource", ""),
-        "watchdog_enabled": bool(payload.get("watchdogEnabled", False)),
-        "last_reboot_reason": payload.get("lastRebootReason", ""),
-    }
+        db.setdefault("pi_state", {})
+        db["pi_state"][sid] = pi_state
 
-    db.setdefault("pi_state", {})
-    pi_state["last_sync"] = datetime.now(timezone.utc).isoformat()
-    db["pi_state"][sid] = pi_state
+        db.setdefault("pi_events", {})
+        db["pi_events"].setdefault(sid, [])
+        existing_ids = {e.get("event_id") for e in db["pi_events"][sid] if e.get("event_id")}
+        
+        for event in payload.get("events", []):
+            ev_id = event.get("eventId")
+            if not ev_id:
+                continue
+                
+            if ev_id not in existing_ids:
+                db["pi_events"][sid].append({
+                    "id": ev_id, "event_id": ev_id,
+                    "timestamp": event.get("timestamp", now),
+                    "type": event.get("type", "system"),
+                    "message": event.get("message", "")
+                })
+                existing_ids.add(ev_id)
+                
+        if len(db["pi_events"][sid]) > 500:
+            db["pi_events"][sid] = db["pi_events"][sid][-500:]
 
-    db.setdefault("pi_events", {})
-    db["pi_events"].setdefault(sid, [])
-    for event in payload.get("events", []):
-        db["pi_events"][sid].append(event)
-    if len(db["pi_events"][sid]) > 500:
-        db["pi_events"][sid] = db["pi_events"][sid][-500:]
+        reply = {"success": True, "command": None, "command_id": None}
+        
+        cmds = db.get("pi_commands", {}).get(sid, [])
+        if cmds is None:
+            cmds = []
+            db["pi_commands"][sid] = cmds
+        elif isinstance(cmds, dict): 
+            cmds = [cmds]
+            db["pi_commands"][sid] = cmds
+            
+        for cmd in cmds:
+            if cmd.get("status") == "pending":
+                reply["command"] = cmd["command"]
+                reply["command_id"] = cmd["id"]
+                if cmd.get("wing"): reply["wing"] = cmd["wing"]
+                reply["params"] = cmd.get("params", {})
+                cmd["status"] = "sent"
+                cmd["sent_at"] = datetime.now(timezone.utc).isoformat()
+                break
 
-    save_db(db)
-
-    reply = {"success": True, "command": None}
-    cmds = db.get("pi_commands", {}).get(sid, [])
-    if isinstance(cmds, dict): cmds = [cmds]; db.setdefault("pi_commands", {}); db["pi_commands"][sid] = cmds
-    for cmd in cmds:
-        if cmd.get("status") == "pending":
-            reply["command"] = cmd["command"]
-            reply["command_id"] = cmd["id"]
-            if cmd.get("wing"): reply["wing"] = cmd["wing"]
-            reply["params"] = cmd.get("params", {})
-            cmd["status"] = "sent"
-            cmd["sent_at"] = datetime.now(timezone.utc).isoformat()
-            break
-    save_db(db)
     return reply
-
-# ================================================================
-# PI COMMAND ACK
-# ================================================================
 
 @app.post("/api/pi/command-ack")
 def pi_command_ack(payload: dict):
@@ -741,27 +751,33 @@ def pi_command_ack(payload: dict):
     error = payload.get("error")
     result = payload.get("result")
 
-    db = load_db()
-    cmds = db.get("pi_commands", {}).get(sid, [])
-    if isinstance(cmds, dict): cmds = [cmds]
-    found = next((cmd for cmd in cmds if cmd.get("id") == str(command_id)), None)
-    if not found:
-        raise HTTPException(404, "Command not found")
+    with db_transaction() as db:
+        cmds = db.get("pi_commands", {}).get(sid, [])
+        if cmds is None:
+            cmds = []
+            db["pi_commands"][sid] = cmds
+        elif isinstance(cmds, dict): 
+            cmds = [cmds]
+            db["pi_commands"][sid] = cmds
+            
+        found = next((cmd for cmd in cmds if cmd.get("id") == str(command_id)), None)
+        
+        if not found:
+            return {"success": True, "status": "unknown"}
 
-    found["acked_at"] = datetime.now(timezone.utc).isoformat()
-    found["status"] = "acknowledged" if success else "failed"
-    found["error"] = None if success else error
-    found["result"] = result
-    save_db(db)
+        found["acked_at"] = datetime.now(timezone.utc).isoformat()
+        found["status"] = "acknowledged" if success else "failed"
+        found["error"] = None if success else error
+        found["result"] = result
+        
     return {"success": True, "status": found["status"]}
 
 # ================================================================
-# ADMIN — COMMAND QUEUE
+# ADMIN & MEMBER ENDPOINTS
 # ================================================================
 
 @app.post("/api/admin/pi-command")
 def queue_command(data: dict, user: dict = Depends(get_current_user)):
-    db = load_db()
     try:
         sid = int(data.get("society_id"))
     except Exception:
@@ -776,22 +792,23 @@ def queue_command(data: dict, user: dict = Depends(get_current_user)):
 
     validate_command(command, params, wing)
 
-    command_id = str(int(time.time() * 1000))
+    command_id = str(uuid.uuid4())
     new_cmd = {
         "id": command_id, "command": command, "wing": wing, "params": params,
         "queued_at": datetime.now(timezone.utc).isoformat(), "status": "pending",
         "sent_at": None, "acked_at": None, "error": None, "result": None,
     }
-    db.setdefault("pi_commands", {})
-    if sid not in db["pi_commands"]: db["pi_commands"][sid] = []
-    if isinstance(db["pi_commands"][sid], dict): db["pi_commands"][sid] = [db["pi_commands"][sid]]
-    db["pi_commands"][sid].append(new_cmd)
-    save_db(db)
+    
+    with db_transaction() as db:
+        db.setdefault("pi_commands", {})
+        if sid not in db["pi_commands"] or db["pi_commands"][sid] is None:
+            db["pi_commands"][sid] = []
+        elif isinstance(db["pi_commands"][sid], dict):
+            db["pi_commands"][sid] = [db["pi_commands"][sid]]
+            
+        db["pi_commands"][sid].append(new_cmd)
+        
     return {"success": True, "message": "Command queued", "command": command, "command_id": command_id}
-
-# ================================================================
-# ADMIN — DASHBOARD / STATE / EVENTS
-# ================================================================
 
 @app.get("/api/admin/dashboard")
 def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_access)):
@@ -804,8 +821,6 @@ def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_a
 
     wings_data = {}
     for wid, w in pi.get("wings", {}).items():
-        if not wing_is_visible(w):
-            continue
         wings_data[wid] = {
             "used_days": w.get("used_days", 0),
             "target_days": w.get("target_days", 0),
@@ -815,13 +830,18 @@ def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_a
             "disabled": w.get("disabled", False),
             "physical_toggle": w.get("physical_toggle", "UNKNOWN"),
             "clicks": w.get("clicks", 0),
+            "visible": wing_is_visible(w),
         }
 
     cmds = db.get("pi_commands", {}).get(int(society_id), [])
-    if isinstance(cmds, dict): cmds = [cmds]
+    if cmds is None:
+        cmds = []
+    elif isinstance(cmds, dict):
+        cmds = [cmds]
+        
     pc = next((c for c in cmds if c.get("status") in ("pending","sent")), None)
     return {
-        "connected": True,
+        "connected": is_pi_online(pi),
         "active_wing": pi.get("active_wing"),
         "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY),
         "wings": wings_data,
@@ -846,14 +866,16 @@ def get_pi_state(society_id: str, user: dict = Depends(require_society_access)):
     state = db.get("pi_state", {}).get(int(society_id))
     if not state:
         return {"connected": False}
-    filtered = {wid: w for wid, w in state.get("wings", {}).items() if wing_is_visible(w)}
-    return {"connected": True, **{k: v for k, v in state.items() if k != "wings"}, "wings": filtered}
+    filtered = {}
+    for wid, w in state.get("wings", {}).items():
+        filtered[wid] = {**w, "visible": wing_is_visible(w)}
+    return {"connected": is_pi_online(state), **{k: v for k, v in state.items() if k != "wings"}, "wings": filtered}
 
 def map_events(raw):
     out = []
     for e in raw:
         if isinstance(e, dict) and e.get("message"):
-            out.append({"id": e.get("id",0), "ts": e.get("timestamp",""), "level": (e.get("type","") or "").upper(), "msg": e.get("message","")})
+            out.append({"id": e.get("id","0"), "ts": e.get("timestamp",""), "level": (e.get("type","") or "").upper(), "msg": e.get("message","")})
     return out
 
 @app.get("/api/admin/pi-events")
@@ -861,10 +883,6 @@ def get_pi_events(society_id: str, since: int = 0, user: dict = Depends(require_
     db = load_db()
     events = map_events(db.get("pi_events", {}).get(int(society_id), []))
     return {"events": events[since:], "total": len(events), "next": len(events)}
-
-# ================================================================
-# MEMBER
-# ================================================================
 
 @app.get("/api/member/dashboard")
 def member_dashboard(user: dict = Depends(get_current_user)):
@@ -880,8 +898,7 @@ def member_dashboard(user: dict = Depends(get_current_user)):
 
     wings_data = {}
     for wid, w in pi.get("wings", {}).items():
-        if not wing_is_visible(w):
-            continue
+        if not wing_is_visible(w): continue
         wings_data[wid] = {
             "used_days": w.get("used_days", 0),
             "target_days": w.get("target_days", 0),
@@ -892,7 +909,8 @@ def member_dashboard(user: dict = Depends(get_current_user)):
         }
 
     return {
-        "connected": True, "active_wing": pi.get("active_wing"),
+        "connected": is_pi_online(pi),
+        "active_wing": pi.get("active_wing"),
         "wings": wings_data, "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY),
         "firmware_version": pi.get("firmware_version", "?"),
         "cpu_temp": pi.get("cpu_temp", 0),
