@@ -1,12 +1,12 @@
 """
-EMS SaaS Backend v5.1.0 — Industrial Production (Hardened)
+EMS SaaS Backend v5.2.0 — Industrial Production (Hardened)
 ====================================
 - Explicit Database Transactions for multi-step operations.
 - Audit logging no longer silently fails.
 - Added Rate Limiting (slowapi) for login and Pi sync.
 - Real Database readiness check in /api/health.
 - Wing contract strictly enforced: A, B, G.
-- PRODUCTION FIX: Pi sync now updates wing_configs.target_days.
+- PRODUCTION FIX: Cloud is authority for target_days (updated on ACK, not sync).
 """
 
 import os
@@ -47,7 +47,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="5.1.0-prod")
+app = FastAPI(title="EMS SaaS API", version="5.2.0-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -187,7 +187,7 @@ def ensure_db_schema():
             """)
 
         conn.commit() # Commit schema changes
-        print("DB schema verified OK (Relational v5.1.0 Hardened)")
+        print("DB schema verified OK (Relational v5.2.0 Hardened)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -718,11 +718,7 @@ def pi_sync(request: Request, payload: dict):
                 physical_toggle = str(physical_toggle).upper()
                 if physical_toggle not in ("ON", "OFF", "UNKNOWN"): physical_toggle = "UNKNOWN"
                 
-                # PRODUCTION FIX: Sync target_days from Pi to DB wing_configs
-                target_days = int(w.get("targetDays", 0))
-                cur.execute("""UPDATE wing_configs SET target_days = %s WHERE society_id = %s AND wing_id = %s""",
-                            (target_days, society_id, wid))
-                
+                # PRODUCTION FIX: Pi only reports runtime state, NOT target_days config
                 cur.execute("""INSERT INTO wing_state (device_id, wing_id, physical_toggle, used_days, clicks) 
                                VALUES (%s, %s, %s, %s, %s) 
                                ON CONFLICT (device_id, wing_id) DO UPDATE SET 
@@ -774,7 +770,7 @@ def pi_sync(request: Request, payload: dict):
 
 @app.post("/api/pi/command-ack")
 def pi_command_ack(payload: dict):
-    device_id, _ = authenticate_pi(payload)
+    device_id, society_id = authenticate_pi(payload)
     command_id = payload.get("command_id")
     if not command_id:
         raise HTTPException(400, "command_id required")
@@ -786,6 +782,23 @@ def pi_command_ack(payload: dict):
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            # Fetch the command to see what it was
+            cur.execute("SELECT command, wing, params FROM pi_commands WHERE id = %s AND device_id = %s", (command_id, device_id))
+            cmd = cur.fetchone()
+            if not cmd:
+                return {"success": True, "status": "unknown"}
+
+            # PRODUCTION FIX: If ACK is successful, apply configuration changes to DB
+            if success:
+                if cmd["command"] == "set_days":
+                    wing = cmd["wing"]
+                    days = int(cmd["params"].get("days", 0))
+                    cur.execute("UPDATE wing_configs SET target_days = %s WHERE society_id = %s AND wing_id = %s", (days, society_id, wing))
+                elif cmd["command"] == "set_reset_day":
+                    day = int(cmd["params"].get("day", 15))
+                    cur.execute("UPDATE pi_state SET reset_day = %s WHERE device_id = %s", (day, device_id))
+
+            # Update command status
             cur.execute("""UPDATE pi_commands SET status = %s, acked_at = %s, error = %s, result = %s 
                            WHERE id = %s AND device_id = %s AND status = 'delivered'""",
                         ("succeeded" if success else "failed", datetime.now(timezone.utc), None if success else error, result, command_id, device_id))
