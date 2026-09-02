@@ -16,7 +16,7 @@ def simulate_pi():
     print(f"Starting Pi Simulator for Society {SOCIETY_ID}...")
     session = requests.Session()
     
-    # Simulated Pi State
+    # Simulated Pi State (STRICT: Only runtime data, no name/display_name/target_days/disabled)
     pi_state = {
         "societyId": SOCIETY_ID,
         "key": API_KEY,
@@ -33,9 +33,9 @@ def simulate_pi():
         "watchdogEnabled": True,
         "lastRebootReason": "SIMULATOR_BOOT",
         "wings": {
-            "A": {"usedDays": 1, "targetDays": 10, "physicalToggle": "ON", "disabled": False, "clicks": 5},
-            "B": {"usedDays": 2, "targetDays": 12, "physicalToggle": "ON", "disabled": False, "clicks": 3},
-            "G": {"usedDays": 0, "targetDays": 0, "physicalToggle": "OFF", "disabled": False, "clicks": 0}
+            "A": {"usedDays": 1, "physicalToggle": "ON", "clicks": 5},
+            "B": {"usedDays": 2, "physicalToggle": "ON", "clicks": 3},
+            "G": {"usedDays": 0, "physicalToggle": "OFF", "clicks": 0}
         },
         "events": [{
             "eventId": str(uuid.uuid4()),

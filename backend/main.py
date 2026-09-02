@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v3.3.2 — Production Deployment Candidate
+EMS SaaS Backend v3.3.3 — Production Deployment Candidate
 ====================================
 Wings: A, B, G
 Reset Day: 15 (default, configurable per society)
@@ -45,7 +45,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:5500",
 ]
 
-app = FastAPI(title="EMS SaaS API", version="3.3.2-prod")
+app = FastAPI(title="EMS SaaS API", version="3.3.3-prod")
 
 DEFAULT_RESET_DAY = 15
 WING_ORDER = ["A", "B", "G"]
@@ -411,9 +411,9 @@ def bootstrap():
         })
         db["pi_state"][1] = {
             "active_wing": "A", "wings": {
-                "A": {"name": "A", "display_name": "Wing A", "used_days": 0, "target_days": 9, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
-                "B": {"name": "B", "display_name": "Wing B", "used_days": 0, "target_days": 12, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
-                "G": {"name": "G", "display_name": "Wing G", "used_days": 0, "target_days": 10, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
+                "A": {"name": "Tower A", "display_name": "Tower A", "used_days": 0, "target_days": 9, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
+                "B": {"name": "Tower B", "display_name": "Tower B", "used_days": 0, "target_days": 12, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
+                "G": {"name": "Tower G", "display_name": "Tower G", "used_days": 0, "target_days": 10, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
             },
             "reset_day": DEFAULT_RESET_DAY, "emergency_stop": False, "firmware_version": "0.0.0",
             "uptime_seconds": 0, "cpu_temp": 0, "disk_free_mb": 0, "last_sync": now_iso,
@@ -660,7 +660,11 @@ def pi_sync(payload: dict):
         now = datetime.now(timezone.utc).isoformat()
 
         wings = {}
-        for wid, w in payload.get("wings", {}).items():
+        # Iterate strictly over A, B, G to maintain canonical keys
+        for wid in WING_ORDER:
+            w = payload.get("wings", {}).get(wid, {})
+            
+            # 1. Normalize Pi Runtime State
             physical_toggle = w.get("physicalToggle", "UNKNOWN")
             if isinstance(physical_toggle, bool):
                 physical_toggle = "ON" if physical_toggle else "OFF"
@@ -668,18 +672,26 @@ def pi_sync(payload: dict):
             if physical_toggle not in ("ON", "OFF", "UNKNOWN"):
                 physical_toggle = "UNKNOWN"
 
+            # 2. Fetch Existing DB Configuration (Backend is authority)
+            existing_wing = db.get("pi_state", {}).get(sid, {}).get("wings", {}).get(wid, {})
+            
+            # 3. Merge: Keep DB config, update Pi runtime
             wings[wid] = {
-                "name": w.get("name", wid),
-                "display_name": w.get("display_name", w.get("name", wid)),
-                "used_days": int(w.get("usedDays", 0)),
-                "target_days": int(w.get("targetDays", 0)),
-                "clicks": int(w.get("clicks", 0)),
-                "disabled": bool(w.get("disabled", False)),
+                # Backend Owned (Configuration)
+                "name": existing_wing.get("name", wid),
+                "display_name": existing_wing.get("display_name", f"Wing {wid}"),
+                "target_days": existing_wing.get("target_days", 0),
+                "disabled": existing_wing.get("disabled", False),
+                
+                # Pi Owned (Runtime State)
+                "used_days": int(w.get("usedDays", existing_wing.get("used_days", 0))),
+                "clicks": int(w.get("clicks", existing_wing.get("clicks", 0))),
                 "physical_toggle": physical_toggle,
             }
 
         pi_state = {
-            "active_wing": payload.get("activeWing"), "wings": wings,
+            "active_wing": payload.get("activeWing"), 
+            "wings": wings,
             "reset_day": int(payload.get("resetDay", DEFAULT_RESET_DAY)),
             "emergency_stop": bool(payload.get("emergencyStop", False)),
             "firmware_version": payload.get("firmwareVersion", "?"),
