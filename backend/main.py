@@ -60,7 +60,7 @@ VALID_COMMANDS = {
 # ================================================================
 
 def get_db():
-    conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
+    conn = psycopg.connect(DATABASE_URL, connect_timeout=10, row_factory=dict_row)
     conn.autocommit = True
     return conn
 
