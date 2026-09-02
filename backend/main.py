@@ -1,10 +1,9 @@
 """
-EMS SaaS Backend v4.1.1 — Industrial Production (Relational DB + Full Endpoints)
+EMS SaaS Backend v4.2.0 — Industrial Production (Hardened)
 ====================================
-- Decoupled Pi device identity from Society (supports multiple Pis per society).
-- Wing configuration owned by DB; Pi only reports runtime state.
-- Command state machine (queued -> delivered -> succeeded/failed/expired).
-- Audit log for administrative actions.
+- Added DB Foreign Keys with ON DELETE CASCADE for strict relational integrity.
+- Strict Command State Machine (delivered -> succeeded/failed).
+- Event cursor pagination (last_id) instead of array offset.
 - Native Postgres UNIQUE constraints for strict idempotency.
 """
 
@@ -42,12 +41,12 @@ ALLOWED_ORIGINS = [
     "http://localhost:5500",
 ]
 
-app = FastAPI(title="EMS SaaS API", version="4.1.1-prod")
+app = FastAPI(title="EMS SaaS API", version="4.2.0-prod")
 
 DEFAULT_RESET_DAY = 15
 WING_ORDER = ["A", "B", "G"]
 PI_ONLINE_THRESHOLD_SECONDS = 120
-COMMAND_EXPIRY_SECONDS = 300  # Expire commands stuck in 'delivered' for 5 mins
+COMMAND_EXPIRY_SECONDS = 300
 VALID_ROLES = {"super_admin", "society_admin", "member"}
 
 VALID_COMMANDS = {
@@ -151,7 +150,17 @@ def ensure_db_schema():
                     action TEXT, details JSONB, created_at TIMESTAMPTZ
                 );
             """)
-        print("DB schema verified OK (Relational v4.1.1)")
+            
+            # PRODUCTION HARDENING: Add Foreign Keys & Cascades safely
+            cur.execute("ALTER TABLE users ADD CONSTRAINT IF NOT EXISTS fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL")
+            cur.execute("ALTER TABLE pi_devices ADD CONSTRAINT IF NOT EXISTS fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE CASCADE")
+            cur.execute("ALTER TABLE wing_configs ADD CONSTRAINT IF NOT EXISTS fk_wing_configs_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE CASCADE")
+            cur.execute("ALTER TABLE wing_state ADD CONSTRAINT IF NOT EXISTS fk_wing_state_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE")
+            cur.execute("ALTER TABLE pi_state ADD CONSTRAINT IF NOT EXISTS fk_pi_state_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE")
+            cur.execute("ALTER TABLE pi_events ADD CONSTRAINT IF NOT EXISTS fk_pi_events_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE")
+            cur.execute("ALTER TABLE pi_commands ADD CONSTRAINT IF NOT EXISTS fk_pi_commands_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE")
+
+        print("DB schema verified OK (Relational v4.2.0 Hardened)")
     except Exception as e:
         print(f"DB SCHEMA CHECK ERROR: {e}")
     finally:
@@ -350,7 +359,6 @@ def bootstrap():
                         ("Prestine Pacific", "Mumbai", "Basic", "active", "prestine"))
             sid = cur.fetchone()["id"]
             
-            # Generate Pi Device
             device_id = str(uuid.uuid4())
             raw_api_key = str(uuid.uuid4())
             cur.execute("INSERT INTO pi_devices (id, society_id, name, api_key_hash, status) VALUES (%s, %s, %s, %s, %s)",
@@ -363,7 +371,6 @@ def bootstrap():
             cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
                         ("member@prestine.com", "Prestine Member", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "member", sid))
             
-            # Initialize Wing Configs (DB Owned)
             for wid in WING_ORDER:
                 cur.execute("INSERT INTO wing_configs (society_id, wing_id, name, display_name, target_days, disabled) VALUES (%s, %s, %s, %s, %s, %s)",
                            (sid, wid, f"Tower {wid}", f"Tower {wid}", 10 if wid == "A" else 12 if wid == "B" else 10, False))
@@ -489,10 +496,8 @@ def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))
     try:
         with conn.cursor() as cur:
             sid = data.get("id")
+            # CASCADE will automatically clean up devices, state, events, commands, etc.
             cur.execute("DELETE FROM societies WHERE id = %s", (sid,))
-            cur.execute("DELETE FROM pi_devices WHERE society_id = %s", (sid,))
-            cur.execute("DELETE FROM wing_configs WHERE society_id = %s", (sid,))
-            cur.execute("DELETE FROM users WHERE society_id = %s", (sid,))
             log_audit(user, sid, "DELETE_SOCIETY", {})
     finally:
         conn.close()
@@ -633,16 +638,13 @@ def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-K
 def pi_sync(payload: dict):
     device_id = authenticate_pi(payload)
     now = datetime.now(timezone.utc)
-    now_iso = now.isoformat()
     
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            # 1. Update Device Last Seen & Firmware
             cur.execute("UPDATE pi_devices SET last_seen = %s, firmware_version = %s WHERE id = %s",
                         (now, payload.get("firmwareVersion", "unknown"), device_id))
                         
-            # 2. Update Wing Runtime State
             for wid, w in payload.get("wings", {}).items():
                 if wid not in WING_ORDER: continue
                 physical_toggle = w.get("physicalToggle", "UNKNOWN")
@@ -656,7 +658,6 @@ def pi_sync(payload: dict):
                                physical_toggle=EXCLUDED.physical_toggle, used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks""",
                             (device_id, wid, physical_toggle, int(w.get("usedDays", 0)), int(w.get("clicks", 0))))
 
-            # 3. Upsert Pi State
             cur.execute("""INSERT INTO pi_state (device_id, active_wing, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason) 
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (device_id) DO UPDATE SET 
@@ -670,7 +671,6 @@ def pi_sync(payload: dict):
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
                          payload.get("lastRebootReason", "")))
 
-            # 4. Insert Events (Strict Unique)
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
                 if not ev_id: continue
@@ -680,11 +680,9 @@ def pi_sync(payload: dict):
                 except psycopg.errors.UniqueViolation:
                     pass 
 
-            # 5. Expire Stale Commands
             cur.execute("UPDATE pi_commands SET status = 'expired' WHERE device_id = %s AND status = 'delivered' AND delivered_at < %s",
                         (device_id, now - timedelta(seconds=COMMAND_EXPIRY_SECONDS)))
 
-            # 6. Fetch next queued command
             cur.execute("SELECT * FROM pi_commands WHERE device_id = %s AND status = 'queued' ORDER BY created_at ASC LIMIT 1", (device_id,))
             cmd = cur.fetchone()
             
@@ -714,8 +712,9 @@ def pi_command_ack(payload: dict):
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            # PRODUCTION HARDENING: Strict State Machine (only allow transition from 'delivered')
             cur.execute("""UPDATE pi_commands SET status = %s, acked_at = %s, error = %s, result = %s 
-                           WHERE id = %s AND device_id = %s""",
+                           WHERE id = %s AND device_id = %s AND status = 'delivered'""",
                         ("succeeded" if success else "failed", datetime.now(timezone.utc), None if success else error, result, command_id, device_id))
     finally:
         conn.close()
@@ -828,24 +827,25 @@ def map_events(raw):
     out = []
     for e in raw:
         out.append({
-            "id": str(e["id"]), 
+            "id": e["id"], # Return integer ID for cursor
             "ts": e["timestamp"].isoformat() if e.get("timestamp") else "", 
             "level": (e.get("type","") or "").upper(), 
             "msg": e.get("message","")
         })
     return out
 
+# PRODUCTION HARDENING: Cursor-based Pagination (last_id)
 @app.get("/api/admin/pi-events")
-def get_pi_events(society_id: str, since: int = 0, user: dict = Depends(require_society_access)):
+def get_pi_events(society_id: str, last_id: int = 0, user: dict = Depends(require_society_access)):
     sid = int(society_id)
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             dev_id = get_device_for_society(cur, sid)
-            cur.execute("SELECT * FROM pi_events WHERE device_id = %s ORDER BY timestamp DESC LIMIT 100", (dev_id,))
+            cur.execute("SELECT * FROM pi_events WHERE device_id = %s AND id > %s ORDER BY id ASC LIMIT 100", (dev_id, last_id))
             events = cur.fetchall()
             mapped = map_events(events)
-            return {"events": mapped[since:], "total": len(mapped), "next": len(mapped)}
+            return {"events": mapped, "last_id": mapped[-1]["id"] if mapped else last_id}
     finally:
         conn.close()
 
@@ -892,7 +892,7 @@ def member_dashboard(user: dict = Depends(get_current_user)):
         conn.close()
 
 @app.get("/api/member/events")
-def member_events(since: int = 0, user: dict = Depends(get_current_user)):
+def member_events(last_id: int = 0, user: dict = Depends(get_current_user)):
     if user.get("role") != "member": raise HTTPException(403, "Members only")
     sid = user.get("society_id")
     if not sid: raise HTTPException(400, "No society assigned")
@@ -901,9 +901,9 @@ def member_events(since: int = 0, user: dict = Depends(get_current_user)):
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             dev_id = get_device_for_society(cur, sid)
-            cur.execute("SELECT * FROM pi_events WHERE device_id = %s ORDER BY timestamp DESC LIMIT 100", (dev_id,))
+            cur.execute("SELECT * FROM pi_events WHERE device_id = %s AND id > %s ORDER BY id ASC LIMIT 100", (dev_id, last_id))
             events = cur.fetchall()
             mapped = map_events(events)
-            return {"events": mapped[since:], "total": len(mapped), "next": len(mapped)}
+            return {"events": mapped, "last_id": mapped[-1]["id"] if mapped else last_id}
     finally:
         conn.close()
