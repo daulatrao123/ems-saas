@@ -151,14 +151,32 @@ def ensure_db_schema():
                 );
             """)
             
-            # PRODUCTION HARDENING: Add Foreign Keys & Cascades safely
-            cur.execute("ALTER TABLE users ADD CONSTRAINT IF NOT EXISTS fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL")
-            cur.execute("ALTER TABLE pi_devices ADD CONSTRAINT IF NOT EXISTS fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE CASCADE")
-            cur.execute("ALTER TABLE wing_configs ADD CONSTRAINT IF NOT EXISTS fk_wing_configs_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE CASCADE")
-            cur.execute("ALTER TABLE wing_state ADD CONSTRAINT IF NOT EXISTS fk_wing_state_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE")
-            cur.execute("ALTER TABLE pi_state ADD CONSTRAINT IF NOT EXISTS fk_pi_state_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE")
-            cur.execute("ALTER TABLE pi_events ADD CONSTRAINT IF NOT EXISTS fk_pi_events_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE")
-            cur.execute("ALTER TABLE pi_commands ADD CONSTRAINT IF NOT EXISTS fk_pi_commands_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE")
+                        # PRODUCTION HARDENING: Add Foreign Keys & Cascades safely
+            cur.execute("""
+                DO $$                 BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_society') THEN
+                        ALTER TABLE users ADD CONSTRAINT fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_devices_society') THEN
+                        ALTER TABLE pi_devices ADD CONSTRAINT fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE CASCADE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_wing_configs_society') THEN
+                        ALTER TABLE wing_configs ADD CONSTRAINT fk_wing_configs_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE CASCADE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_wing_state_device') THEN
+                        ALTER TABLE wing_state ADD CONSTRAINT fk_wing_state_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_pi_state_device') THEN
+                        ALTER TABLE pi_state ADD CONSTRAINT fk_pi_state_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_pi_events_device') THEN
+                        ALTER TABLE pi_events ADD CONSTRAINT fk_pi_events_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_pi_commands_device') THEN
+                        ALTER TABLE pi_commands ADD CONSTRAINT fk_pi_commands_device FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE;
+                    END IF;
+                END $$;
+            """)
 
         print("DB schema verified OK (Relational v4.2.0 Hardened)")
     except Exception as e:
