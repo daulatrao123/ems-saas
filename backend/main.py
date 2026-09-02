@@ -806,6 +806,9 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                 "firmware_version": pi.get("firmware_version", "?"),
                 "cpu_temp": pi.get("cpu_temp", 0),
                 "uptime_seconds": pi.get("uptime_seconds", 0),
+                "boot_count": pi.get("boot_count", 0),
+                "disk_free_mb": pi.get("disk_free_mb", 0),
+                "clock_source": pi.get("clock_source", "NTP"),
                 "last_sync": pi.get("last_sync").isoformat() if pi.get("last_sync") else None,
                 "pending_command": {
                     "id": str(pc["id"]), "command": pc["command"],

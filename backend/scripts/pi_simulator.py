@@ -52,19 +52,43 @@ def simulate_pi():
             data = res.json()
             print("✅ Sync Successful. last_sync updated.")
             
+            # Clear events after successful sync so we don't resend them
+            pi_state["events"].clear()
+            
             cmd = data.get("command")
             cmd_id = data.get("command_id")
             
             if cmd and cmd_id:
                 print(f"📦 Received Command: {cmd} (ID: {cmd_id})")
+                event_msg = ""
                 
                 if cmd == "set_active_wing":
                     wing = data.get("wing")
                     print(f"⚡ Executing: Activating Wing {wing}")
                     pi_state["activeWing"] = wing
+                    event_msg = f"Command: Activated Wing {wing}"
                 elif cmd == "off_all":
                     print("⚡ Executing: Turning off all wings")
                     pi_state["activeWing"] = None
+                    event_msg = "Command: All wings turned OFF"
+                elif cmd == "reset_days":
+                    print("⚡ Executing: Resetting days")
+                    for w in pi_state["wings"]: pi_state["wings"][w]["usedDays"] = 0
+                    event_msg = "System: Monthly reset executed"
+                elif cmd == "set_days":
+                    wing = data.get("wing")
+                    days = data.get("params", {}).get("days")
+                    print(f"⚡ Executing: Setting Wing {wing} to {days} days")
+                    event_msg = f"Command: Set Wing {wing} to {days} days"
+                    
+                # Generate a new event for the executed command
+                if event_msg:
+                    pi_state["events"].append({
+                        "eventId": str(uuid.uuid4()),
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "type": "command" if "Command" in event_msg else "system",
+                        "message": event_msg
+                    })
                     
                 ack_payload = {
                     "deviceId": DEVICE_ID,
