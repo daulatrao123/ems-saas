@@ -1,22 +1,18 @@
 """
-EMS SaaS Backend v3.3.3 — Production Deployment Candidate
+EMS SaaS Backend v4.0.0 — Industrial Production (Relational DB)
 ====================================
-Wings: A, B, G
-Reset Day: 15 (default, configurable per society)
-Commands: set_active_wing, set_days, set_reset_day, restart,
-          reboot, reset_days, off_wing, off_all, lcd_display
-Pi auth: strict key verification, never overwrites stored key
-Wing visibility: target_days > 0 AND physical_toggle == ON AND not disabled
+- Migrated from JSONB to proper PostgreSQL relational tables.
+- Eliminated global Python locks; uses DB-level atomic operations.
+- API keys stored as SHA-256 hashes.
+- Native Postgres UNIQUE constraint for event idempotency.
 """
 
 import os
-import json
 import time
 import uuid
-import threading
+import hashlib
 import psycopg
 from psycopg.rows import dict_row
-from contextlib import contextmanager
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,7 +27,7 @@ from datetime import datetime, timezone, timedelta
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    print("WARNING: DATABASE_URL not configured — local JSON only")
+    raise RuntimeError("DATABASE_URL environment variable is required.")
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
@@ -45,7 +41,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:5500",
 ]
 
-app = FastAPI(title="EMS SaaS API", version="3.3.3-prod")
+app = FastAPI(title="EMS SaaS API", version="4.0.0-prod")
 
 DEFAULT_RESET_DAY = 15
 WING_ORDER = ["A", "B", "G"]
@@ -58,155 +54,71 @@ VALID_COMMANDS = {
 }
 
 # ================================================================
-# DATABASE & CONCURRENCY CONTROL
+# DATABASE & SCHEMA INITIALIZATION
 # ================================================================
-
-_db_cache = {"data": None, "ts": 0}
-DB_CACHE_TTL = 30
-INT_KEYS = ("pi_state", "pi_events", "pi_commands")
-
-# Global lock to prevent concurrent read-modify-write race conditions
-_db_write_lock = threading.Lock()
 
 def get_db():
-    if not DATABASE_URL:
-        return None
-    try:
-        conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        print(f"DB CONNECT ERROR: {e}")
-        return None
-
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
-
-def load_db() -> dict:
-    now = time.time()
-    if _db_cache["data"] and (now - _db_cache["ts"]) < DB_CACHE_TTL:
-        return _db_cache["data"]
-        
-    default = {"users": [], "societies": [], "pi_state": {}, "pi_events": {}, "pi_commands": {}, "firmware_versions": []}
-    
-    if DATABASE_URL:
-        conn = get_db()
-        if conn:
-            try:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute("SELECT key, data FROM saas_data")
-                    rows = cur.fetchall()
-                    db = default.copy()
-                    for row in rows:
-                        db[row["key"]] = row["data"]
-                    for k in INT_KEYS:
-                        if k in db and db[k]:
-                            db[k] = {int(ik): iv for ik, iv in db[k].items()}
-                    _db_cache["data"] = db
-                    _db_cache["ts"] = now
-                    return db
-            except Exception as e:
-                print(f"NEON LOAD ERROR: {e}")
-                raise HTTPException(status_code=500, detail="Database read failed")
-            finally:
-                conn.close()
-        else:
-            raise HTTPException(status_code=500, detail="Database connection failed")
-    else:
-        if os.path.exists(DB_FILE):
-            try:
-                with open(DB_FILE, "r") as f:
-                    db = json.load(f)
-                for k in INT_KEYS:
-                    if k in db and db[k]:
-                        db[k] = {int(ik): iv for ik, iv in db[k].items()}
-                _db_cache["data"] = db
-                _db_cache["ts"] = now
-                return db
-            except Exception:
-                pass
-                
-    return default
-
-def save_db(data: dict) -> None:
-    if DATABASE_URL:
-        conn = get_db()
-        if conn:
-            try:
-                with conn.cursor() as cur:
-                    for key in list(data.keys()):
-                        val = data.get(key, [])
-                        if key in INT_KEYS and val:
-                            val = {str(ik): iv for ik, iv in val.items()}
-                        cur.execute(
-                            "INSERT INTO saas_data (key, data) VALUES (%s, %s) "
-                            "ON CONFLICT (key) DO UPDATE SET data = %s, updated_at = NOW()",
-                            (key, json.dumps(val), json.dumps(val)),
-                        )
-                # Cache ONLY after successful persistence
-                _db_cache["data"] = data
-                _db_cache["ts"] = time.time()
-            except Exception as e:
-                print(f"NEON SAVE ERROR: {e}")
-                raise HTTPException(status_code=500, detail="Database write failed")
-            finally:
-                conn.close()
-        else:
-            raise HTTPException(status_code=500, detail="Database connection failed")
-    else:
-        try:
-            with open(DB_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-            _db_cache["data"] = data
-            _db_cache["ts"] = time.time()
-        except Exception as e:
-            print(f"LOCAL FILE SAVE ERROR: {e}")
-            raise HTTPException(status_code=500, detail="Local file write failed")
-
-@contextmanager
-def db_transaction():
-    """
-    Context manager that handles locking, loading, and saving.
-    Guarantees the lock is released exactly once, even if load_db fails.
-    """
-    _db_write_lock.acquire()
-    try:
-        db = load_db()
-        yield db
-        save_db(db)
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"DB TRANSACTION ERROR: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error during DB transaction")
-    finally:
-        _db_write_lock.release()
-
-# ================================================================
-# AUTO-CREATE TABLE ON STARTUP
-# ================================================================
+    conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
+    conn.autocommit = True
+    return conn
 
 @app.on_event("startup")
 def ensure_db_schema():
-    if not DATABASE_URL:
-        return
+    conn = get_db()
     try:
-        conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
-        conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS saas_data (
-                    key   TEXT PRIMARY KEY,
-                    data  JSONB NOT NULL DEFAULT '{}',
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                )
+                CREATE TABLE IF NOT EXISTS societies (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT, location TEXT, plan TEXT, status TEXT,
+                    tailscale_ip TEXT, pi_port INT, api_key TEXT, society_code TEXT
+                );
             """)
-        conn.close()
-        print("DB schema verified OK")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    email TEXT UNIQUE, name TEXT, password TEXT, role TEXT, society_id INT
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_state (
+                    society_id INT PRIMARY KEY,
+                    active_wing TEXT, wings JSONB, reset_day INT, emergency_stop BOOL,
+                    firmware_version TEXT, uptime_seconds INT, cpu_temp FLOAT, disk_free_mb FLOAT,
+                    last_sync TIMESTAMPTZ, boot_count INT, last_shutdown_reason TEXT, clock_source TEXT,
+                    watchdog_enabled BOOL, last_reboot_reason TEXT
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_events (
+                    id SERIAL PRIMARY KEY,
+                    society_id INT, event_id TEXT UNIQUE, timestamp TIMESTAMPTZ, type TEXT, message TEXT
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_commands (
+                    id UUID PRIMARY KEY,
+                    society_id INT, command TEXT, wing TEXT, params JSONB,
+                    status TEXT, queued_at TIMESTAMPTZ, sent_at TIMESTAMPTZ, acked_at TIMESTAMPTZ, error TEXT, result TEXT
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS firmware_versions (
+                    version TEXT PRIMARY KEY,
+                    code TEXT, changelog TEXT, forced BOOL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+                );
+            """)
+        print("DB schema verified OK (Relational v4.0)")
     except Exception as e:
         print(f"DB SCHEMA CHECK ERROR: {e}")
+    finally:
+        conn.close()
+
+def hash_api_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
 
 # ================================================================
-# EXCEPTION HANDLERS
+# EXCEPTION HANDLERS & CORS
 # ================================================================
 
 def _cors_headers(origin: str) -> dict:
@@ -239,10 +151,6 @@ app.add_middleware(
 # UTILITIES
 # ================================================================
 
-def next_id(items: list) -> str:
-    if not items: return "1"
-    return str(max(int(x.get("id", "0")) for x in items) + 1)
-
 def create_token(data: dict) -> str:
     payload = data.copy()
     payload["exp"] = datetime.now(timezone.utc) + timedelta(days=30)
@@ -250,17 +158,15 @@ def create_token(data: dict) -> str:
 
 def is_pi_online(pi_state: dict) -> bool:
     if not pi_state: return False
-    last_sync_str = pi_state.get("last_sync")
-    if not last_sync_str: return False
-    try:
-        if last_sync_str.endswith("Z"):
-            last_sync_str = last_sync_str[:-1] + "+00:00"
-        last_sync = datetime.fromisoformat(last_sync_str)
-        if last_sync.tzinfo is None:
-            last_sync = last_sync.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - last_sync).total_seconds() <= PI_ONLINE_THRESHOLD_SECONDS
-    except Exception:
-        return False
+    last_sync = pi_state.get("last_sync")
+    if not last_sync: return False
+    if isinstance(last_sync, str):
+        try:
+            if last_sync.endswith("Z"): last_sync = last_sync[:-1] + "+00:00"
+            last_sync = datetime.fromisoformat(last_sync)
+        except: return False
+    if last_sync.tzinfo is None: last_sync = last_sync.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last_sync).total_seconds() <= PI_ONLINE_THRESHOLD_SECONDS
 
 def wing_is_visible(w: dict) -> bool:
     physical = str(w.get("physical_toggle", "UNKNOWN")).upper()
@@ -328,27 +234,22 @@ async def require_society_access(request: Request, user: dict = Depends(get_curr
             raise HTTPException(status_code=403, detail="Cannot access other society data")
     return user
 
-def authenticate_pi(payload: dict) -> tuple:
-    try:
-        sid = int(payload.get("societyId"))
-    except Exception:
-        raise HTTPException(400, "Invalid societyId")
-        
+def authenticate_pi(payload: dict) -> int:
+    try: sid = int(payload.get("societyId"))
+    except: raise HTTPException(400, "Invalid societyId")
+    
     supplied_key = str(payload.get("key", ""))
-    if not supplied_key:
-        raise HTTPException(401, "Pi API key required")
-        
-    db = load_db() 
-    society = next((s for s in db.get("societies", []) if int(s.get("id", 0)) == sid), None)
-    if not society:
-        raise HTTPException(403, "Society not registered.")
-        
-    stored_key = str(society.get("api_key", ""))
-    if not stored_key:
-        raise HTTPException(403, "No Pi API key configured for this society.")
-    if supplied_key != stored_key:
-        raise HTTPException(403, "Invalid Pi API key.")
-    return sid, society
+    if not supplied_key: raise HTTPException(401, "Pi API key required")
+    
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM societies WHERE id = %s AND api_key = %s", (sid, hash_api_key(supplied_key)))
+            soc = cur.fetchone()
+            if not soc: raise HTTPException(403, "Invalid Pi API key or Society ID.")
+            return sid
+    finally:
+        conn.close()
 
 # ================================================================
 # HEALTH & KEEPALIVE
@@ -379,51 +280,46 @@ def health():
 
 @app.post("/api/bootstrap")
 def bootstrap():
-    with db_transaction() as db:
-        if db["users"]:
-            raise HTTPException(400, "System already initialized")
-
-        bootstrap_pass = os.getenv("EMS_BOOTSTRAP_PASSWORD")
-        if not bootstrap_pass:
-            raise HTTPException(500, "EMS_BOOTSTRAP_PASSWORD env variable is not configured.")
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        db["societies"].append({
-            "id": "1", "name": "Prestine Pacific", "location": "Mumbai",
-            "plan": "Basic", "status": "active", "tailscale_ip": "",
-            "pi_port": 5000, "api_key": "", "society_code": "prestine",
-        })
-        db["users"].append({
-            "id": "1", "email": "admin@ems.com", "name": "Super Admin",
-            "password": bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(),
-            "role": "super_admin", "society_id": None,
-        })
-        db["users"].append({
-            "id": "2", "email": "admin@prestine.com", "name": "Prestine Admin",
-            "password": bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(),
-            "role": "society_admin", "society_id": "1",
-        })
-        db["users"].append({
-            "id": "3", "email": "member@prestine.com", "name": "Prestine Member",
-            "password": bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(),
-            "role": "member", "society_id": "1",
-        })
-        db["pi_state"][1] = {
-            "active_wing": "A", "wings": {
+    bootstrap_pass = os.getenv("EMS_BOOTSTRAP_PASSWORD")
+    if not bootstrap_pass:
+        raise HTTPException(500, "EMS_BOOTSTRAP_PASSWORD env variable is not configured.")
+        
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM users LIMIT 1")
+            if cur.fetchone():
+                raise HTTPException(400, "System already initialized")
+                
+            cur.execute("INSERT INTO societies (name, location, plan, status, pi_port, society_code) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id", 
+                        ("Prestine Pacific", "Mumbai", "Basic", "active", 5000, "prestine"))
+            sid = cur.fetchone()["id"]
+            
+            # Generate a random API key for the society
+            raw_api_key = str(uuid.uuid4())
+            cur.execute("UPDATE societies SET api_key = %s WHERE id = %s", (hash_api_key(raw_api_key), sid))
+            
+            cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
+                        ("admin@ems.com", "Super Admin", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "super_admin", None))
+            cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
+                        ("admin@prestine.com", "Prestine Admin", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "society_admin", sid))
+            cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
+                        ("member@prestine.com", "Prestine Member", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "member", sid))
+                        
+            wings = {
                 "A": {"name": "Tower A", "display_name": "Tower A", "used_days": 0, "target_days": 9, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
                 "B": {"name": "Tower B", "display_name": "Tower B", "used_days": 0, "target_days": 12, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
-                "G": {"name": "Tower G", "display_name": "Tower G", "used_days": 0, "target_days": 10, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"},
-            },
-            "reset_day": DEFAULT_RESET_DAY, "emergency_stop": False, "firmware_version": "0.0.0",
-            "uptime_seconds": 0, "cpu_temp": 0, "disk_free_mb": 0, "last_sync": now_iso,
-            "boot_count": 0, "last_shutdown_reason": None, "clock_source": "ntp",
-            "watchdog_enabled": True, "last_reboot_reason": None,
-        }
-        db["pi_events"][1] = [{"id": str(uuid.uuid4()), "event_id": str(uuid.uuid4()), "timestamp": now_iso, "type": "system", "message": "System bootstrapped"}]
-        db["pi_commands"][1] = []
+                "G": {"name": "Tower G", "display_name": "Tower G", "used_days": 0, "target_days": 10, "clicks": 0, "disabled": False, "physical_toggle": "UNKNOWN"}
+            }
+            cur.execute("""INSERT INTO pi_state (society_id, active_wing, wings, reset_day, emergency_stop, firmware_version, 
+                           uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, watchdog_enabled) 
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (sid, "A", psycopg.types.json.Json(wings), DEFAULT_RESET_DAY, False, "0.0.0", 0, 0.0, 0.0, datetime.now(timezone.utc), 0, True))
+                        
+    finally:
+        conn.close()
         
-    return {"message": "Initialized. Change default passwords and set society API key."}
+    return {"message": "Initialized. Change default passwords.", "society_api_key": raw_api_key}
 
 # ================================================================
 # AUTH LOGIN
@@ -431,18 +327,24 @@ def bootstrap():
 
 @app.post("/api/auth/login")
 def login(user: UserLogin):
-    db = load_db()
-    db_user = next((u for u in db["users"] if u["email"] == user.email), None)
-    if not db_user or not bcrypt.checkpw(user.password.encode(), db_user["password"].encode()):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_token({
-        "id": int(db_user["id"]), "role": db_user["role"],
-        "society_id": int(db_user["society_id"]) if db_user.get("society_id") else None,
-    })
-    return {
-        "token": token, "role": db_user["role"],
-        "name": db_user["name"], "society_id": db_user.get("society_id"),
-    }
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM users WHERE email = %s", (user.email,))
+            db_user = cur.fetchone()
+            if not db_user or not bcrypt.checkpw(user.password.encode(), db_user["password"].encode()):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+                
+            token = create_token({
+                "id": db_user["id"], "role": db_user["role"],
+                "society_id": db_user["society_id"]
+            })
+            return {
+                "token": token, "role": db_user["role"],
+                "name": db_user["name"], "society_id": db_user["society_id"],
+            }
+    finally:
+        conn.close()
 
 # ================================================================
 # SUPER-ADMIN — SOCIETIES
@@ -450,81 +352,92 @@ def login(user: UserLogin):
 
 @app.get("/api/super-admin/societies")
 def get_societies(user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    result = []
-    for s in db["societies"]:
-        pi = db.get("pi_state", {}).get(int(s["id"]))
-        online = is_pi_online(pi)
-        wings = pi.get("wings", {}) if pi else {}
-        wing_data = {}
-        for wid, w in wings.items():
-            wing_data[wid] = {
-                "name": w.get("name", wid),
-                "display_name": w.get("display_name", ""),
-                "used_days": w.get("used_days", 0),
-                "target_days": w.get("target_days", 0),
-                "clicks": w.get("clicks", 0),
-                "disabled": w.get("disabled", False),
-                "physical_toggle": w.get("physical_toggle", "UNKNOWN"),
-                "visible": wing_is_visible(w),
-            }
-            
-        raw_key = s.get("api_key", "")
-        masked_key = f"***{raw_key[-4:]}" if raw_key else ""
-            
-        result.append({
-            "id": s["id"], "name": s["name"], "location": s["location"],
-            "plan": s["plan"], "status": s.get("status", "active"),
-            "tailscale_ip": s.get("tailscale_ip", ""), "pi_port": s.get("pi_port", 5000),
-            "api_key": masked_key,
-            "society_code": s.get("society_code", ""),
-            "pi_online": online, "last_sync": pi.get("last_sync") if pi else None,
-            "active_wing": pi.get("active_wing") if pi else None,
-            "emergency_stop": pi.get("emergency_stop", False) if pi else False,
-            "firmware_version": pi.get("firmware_version", "?") if pi else None,
-            "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY) if pi else DEFAULT_RESET_DAY,
-            "wings": wing_data,
-            "watchdog_enabled": pi.get("watchdog_enabled", False) if pi else False,
-            "last_reboot_reason": pi.get("last_reboot_reason", "") if pi else "",
-        })
-    return result
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM societies ORDER BY id ASC")
+            societies = cur.fetchall()
+            result = []
+            for s in societies:
+                sid = s["id"]
+                cur.execute("SELECT * FROM pi_state WHERE society_id = %s", (sid,))
+                pi = cur.fetchone()
+                
+                online = is_pi_online(pi)
+                wings = pi.get("wings", {}) if pi else {}
+                wing_data = {}
+                for wid, w in wings.items():
+                    wing_data[wid] = {
+                        "name": w.get("name", wid),
+                        "display_name": w.get("display_name", ""),
+                        "used_days": w.get("used_days", 0),
+                        "target_days": w.get("target_days", 0),
+                        "clicks": w.get("clicks", 0),
+                        "disabled": w.get("disabled", False),
+                        "physical_toggle": w.get("physical_toggle", "UNKNOWN"),
+                        "visible": wing_is_visible(w),
+                    }
+                    
+                result.append({
+                    "id": s["id"], "name": s["name"], "location": s["location"],
+                    "plan": s["plan"], "status": s.get("status", "active"),
+                    "tailscale_ip": s.get("tailscale_ip", ""), "pi_port": s.get("pi_port", 5000),
+                    "api_key": "configured" if s.get("api_key") else "",
+                    "society_code": s.get("society_code", ""),
+                    "pi_online": online, "last_sync": pi.get("last_sync") if pi else None,
+                    "active_wing": pi.get("active_wing") if pi else None,
+                    "emergency_stop": pi.get("emergency_stop", False) if pi else False,
+                    "firmware_version": pi.get("firmware_version", "?") if pi else None,
+                    "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY) if pi else DEFAULT_RESET_DAY,
+                    "wings": wing_data,
+                    "watchdog_enabled": pi.get("watchdog_enabled", False) if pi else False,
+                    "last_reboot_reason": pi.get("last_reboot_reason", "") if pi else "",
+                })
+            return result
+    finally:
+        conn.close()
 
 @app.post("/api/super-admin/societies/save")
 def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
-    with db_transaction() as db:
-        sid = data.get("id")
-        society = {
-            "name": data.get("name", ""), "location": data.get("location", ""),
-            "plan": data.get("plan", "Basic"), "status": "active",
-            "tailscale_ip": data.get("tailscale_ip", ""),
-            "pi_port": int(data.get("pi_port", 5000)),
-            "society_code": data.get("society_code", ""),
-        }
-        
-        if data.get("api_key") and not data["api_key"].startswith("***"):
-            society["api_key"] = data["api_key"]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            sid = data.get("id")
+            society = {
+                "name": data.get("name", ""), "location": data.get("location", ""),
+                "plan": data.get("plan", "Basic"), "status": "active",
+                "tailscale_ip": data.get("tailscale_ip", ""),
+                "pi_port": int(data.get("pi_port", 5000)),
+                "society_code": data.get("society_code", ""),
+            }
             
-        if sid:
-            for s in db["societies"]:
-                if s["id"] == sid:
-                    if "api_key" not in society: society["api_key"] = s.get("api_key", "")
-                    s.update(society)
-                    break
-        else:
-            society["id"] = next_id(db["societies"])
-            if "api_key" not in society: society["api_key"] = str(uuid.uuid4())
-            db["societies"].append(society)
-            
+            if sid:
+                cur.execute("""UPDATE societies SET name=%s, location=%s, plan=%s, status=%s, 
+                               tailscale_ip=%s, pi_port=%s, society_code=%s WHERE id=%s""",
+                            (society["name"], society["location"], society["plan"], society["status"],
+                             society["tailscale_ip"], society["pi_port"], society["society_code"], sid))
+            else:
+                cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code) 
+                               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                            (society["name"], society["location"], society["plan"], society["status"],
+                             society["tailscale_ip"], society["pi_port"], society["society_code"]))
+    finally:
+        conn.close()
     return {"message": "Saved"}
 
 @app.post("/api/super-admin/societies/delete")
 def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))):
-    with db_transaction() as db:
-        sid = data.get("id")
-        db["societies"] = [s for s in db["societies"] if s["id"] != sid]
-        for key in INT_KEYS:
-            db.get(key, {}).pop(int(sid), None)
-        db["users"] = [u for u in db["users"] if u.get("society_id") != sid]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            sid = data.get("id")
+            cur.execute("DELETE FROM societies WHERE id = %s", (sid,))
+            cur.execute("DELETE FROM pi_state WHERE society_id = %s", (sid,))
+            cur.execute("DELETE FROM pi_events WHERE society_id = %s", (sid,))
+            cur.execute("DELETE FROM pi_commands WHERE society_id = %s", (sid,))
+            cur.execute("DELETE FROM users WHERE society_id = %s", (sid,))
+    finally:
+        conn.close()
     return {"message": "Deleted"}
 
 # ================================================================
@@ -533,16 +446,16 @@ def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))
 
 @app.get("/api/super-admin/users")
 def get_users(user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    users = []
-    for u in db["users"]:
-        soc = next((s for s in db["societies"] if s["id"] == u.get("society_id")), None)
-        users.append({
-            "id": u["id"], "email": u["email"], "name": u["name"],
-            "role": u["role"], "society_name": soc["name"] if soc else "None",
-            "society_id": u.get("society_id"),
-        })
-    return users
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT u.id, u.email, u.name, u.role, u.society_id, s.name as society_name FROM users u LEFT JOIN societies s ON u.society_id = s.id")
+            users = cur.fetchall()
+            for u in users:
+                u["society_id"] = str(u["society_id"]) if u["society_id"] else None
+            return users
+    finally:
+        conn.close()
 
 @app.post("/api/super-admin/users/save")
 def save_user(data: dict, user: dict = Depends(require_role("super_admin"))):
@@ -554,100 +467,105 @@ def save_user(data: dict, user: dict = Depends(require_role("super_admin"))):
     if role != "super_admin" and not society_id:
         raise HTTPException(400, "society_id is required for non-super_admin roles")
         
-    with db_transaction() as db:
-        if role != "super_admin" and not any(s["id"] == str(society_id) for s in db["societies"]):
-            raise HTTPException(400, "Invalid society_id")
-            
-        uid = data.get("id")
-        if uid:
-            user_found = False
-            for u in db["users"]:
-                if u["id"] == uid:
-                    user_found = True
-                    if data.get("password"):
-                        u["password"] = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()
-                    u["email"] = data.get("email", u["email"])
-                    u["name"] = data.get("name", u["name"])
-                    u["role"] = role
-                    u["society_id"] = None if role == "super_admin" else str(society_id)
-                    break
-            if not user_found:
-                raise HTTPException(404, "User not found")
-        else:
-            if not data.get("password"):
-                raise HTTPException(400, "Password required")
-            db["users"].append({
-                "id": next_id(db["users"]), "email": data["email"], "name": data["name"],
-                "role": role, "society_id": None if role == "super_admin" else str(society_id),
-                "password": bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode(),
-            })
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            uid = data.get("id")
+            if uid:
+                if data.get("password"):
+                    cur.execute("UPDATE users SET email=%s, name=%s, role=%s, society_id=%s, password=%s WHERE id=%s",
+                                (data["email"], data["name"], role, society_id, bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode(), uid))
+                else:
+                    cur.execute("UPDATE users SET email=%s, name=%s, role=%s, society_id=%s WHERE id=%s",
+                                (data["email"], data["name"], role, society_id, uid))
+            else:
+                if not data.get("password"):
+                    raise HTTPException(400, "Password required")
+                cur.execute("INSERT INTO users (email, name, role, society_id, password) VALUES (%s, %s, %s, %s, %s)",
+                            (data["email"], data["name"], role, society_id, bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()))
+    finally:
+        conn.close()
     return {"message": "Saved"}
 
 @app.post("/api/super-admin/users/delete")
 def delete_user(data: dict, user: dict = Depends(require_role("super_admin"))):
-    with db_transaction() as db:
-        db["users"] = [u for u in db["users"] if u["id"] != data.get("id")]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE id = %s", (data.get("id"),))
+    finally:
+        conn.close()
     return {"message": "Deleted"}
 
 @app.get("/api/super-admin/firmware/versions")
 def get_firmware_versions(user: dict = Depends(require_role("super_admin"))):
-    db = load_db()
-    versions = db.get("firmware_versions", [])
-    for v in versions: v.pop("code", None)
-    return versions
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT version, changelog, forced, created_at, updated_at FROM firmware_versions ORDER BY created_at DESC")
+            versions = cur.fetchall()
+            return versions
+    finally:
+        conn.close()
 
 @app.post("/api/super-admin/firmware/save")
 def save_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
-    with db_transaction() as db:
-        version = data.get("version", "").strip()
-        code = data.get("code", "")
-        changelog = data.get("changelog", "")
-        forced = data.get("forced", False)
-        if not version or not code:
-            raise HTTPException(400, "Version and code required")
-            
-        if "firmware_versions" not in db: db["firmware_versions"] = []
-        existing = next((v for v in db["firmware_versions"] if v["version"] == version), None)
-        if existing:
-            existing.update({"code": code, "changelog": changelog, "forced": forced, "updated_at": datetime.now(timezone.utc).isoformat()})
-        else:
-            db["firmware_versions"].insert(0, {
-                "version": version, "code": code, "changelog": changelog, "forced": forced,
-                "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()
-            })
-        if forced:
-            for v in db["firmware_versions"]:
-                if v["version"] != version: v["forced"] = False
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            version = data.get("version", "").strip()
+            code = data.get("code", "")
+            changelog = data.get("changelog", "")
+            forced = data.get("forced", False)
+            if not version or not code:
+                raise HTTPException(400, "Version and code required")
+                
+            if forced:
+                cur.execute("UPDATE firmware_versions SET forced = FALSE")
+                
+            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at) 
+                           VALUES (%s, %s, %s, %s, %s, %s) 
+                           ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s""",
+                        (version, code, changelog, forced, datetime.now(timezone.utc), datetime.now(timezone.utc), code, changelog, forced, datetime.now(timezone.utc)))
+    finally:
+        conn.close()
     return {"message": "Saved"}
 
 @app.post("/api/super-admin/firmware/delete")
 def delete_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
-    with db_transaction() as db:
-        version = data.get("version")
-        db["firmware_versions"] = [v for v in db.get("firmware_versions", []) if v["version"] != version]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM firmware_versions WHERE version = %s", (data.get("version"),))
+    finally:
+        conn.close()
     return {"message": "Deleted"}
 
 @app.post("/api/super-admin/firmware/force")
 def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))):
-    with db_transaction() as db:
-        version = data.get("version")
-        if "firmware_versions" not in db: db["firmware_versions"] = []
-        for v in db["firmware_versions"]:
-            v["forced"] = (v["version"] == version)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE firmware_versions SET forced = FALSE")
+            cur.execute("UPDATE firmware_versions SET forced = TRUE WHERE version = %s", (data.get("version"),))
+    finally:
+        conn.close()
     return {"message": "Force flag updated"}
 
 @app.get("/api/pi/firmware-download")
 def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-Key")):
     if not x_api_key:
         raise HTTPException(403, "API key required in X-Api-Key header")
-    db = load_db()
-    society = next((s for s in db["societies"] if s.get("api_key") == x_api_key), None)
-    if not society:
-        raise HTTPException(403, "Invalid API key")
-    fv = next((v for v in db.get("firmware_versions", []) if v["version"] == version), None)
-    if not fv:
-        raise HTTPException(404, "Version not found")
-    return PlainTextResponse(fv["code"], media_type="text/plain")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT code FROM firmware_versions WHERE version = %s", (version,))
+            fv = cur.fetchone()
+            if not fv:
+                raise HTTPException(404, "Version not found")
+            return PlainTextResponse(fv["code"], media_type="text/plain")
+    finally:
+        conn.close()
 
 # ================================================================
 # PI SYNC & COMMAND ACK
@@ -655,106 +573,86 @@ def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-K
 
 @app.post("/api/pi/sync")
 def pi_sync(payload: dict):
-    sid, society = authenticate_pi(payload)
-    with db_transaction() as db:
-        now = datetime.now(timezone.utc).isoformat()
-
-        wings = {}
-        # Iterate strictly over A, B, G to maintain canonical keys
-        for wid in WING_ORDER:
-            w = payload.get("wings", {}).get(wid, {})
+    sid = authenticate_pi(payload)
+    now = datetime.now(timezone.utc).isoformat()
+    
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # 1. Fetch Existing DB State
+            cur.execute("SELECT * FROM pi_state WHERE society_id = %s FOR UPDATE", (sid,))
+            db_state = cur.fetchone()
             
-            # 1. Normalize Pi Runtime State
-            physical_toggle = w.get("physicalToggle", "UNKNOWN")
-            if isinstance(physical_toggle, bool):
-                physical_toggle = "ON" if physical_toggle else "OFF"
-            physical_toggle = str(physical_toggle).upper()
-            if physical_toggle not in ("ON", "OFF", "UNKNOWN"):
-                physical_toggle = "UNKNOWN"
+            wings = {}
+            for wid in WING_ORDER:
+                w = payload.get("wings", {}).get(wid, {})
+                
+                physical_toggle = w.get("physicalToggle", "UNKNOWN")
+                if isinstance(physical_toggle, bool):
+                    physical_toggle = "ON" if physical_toggle else "OFF"
+                physical_toggle = str(physical_toggle).upper()
+                if physical_toggle not in ("ON", "OFF", "UNKNOWN"):
+                    physical_toggle = "UNKNOWN"
 
-            # 2. Fetch Existing DB Configuration (Backend is authority)
-            existing_wing = db.get("pi_state", {}).get(sid, {}).get("wings", {}).get(wid, {})
+                existing_wing = db_state.get("wings", {}).get(wid, {}) if db_state else {}
+                
+                wings[wid] = {
+                    "name": existing_wing.get("name", wid),
+                    "display_name": existing_wing.get("display_name", f"Wing {wid}"),
+                    "target_days": existing_wing.get("target_days", 0),
+                    "disabled": existing_wing.get("disabled", False),
+                    "used_days": int(w.get("usedDays", existing_wing.get("used_days", 0))),
+                    "clicks": int(w.get("clicks", existing_wing.get("clicks", 0))),
+                    "physical_toggle": physical_toggle,
+                }
+
+            # 2. Upsert Pi State
+            cur.execute("""INSERT INTO pi_state (society_id, active_wing, wings, reset_day, emergency_stop, firmware_version, 
+                           uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, 
+                           watchdog_enabled, last_reboot_reason) 
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (society_id) DO UPDATE SET 
+                           active_wing=EXCLUDED.active_wing, wings=EXCLUDED.wings, reset_day=EXCLUDED.reset_day, 
+                           emergency_stop=EXCLUDED.emergency_stop, firmware_version=EXCLUDED.firmware_version, 
+                           uptime_seconds=EXCLUDED.uptime_seconds, cpu_temp=EXCLUDED.cpu_temp, disk_free_mb=EXCLUDED.disk_free_mb, 
+                           last_sync=EXCLUDED.last_sync, boot_count=EXCLUDED.boot_count, last_shutdown_reason=EXCLUDED.last_shutdown_reason, 
+                           clock_source=EXCLUDED.clock_source, watchdog_enabled=EXCLUDED.watchdog_enabled, 
+                           last_reboot_reason=EXCLUDED.last_reboot_reason""",
+                        (sid, payload.get("activeWing"), psycopg.types.json.Json(wings), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
+                         bool(payload.get("emergencyStop", False)), payload.get("firmwareVersion", "?"), int(payload.get("uptimeSeconds", 0)),
+                         float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
+                         payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
+                         payload.get("lastRebootReason", "")))
+
+            # 3. Insert Events (DB Unique Constraint handles deduplication)
+            for event in payload.get("events", []):
+                ev_id = event.get("eventId")
+                if not ev_id: continue
+                try:
+                    cur.execute("INSERT INTO pi_events (society_id, event_id, timestamp, type, message) VALUES (%s, %s, %s, %s, %s)",
+                                (sid, ev_id, event.get("timestamp", now), event.get("type", "system"), event.get("message", "")))
+                except psycopg.errors.UniqueViolation:
+                    pass # Ignore duplicate events
+
+            # 4. Fetch and return next pending command
+            cur.execute("SELECT * FROM pi_commands WHERE society_id = %s AND status = 'pending' ORDER BY queued_at ASC LIMIT 1", (sid,))
+            cmd = cur.fetchone()
             
-            # 3. Merge: Keep DB config, update Pi runtime
-            wings[wid] = {
-                # Backend Owned (Configuration)
-                "name": existing_wing.get("name", wid),
-                "display_name": existing_wing.get("display_name", f"Wing {wid}"),
-                "target_days": existing_wing.get("target_days", 0),
-                "disabled": existing_wing.get("disabled", False),
-                
-                # Pi Owned (Runtime State)
-                "used_days": int(w.get("usedDays", existing_wing.get("used_days", 0))),
-                "clicks": int(w.get("clicks", existing_wing.get("clicks", 0))),
-                "physical_toggle": physical_toggle,
-            }
-
-        pi_state = {
-            "active_wing": payload.get("activeWing"), 
-            "wings": wings,
-            "reset_day": int(payload.get("resetDay", DEFAULT_RESET_DAY)),
-            "emergency_stop": bool(payload.get("emergencyStop", False)),
-            "firmware_version": payload.get("firmwareVersion", "?"),
-            "uptime_seconds": int(payload.get("uptimeSeconds", 0)),
-            "cpu_temp": float(payload.get("cpuTemp", 0)),
-            "disk_free_mb": float(payload.get("diskFreeMB", 0)),
-            "last_sync": now,
-            "boot_count": int(payload.get("bootCount", 0)),
-            "last_shutdown_reason": payload.get("lastShutdownReason", ""),
-            "clock_source": payload.get("clockSource", ""),
-            "watchdog_enabled": bool(payload.get("watchdogEnabled", False)),
-            "last_reboot_reason": payload.get("lastRebootReason", ""),
-        }
-
-        db.setdefault("pi_state", {})
-        db["pi_state"][sid] = pi_state
-
-        db.setdefault("pi_events", {})
-        db["pi_events"].setdefault(sid, [])
-        existing_ids = {e.get("event_id") for e in db["pi_events"][sid] if e.get("event_id")}
-        
-        for event in payload.get("events", []):
-            ev_id = event.get("eventId")
-            if not ev_id:
-                continue
-                
-            if ev_id not in existing_ids:
-                db["pi_events"][sid].append({
-                    "id": ev_id, "event_id": ev_id,
-                    "timestamp": event.get("timestamp", now),
-                    "type": event.get("type", "system"),
-                    "message": event.get("message", "")
-                })
-                existing_ids.add(ev_id)
-                
-        if len(db["pi_events"][sid]) > 500:
-            db["pi_events"][sid] = db["pi_events"][sid][-500:]
-
-        reply = {"success": True, "command": None, "command_id": None}
-        
-        cmds = db.get("pi_commands", {}).get(sid, [])
-        if cmds is None:
-            cmds = []
-            db["pi_commands"][sid] = cmds
-        elif isinstance(cmds, dict): 
-            cmds = [cmds]
-            db["pi_commands"][sid] = cmds
-            
-        for cmd in cmds:
-            if cmd.get("status") == "pending":
+            reply = {"success": True, "command": None, "command_id": None}
+            if cmd:
+                cur.execute("UPDATE pi_commands SET status = 'sent', sent_at = %s WHERE id = %s", (now, cmd["id"]))
                 reply["command"] = cmd["command"]
-                reply["command_id"] = cmd["id"]
+                reply["command_id"] = str(cmd["id"])
                 if cmd.get("wing"): reply["wing"] = cmd["wing"]
                 reply["params"] = cmd.get("params", {})
-                cmd["status"] = "sent"
-                cmd["sent_at"] = datetime.now(timezone.utc).isoformat()
-                break
 
+    finally:
+        conn.close()
     return reply
 
 @app.post("/api/pi/command-ack")
 def pi_command_ack(payload: dict):
-    sid, _ = authenticate_pi(payload)
+    sid = authenticate_pi(payload)
     command_id = payload.get("command_id")
     if not command_id:
         raise HTTPException(400, "command_id required")
@@ -763,26 +661,15 @@ def pi_command_ack(payload: dict):
     error = payload.get("error")
     result = payload.get("result")
 
-    with db_transaction() as db:
-        cmds = db.get("pi_commands", {}).get(sid, [])
-        if cmds is None:
-            cmds = []
-            db["pi_commands"][sid] = cmds
-        elif isinstance(cmds, dict): 
-            cmds = [cmds]
-            db["pi_commands"][sid] = cmds
-            
-        found = next((cmd for cmd in cmds if cmd.get("id") == str(command_id)), None)
-        
-        if not found:
-            return {"success": True, "status": "unknown"}
-
-        found["acked_at"] = datetime.now(timezone.utc).isoformat()
-        found["status"] = "acknowledged" if success else "failed"
-        found["error"] = None if success else error
-        found["result"] = result
-        
-    return {"success": True, "status": found["status"]}
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE pi_commands SET status = %s, acked_at = %s, error = %s, result = %s 
+                           WHERE id = %s AND society_id = %s""",
+                        ("acknowledged" if success else "failed", datetime.now(timezone.utc), None if success else error, result, command_id, sid))
+    finally:
+        conn.close()
+    return {"success": True}
 
 # ================================================================
 # ADMIN & MEMBER ENDPOINTS
@@ -790,10 +677,8 @@ def pi_command_ack(payload: dict):
 
 @app.post("/api/admin/pi-command")
 def queue_command(data: dict, user: dict = Depends(get_current_user)):
-    try:
-        sid = int(data.get("society_id"))
-    except Exception:
-        raise HTTPException(400, "Invalid society_id")
+    try: sid = int(data.get("society_id"))
+    except: raise HTTPException(400, "Invalid society_id")
 
     if user.get("role") != "super_admin" and str(user.get("society_id")) != str(sid):
         raise HTTPException(403, "Cannot access other society data")
@@ -805,96 +690,101 @@ def queue_command(data: dict, user: dict = Depends(get_current_user)):
     validate_command(command, params, wing)
 
     command_id = str(uuid.uuid4())
-    new_cmd = {
-        "id": command_id, "command": command, "wing": wing, "params": params,
-        "queued_at": datetime.now(timezone.utc).isoformat(), "status": "pending",
-        "sent_at": None, "acked_at": None, "error": None, "result": None,
-    }
-    
-    with db_transaction() as db:
-        db.setdefault("pi_commands", {})
-        if sid not in db["pi_commands"] or db["pi_commands"][sid] is None:
-            db["pi_commands"][sid] = []
-        elif isinstance(db["pi_commands"][sid], dict):
-            db["pi_commands"][sid] = [db["pi_commands"][sid]]
-            
-        db["pi_commands"][sid].append(new_cmd)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO pi_commands (id, society_id, command, wing, params, status, queued_at) 
+                           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                        (command_id, sid, command, wing, psycopg.types.json.Json(params), "pending", datetime.now(timezone.utc)))
+    finally:
+        conn.close()
         
     return {"success": True, "message": "Command queued", "command": command, "command_id": command_id}
 
 @app.get("/api/admin/dashboard")
-def admin_dashboard(society_id: str = "", user: dict = Depends(require_society_access)):
+def admin_dashboard(society_id: str, user: dict = Depends(require_society_access)):
     if not society_id:
         raise HTTPException(400, "society_id required")
-    db = load_db()
-    pi = db.get("pi_state", {}).get(int(society_id))
-    if not pi:
-        return {"connected": False}
+    sid = int(society_id)
+    
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM pi_state WHERE society_id = %s", (sid,))
+            pi = cur.fetchone()
+            if not pi:
+                return {"connected": False}
 
-    wings_data = {}
-    for wid, w in pi.get("wings", {}).items():
-        wings_data[wid] = {
-            "used_days": w.get("used_days", 0),
-            "target_days": w.get("target_days", 0),
-            "status": "ACTIVE" if pi.get("active_wing") == wid else "IDLE",
-            "name": w.get("name", wid),
-            "display_name": w.get("display_name", ""),
-            "disabled": w.get("disabled", False),
-            "physical_toggle": w.get("physical_toggle", "UNKNOWN"),
-            "clicks": w.get("clicks", 0),
-            "visible": wing_is_visible(w),
-        }
+            wings_data = {}
+            for wid, w in pi.get("wings", {}).items():
+                wings_data[wid] = {
+                    "used_days": w.get("used_days", 0),
+                    "target_days": w.get("target_days", 0),
+                    "status": "ACTIVE" if pi.get("active_wing") == wid else "IDLE",
+                    "name": w.get("name", wid),
+                    "display_name": w.get("display_name", ""),
+                    "disabled": w.get("disabled", False),
+                    "physical_toggle": w.get("physical_toggle", "UNKNOWN"),
+                    "clicks": w.get("clicks", 0),
+                    "visible": wing_is_visible(w),
+                }
 
-    cmds = db.get("pi_commands", {}).get(int(society_id), [])
-    if cmds is None:
-        cmds = []
-    elif isinstance(cmds, dict):
-        cmds = [cmds]
-        
-    pc = next((c for c in cmds if c.get("status") in ("pending","sent")), None)
-    return {
-        "connected": is_pi_online(pi),
-        "active_wing": pi.get("active_wing"),
-        "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY),
-        "wings": wings_data,
-        "emergency_stop": pi.get("emergency_stop", False),
-        "watchdog_enabled": pi.get("watchdog_enabled", False),
-        "last_reboot_reason": pi.get("last_reboot_reason", ""),
-        "firmware_version": pi.get("firmware_version", "?"),
-        "cpu_temp": pi.get("cpu_temp", 0),
-        "uptime_seconds": pi.get("uptime_seconds", 0),
-        "last_sync": pi.get("last_sync"),
-        "pending_command": {
-            "id": pc.get("id"), "command": pc.get("command"),
-            "status": pc.get("status"), "queued_at": pc.get("queued_at"),
-            "sent_at": pc.get("sent_at"), "acked_at": pc.get("acked_at"),
-            "error": pc.get("error"),
-        } if pc else None,
-    }
+            cur.execute("SELECT * FROM pi_commands WHERE society_id = %s AND status IN ('pending','sent') ORDER BY queued_at ASC LIMIT 1", (sid,))
+            pc = cur.fetchone()
+            
+            return {
+                "connected": is_pi_online(pi),
+                "active_wing": pi.get("active_wing"),
+                "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY),
+                "wings": wings_data,
+                "emergency_stop": pi.get("emergency_stop", False),
+                "watchdog_enabled": pi.get("watchdog_enabled", False),
+                "last_reboot_reason": pi.get("last_reboot_reason", ""),
+                "firmware_version": pi.get("firmware_version", "?"),
+                "cpu_temp": pi.get("cpu_temp", 0),
+                "uptime_seconds": pi.get("uptime_seconds", 0),
+                "last_sync": pi.get("last_sync").isoformat() if pi.get("last_sync") else None,
+                "pending_command": {
+                    "id": str(pc["id"]), "command": pc["command"],
+                    "status": pc["status"], "queued_at": pc["queued_at"].isoformat() if pc["queued_at"] else None,
+                    "sent_at": pc["sent_at"].isoformat() if pc["sent_at"] else None, "acked_at": pc["acked_at"].isoformat() if pc["acked_at"] else None,
+                    "error": pc["error"],
+                } if pc else None,
+            }
+    finally:
+        conn.close()
 
 @app.get("/api/admin/pi-state")
 def get_pi_state(society_id: str, user: dict = Depends(require_society_access)):
-    db = load_db()
-    state = db.get("pi_state", {}).get(int(society_id))
-    if not state:
-        return {"connected": False}
-    filtered = {}
-    for wid, w in state.get("wings", {}).items():
-        filtered[wid] = {**w, "visible": wing_is_visible(w)}
-    return {"connected": is_pi_online(state), **{k: v for k, v in state.items() if k != "wings"}, "wings": filtered}
+    # Reuse dashboard logic to fetch state
+    state = admin_dashboard(society_id, user)
+    if not state.get("connected") and not state.get("wings"):
+        return state
+    return state
 
 def map_events(raw):
     out = []
     for e in raw:
-        if isinstance(e, dict) and e.get("message"):
-            out.append({"id": e.get("id","0"), "ts": e.get("timestamp",""), "level": (e.get("type","") or "").upper(), "msg": e.get("message","")})
+        out.append({
+            "id": str(e["id"]), 
+            "ts": e["timestamp"].isoformat() if e.get("timestamp") else "", 
+            "level": (e.get("type","") or "").upper(), 
+            "msg": e.get("message","")
+        })
     return out
 
 @app.get("/api/admin/pi-events")
 def get_pi_events(society_id: str, since: int = 0, user: dict = Depends(require_society_access)):
-    db = load_db()
-    events = map_events(db.get("pi_events", {}).get(int(society_id), []))
-    return {"events": events[since:], "total": len(events), "next": len(events)}
+    sid = int(society_id)
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM pi_events WHERE society_id = %s ORDER BY timestamp DESC LIMIT 100", (sid,))
+            events = cur.fetchall()
+            mapped = map_events(events)
+            return {"events": mapped[since:], "total": len(mapped), "next": len(mapped)}
+    finally:
+        conn.close()
 
 @app.get("/api/member/dashboard")
 def member_dashboard(user: dict = Depends(get_current_user)):
@@ -903,32 +793,38 @@ def member_dashboard(user: dict = Depends(get_current_user)):
     sid = user.get("society_id")
     if not sid:
         raise HTTPException(400, "No society assigned")
-    db = load_db()
-    pi = db.get("pi_state", {}).get(int(sid))
-    if not pi:
-        return {"connected": False}
+        
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM pi_state WHERE society_id = %s", (sid,))
+            pi = cur.fetchone()
+            if not pi:
+                return {"connected": False}
 
-    wings_data = {}
-    for wid, w in pi.get("wings", {}).items():
-        if not wing_is_visible(w): continue
-        wings_data[wid] = {
-            "used_days": w.get("used_days", 0),
-            "target_days": w.get("target_days", 0),
-            "name": w.get("name", wid),
-            "display_name": w.get("display_name", ""),
-            "clicks": w.get("clicks", 0),
-            "physical_toggle": w.get("physical_toggle", "UNKNOWN"),
-        }
+            wings_data = {}
+            for wid, w in pi.get("wings", {}).items():
+                if not wing_is_visible(w): continue
+                wings_data[wid] = {
+                    "used_days": w.get("used_days", 0),
+                    "target_days": w.get("target_days", 0),
+                    "name": w.get("name", wid),
+                    "display_name": w.get("display_name", ""),
+                    "clicks": w.get("clicks", 0),
+                    "physical_toggle": w.get("physical_toggle", "UNKNOWN"),
+                }
 
-    return {
-        "connected": is_pi_online(pi),
-        "active_wing": pi.get("active_wing"),
-        "wings": wings_data, "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY),
-        "firmware_version": pi.get("firmware_version", "?"),
-        "cpu_temp": pi.get("cpu_temp", 0),
-        "uptime_seconds": pi.get("uptime_seconds", 0),
-        "last_sync": pi.get("last_sync"),
-    }
+            return {
+                "connected": is_pi_online(pi),
+                "active_wing": pi.get("active_wing"),
+                "wings": wings_data, "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY),
+                "firmware_version": pi.get("firmware_version", "?"),
+                "cpu_temp": pi.get("cpu_temp", 0),
+                "uptime_seconds": pi.get("uptime_seconds", 0),
+                "last_sync": pi.get("last_sync").isoformat() if pi.get("last_sync") else None,
+            }
+    finally:
+        conn.close()
 
 @app.get("/api/member/events")
 def member_events(since: int = 0, user: dict = Depends(get_current_user)):
@@ -937,6 +833,13 @@ def member_events(since: int = 0, user: dict = Depends(get_current_user)):
     sid = user.get("society_id")
     if not sid:
         raise HTTPException(400, "No society assigned")
-    db = load_db()
-    events = map_events(db.get("pi_events", {}).get(int(sid), []))
-    return {"events": events[since:], "total": len(events), "next": len(events)}
+        
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM pi_events WHERE society_id = %s ORDER BY timestamp DESC LIMIT 100", (sid,))
+            events = cur.fetchall()
+            mapped = map_events(events)
+            return {"events": mapped[since:], "total": len(mapped), "next": len(mapped)}
+    finally:
+        conn.close()

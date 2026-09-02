@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
-"""
-Pi Simulator: Used to validate the Render/Neon backend chain
-without physical Pi hardware.
-"""
-import requests
-import time
-import uuid
+import requests, time, uuid
 
-# --- CONFIGURATION ---
 BACKEND_URL = "https://ems-saass.onrender.com"
 SOCIETY_ID = 1
-API_KEY = "YOUR_ACTUAL_API_KEY_HERE" # Replace with the key from your DB
+API_KEY = "YOUR_ACTUAL_API_KEY_HERE"
 
 def simulate_pi():
     print(f"Starting Pi Simulator for Society {SOCIETY_ID}...")
     session = requests.Session()
     
-    # Simulated Pi State (STRICT: Only runtime data, no name/display_name/target_days/disabled)
     pi_state = {
         "societyId": SOCIETY_ID,
         "key": API_KEY,
-        "firmwareVersion": "3.3.0-SIMULATOR",
+        "firmwareVersion": "4.0.0-SIMULATOR",
         "activeWing": "A",
         "resetDay": 15,
         "emergencyStop": False,
@@ -51,7 +43,6 @@ def simulate_pi():
         
         print("\n--- Syncing with Backend ---")
         try:
-            # 1. Sync State
             res = session.post(f"{BACKEND_URL}/api/pi/sync", json=pi_state, timeout=15)
             if res.status_code != 200:
                 print(f"❌ Sync Failed: {res.status_code} - {res.text}")
@@ -61,14 +52,12 @@ def simulate_pi():
             data = res.json()
             print("✅ Sync Successful. last_sync updated.")
             
-            # 2. Check for Commands
             cmd = data.get("command")
             cmd_id = data.get("command_id")
             
             if cmd and cmd_id:
                 print(f"📦 Received Command: {cmd} (ID: {cmd_id})")
                 
-                # Simulate Execution
                 if cmd == "set_active_wing":
                     wing = data.get("wing")
                     print(f"⚡ Executing: Activating Wing {wing}")
@@ -77,7 +66,6 @@ def simulate_pi():
                     print("⚡ Executing: Turning off all wings")
                     pi_state["activeWing"] = None
                     
-                # 3. Send ACK
                 ack_payload = {
                     "societyId": SOCIETY_ID,
                     "key": API_KEY,
