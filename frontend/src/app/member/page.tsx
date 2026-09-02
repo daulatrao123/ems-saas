@@ -1,6 +1,5 @@
 "use client";
 
-
 import { useState, useEffect, useCallback } from "react";
 import api from "@/lib/api"; // Adjust import path as needed
 
@@ -14,7 +13,7 @@ export default function MemberDashboard() {
       setPiState(res.data);
     } catch (error) {
       // CRITICAL FIX: If API fails, mark Pi as offline, but keep last known metrics
-      setPiState((prev) => (prev ? { ...prev, connected: false } : null));
+      setPiState((prev: any) => (prev ? { ...prev, connected: false } : null));
     } finally {
       setLoading(false);
     }
