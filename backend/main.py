@@ -1,10 +1,11 @@
 """
-EMS SaaS Backend v4.2.0 — Industrial Production (Hardened)
+EMS SaaS Backend v5.0.0 — Industrial Production (Hardened)
 ====================================
-- Added DB Foreign Keys with ON DELETE CASCADE for strict relational integrity.
-- Strict Command State Machine (delivered -> succeeded/failed).
-- Event cursor pagination (last_id) instead of array offset.
-- Native Postgres UNIQUE constraints for strict idempotency.
+- Explicit Database Transactions for multi-step operations.
+- Audit logging no longer silently fails.
+- Added Rate Limiting (slowapi) for login and Pi sync.
+- Real Database readiness check in /api/health.
+- Wing contract strictly enforced: A, B, G.
 """
 
 import os
@@ -20,6 +21,9 @@ from pydantic import BaseModel
 import bcrypt
 from jose import JWTError, jwt
 from datetime import datetime, timezone, timedelta
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # ================================================================
 # CONFIG
@@ -41,7 +45,10 @@ ALLOWED_ORIGINS = [
     "http://localhost:5500",
 ]
 
-app = FastAPI(title="EMS SaaS API", version="4.2.0-prod")
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="EMS SaaS API", version="5.0.0-prod")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 DEFAULT_RESET_DAY = 15
 WING_ORDER = ["A", "B", "G"]
@@ -60,7 +67,7 @@ VALID_COMMANDS = {
 
 def get_db():
     conn = psycopg.connect(DATABASE_URL, connect_timeout=10, row_factory=dict_row)
-    conn.autocommit = True
+    conn.autocommit = False # PRODUCTION HARDENING: Use explicit transactions
     return conn
 
 @app.on_event("startup")
@@ -151,9 +158,9 @@ def ensure_db_schema():
                 );
             """)
             
-                        # PRODUCTION HARDENING: Add Foreign Keys & Cascades safely
+            # PRODUCTION HARDENING: Add Foreign Keys & Cascades safely
             cur.execute("""
-                DO $$                 BEGIN
+                DO $$ BEGIN
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_society') THEN
                         ALTER TABLE users ADD CONSTRAINT fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
                     END IF;
@@ -178,26 +185,23 @@ def ensure_db_schema():
                 END $$;
             """)
 
-        print("DB schema verified OK (Relational v4.2.0 Hardened)")
+        conn.commit() # Commit schema changes
+        print("DB schema verified OK (Relational v5.0.0 Hardened)")
     except Exception as e:
+        conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
+        raise RuntimeError(f"Database schema initialization failed: {e}")
     finally:
         conn.close()
 
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
-def log_audit(user: dict, society_id: int, action: str, details: dict):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""INSERT INTO audit_log (society_id, user_id, action, details, created_at) 
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (society_id, user.get("id"), action, psycopg.types.json.Json(details), datetime.now(timezone.utc)))
-    except:
-        pass
-    finally:
-        conn.close()
+def log_audit(cur, user: dict, society_id: int, action: str, details: dict):
+    # PRODUCTION HARDENING: No more silent except: pass. Pass cursor in to make it transactional.
+    cur.execute("""INSERT INTO audit_log (society_id, user_id, action, details, created_at) 
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (society_id, user.get("id"), action, psycopg.types.json.Json(details), datetime.now(timezone.utc)))
 
 # ================================================================
 # EXCEPTION HANDLERS & CORS
@@ -354,14 +358,24 @@ def ping():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "uptime_keepalive": round(time.time() - _keepalive_ts)}
+    # PRODUCTION HARDENING: Real readiness check
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        conn.commit()
+        conn.close()
+        return {"status": "ok", "database": "ok", "uptime_keepalive": round(time.time() - _keepalive_ts)}
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "error", "database": "unavailable"})
 
 # ================================================================
 # BOOTSTRAP
 # ================================================================
 
 @app.post("/api/bootstrap")
-def bootstrap():
+@limiter.limit("1/minute")
+def bootstrap(request: Request):
     bootstrap_pass = os.getenv("EMS_BOOTSTRAP_PASSWORD")
     if not bootstrap_pass:
         raise HTTPException(500, "EMS_BOOTSTRAP_PASSWORD env variable is not configured.")
@@ -398,6 +412,10 @@ def bootstrap():
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                         (device_id, "A", DEFAULT_RESET_DAY, False, 0, 0.0, 0.0, datetime.now(timezone.utc), 0, True))
                         
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
         
@@ -408,7 +426,8 @@ def bootstrap():
 # ================================================================
 
 @app.post("/api/auth/login")
-def login(user: UserLogin):
+@limiter.limit("5/minute")
+def login(request: Request, user: UserLogin):
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -503,7 +522,11 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                             (society["name"], society["location"], society["plan"], society["status"],
                              society["tailscale_ip"], society["pi_port"], society["society_code"]))
                 new_sid = cur.fetchone()[0]
-                log_audit(user, new_sid, "CREATE_SOCIETY", society)
+                log_audit(cur, user, new_sid, "CREATE_SOCIETY", society)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
     return {"message": "Saved"}
@@ -514,9 +537,12 @@ def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))
     try:
         with conn.cursor() as cur:
             sid = data.get("id")
-            # CASCADE will automatically clean up devices, state, events, commands, etc.
             cur.execute("DELETE FROM societies WHERE id = %s", (sid,))
-            log_audit(user, sid, "DELETE_SOCIETY", {})
+            log_audit(cur, user, sid, "DELETE_SOCIETY", {})
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
     return {"message": "Deleted"}
@@ -564,6 +590,10 @@ def save_user(data: dict, user: dict = Depends(require_role("super_admin"))):
                     raise HTTPException(400, "Password required")
                 cur.execute("INSERT INTO users (email, name, role, society_id, password) VALUES (%s, %s, %s, %s, %s)",
                             (data["email"], data["name"], role, society_id, bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
     return {"message": "Saved"}
@@ -574,6 +604,10 @@ def delete_user(data: dict, user: dict = Depends(require_role("super_admin"))):
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM users WHERE id = %s", (data.get("id"),))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
     return {"message": "Deleted"}
@@ -608,6 +642,10 @@ def save_firmware_version(data: dict, user: dict = Depends(require_role("super_a
                            VALUES (%s, %s, %s, %s, %s, %s) 
                            ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s""",
                         (version, code, changelog, forced, datetime.now(timezone.utc), datetime.now(timezone.utc), code, changelog, forced, datetime.now(timezone.utc)))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
     return {"message": "Saved"}
@@ -618,6 +656,10 @@ def delete_firmware_version(data: dict, user: dict = Depends(require_role("super
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM firmware_versions WHERE version = %s", (data.get("version"),))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
     return {"message": "Deleted"}
@@ -629,6 +671,10 @@ def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))
         with conn.cursor() as cur:
             cur.execute("UPDATE firmware_versions SET forced = FALSE")
             cur.execute("UPDATE firmware_versions SET forced = TRUE WHERE version = %s", (data.get("version"),))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
     return {"message": "Force flag updated"}
@@ -653,7 +699,8 @@ def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-K
 # ================================================================
 
 @app.post("/api/pi/sync")
-def pi_sync(payload: dict):
+@limiter.limit("30/minute")
+def pi_sync(request: Request, payload: dict):
     device_id = authenticate_pi(payload)
     now = datetime.now(timezone.utc)
     
@@ -689,14 +736,14 @@ def pi_sync(payload: dict):
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
                          payload.get("lastRebootReason", "")))
 
+            # PRODUCTION HARDENING: ON CONFLICT DO NOTHING is cleaner than catching UniqueViolation
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
                 if not ev_id: continue
-                try:
-                    cur.execute("INSERT INTO pi_events (device_id, event_id, timestamp, type, message) VALUES (%s, %s, %s, %s, %s)",
-                                (device_id, ev_id, event.get("timestamp", now), event.get("type", "system"), event.get("message", "")))
-                except psycopg.errors.UniqueViolation:
-                    pass 
+                cur.execute("""INSERT INTO pi_events (device_id, event_id, timestamp, type, message) 
+                               VALUES (%s, %s, %s, %s, %s) 
+                               ON CONFLICT (event_id) DO NOTHING""",
+                            (device_id, ev_id, event.get("timestamp", now), event.get("type", "system"), event.get("message", "")))
 
             cur.execute("UPDATE pi_commands SET status = 'expired' WHERE device_id = %s AND status = 'delivered' AND delivered_at < %s",
                         (device_id, now - timedelta(seconds=COMMAND_EXPIRY_SECONDS)))
@@ -712,6 +759,10 @@ def pi_sync(payload: dict):
                 if cmd.get("wing"): reply["wing"] = cmd["wing"]
                 reply["params"] = cmd.get("params", {})
 
+        conn.commit() # Commit all sync changes atomically
+    except Exception as e:
+        conn.rollback() # Rollback if any query fails
+        raise e
     finally:
         conn.close()
     return reply
@@ -730,10 +781,13 @@ def pi_command_ack(payload: dict):
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            # PRODUCTION HARDENING: Strict State Machine (only allow transition from 'delivered')
             cur.execute("""UPDATE pi_commands SET status = %s, acked_at = %s, error = %s, result = %s 
                            WHERE id = %s AND device_id = %s AND status = 'delivered'""",
                         ("succeeded" if success else "failed", datetime.now(timezone.utc), None if success else error, result, command_id, device_id))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
     return {"success": True}
@@ -749,7 +803,8 @@ def get_device_for_society(cur, sid: int) -> str:
     return dev["id"]
 
 @app.post("/api/admin/pi-command")
-def queue_command(data: dict, user: dict = Depends(get_current_user)):
+@limiter.limit("30/minute")
+def queue_command(request: Request, data: dict, user: dict = Depends(get_current_user)):
     try: sid = int(data.get("society_id"))
     except: raise HTTPException(400, "Invalid society_id")
 
@@ -770,7 +825,13 @@ def queue_command(data: dict, user: dict = Depends(get_current_user)):
             cur.execute("""INSERT INTO pi_commands (id, device_id, command, wing, params, status, created_at, expires_at) 
                            VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s)""",
                         (command_id, dev_id, command, wing, psycopg.types.json.Json(params), datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(hours=24)))
-            log_audit(user, sid, "QUEUE_COMMAND", {"command": command, "wing": wing, "id": command_id})
+            
+            # PRODUCTION HARDENING: Audit logging is now transactional
+            log_audit(cur, user, sid, "QUEUE_COMMAND", {"command": command, "wing": wing, "id": command_id})
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
     finally:
         conn.close()
         
@@ -852,7 +913,6 @@ def map_events(raw):
         })
     return out
 
-# PRODUCTION HARDENING: Cursor-based Pagination (last_id)
 @app.get("/api/admin/pi-events")
 def get_pi_events(society_id: str, last_id: int = 0, user: dict = Depends(require_society_access)):
     sid = int(society_id)
