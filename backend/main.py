@@ -1,11 +1,12 @@
 """
-EMS SaaS Backend v5.0.0 — Industrial Production (Hardened)
+EMS SaaS Backend v5.1.0 — Industrial Production (Hardened)
 ====================================
 - Explicit Database Transactions for multi-step operations.
 - Audit logging no longer silently fails.
 - Added Rate Limiting (slowapi) for login and Pi sync.
 - Real Database readiness check in /api/health.
 - Wing contract strictly enforced: A, B, G.
+- PRODUCTION FIX: Pi sync now updates wing_configs.target_days.
 """
 
 import os
@@ -46,7 +47,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="5.0.0-prod")
+app = FastAPI(title="EMS SaaS API", version="5.1.0-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -186,7 +187,7 @@ def ensure_db_schema():
             """)
 
         conn.commit() # Commit schema changes
-        print("DB schema verified OK (Relational v5.0.0 Hardened)")
+        print("DB schema verified OK (Relational v5.1.0 Hardened)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -320,7 +321,7 @@ async def require_society_access(request: Request, user: dict = Depends(get_curr
             raise HTTPException(status_code=403, detail="Cannot access other society data")
     return user
 
-def authenticate_pi(payload: dict) -> str:
+def authenticate_pi(payload: dict) -> tuple:
     try: device_id = str(payload.get("deviceId"))
     except: raise HTTPException(400, "Invalid deviceId")
     
@@ -330,10 +331,10 @@ def authenticate_pi(payload: dict) -> str:
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT id FROM pi_devices WHERE id = %s AND api_key_hash = %s", (device_id, hash_api_key(supplied_key)))
+            cur.execute("SELECT id, society_id FROM pi_devices WHERE id = %s AND api_key_hash = %s", (device_id, hash_api_key(supplied_key)))
             dev = cur.fetchone()
             if not dev: raise HTTPException(403, "Invalid Pi API key or Device ID.")
-            return device_id
+            return dev["id"], dev["society_id"]
     finally:
         conn.close()
 
@@ -701,7 +702,7 @@ def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-K
 @app.post("/api/pi/sync")
 @limiter.limit("30/minute")
 def pi_sync(request: Request, payload: dict):
-    device_id = authenticate_pi(payload)
+    device_id, society_id = authenticate_pi(payload)
     now = datetime.now(timezone.utc)
     
     conn = get_db()
@@ -716,6 +717,11 @@ def pi_sync(request: Request, payload: dict):
                 if isinstance(physical_toggle, bool): physical_toggle = "ON" if physical_toggle else "OFF"
                 physical_toggle = str(physical_toggle).upper()
                 if physical_toggle not in ("ON", "OFF", "UNKNOWN"): physical_toggle = "UNKNOWN"
+                
+                # PRODUCTION FIX: Sync target_days from Pi to DB wing_configs
+                target_days = int(w.get("targetDays", 0))
+                cur.execute("""UPDATE wing_configs SET target_days = %s WHERE society_id = %s AND wing_id = %s""",
+                            (target_days, society_id, wid))
                 
                 cur.execute("""INSERT INTO wing_state (device_id, wing_id, physical_toggle, used_days, clicks) 
                                VALUES (%s, %s, %s, %s, %s) 
@@ -736,7 +742,6 @@ def pi_sync(request: Request, payload: dict):
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
                          payload.get("lastRebootReason", "")))
 
-            # PRODUCTION HARDENING: ON CONFLICT DO NOTHING is cleaner than catching UniqueViolation
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
                 if not ev_id: continue
@@ -769,7 +774,7 @@ def pi_sync(request: Request, payload: dict):
 
 @app.post("/api/pi/command-ack")
 def pi_command_ack(payload: dict):
-    device_id = authenticate_pi(payload)
+    device_id, _ = authenticate_pi(payload)
     command_id = payload.get("command_id")
     if not command_id:
         raise HTTPException(400, "command_id required")
@@ -826,7 +831,6 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
                            VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s)""",
                         (command_id, dev_id, command, wing, psycopg.types.json.Json(params), datetime.now(timezone.utc), datetime.now(timezone.utc) + timedelta(hours=24)))
             
-            # PRODUCTION HARDENING: Audit logging is now transactional
             log_audit(cur, user, sid, "QUEUE_COMMAND", {"command": command, "wing": wing, "id": command_id})
         conn.commit()
     except Exception as e:

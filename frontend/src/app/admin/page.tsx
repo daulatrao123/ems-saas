@@ -41,9 +41,14 @@ export default function AdminDashboard() {
   const fetchEvents = useCallback(async () => {
     if (!societyId) return;
     try {
+      // PRODUCTION FIX: Use last_id instead of since, default to 0
       const res = await api.get(`/api/admin/pi-events?society_id=${societyId}&last_id=${lastEventId}`);
       if (res.data.events.length > 0) {
-        setEvents((prev) => [...prev, ...res.data.events].slice(-100)); // Keep last 100
+        setEvents((prev) => {
+          // PRODUCTION FIX: Filter out duplicates before appending
+          const newEvents = res.data.events.filter((ne: any) => !prev.some((e: any) => e.id === ne.id));
+          return [...prev, ...newEvents].slice(-100); // Keep last 100
+        });
         setLastEventId(res.data.last_id);
       }
     } catch (error) {
@@ -66,16 +71,15 @@ export default function AdminDashboard() {
 
   const isOnline = Boolean(dashboardData.connected);
 
-  // Example command sender
   const sendCommand = async (command: string, wing?: string) => {
     try {
       await api.post("/api/admin/pi-command", {
-        society_id: societyId, // Use dynamic ID
+        society_id: societyId,
         command,
         wing: wing || "",
         params: {}
       });
-      fetchDashboard(); // Refresh immediately
+      fetchDashboard(); 
     } catch (error) {
       console.error("Command failed", error);
     }
@@ -95,7 +99,7 @@ export default function AdminDashboard() {
         <h3 className="text-lg font-bold mb-2">Pi Events</h3>
         <div className="bg-gray-100 p-4 rounded h-64 overflow-y-auto">
           {events.map((ev: any, i: number) => (
-            <div key={i} className="text-sm border-b py-1">
+            <div key={`${ev.id}-${i}`} className="text-sm border-b py-1">
               <span className="font-mono text-gray-500">{new Date(ev.ts).toLocaleTimeString()}</span> 
               <span className="ml-2 font-bold text-blue-600">[{ev.level}]</span> 
               <span className="ml-2">{ev.msg}</span>

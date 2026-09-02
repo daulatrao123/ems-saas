@@ -3,7 +3,7 @@ import requests, time, uuid
 
 BACKEND_URL = "https://ems-saass.onrender.com"
 DEVICE_ID = "d9e8206b-a9f3-4294-91f8-df66d65bf417"
-API_KEY = "34a7574a-71cc-4f87-802b-4a514ca059b6"
+API_KEY = "b68c8b3b-3633-4c77-a36e-478bff1e7430" # Use your newly rotated key here
 
 def simulate_pi():
     print(f"Starting Pi Simulator for Device {DEVICE_ID}...")
@@ -12,7 +12,7 @@ def simulate_pi():
     pi_state = {
         "deviceId": DEVICE_ID,
         "key": API_KEY,
-        "firmwareVersion": "4.1.0-SIMULATOR",
+        "firmwareVersion": "5.0.0-SIMULATOR",
         "activeWing": "A",
         "resetDay": 15,
         "emergencyStop": False,
@@ -25,9 +25,9 @@ def simulate_pi():
         "watchdogEnabled": True,
         "lastRebootReason": "SIMULATOR_BOOT",
         "wings": {
-            "A": {"usedDays": 1, "physicalToggle": "ON", "clicks": 5},
-            "B": {"usedDays": 2, "physicalToggle": "ON", "clicks": 3},
-            "G": {"usedDays": 0, "physicalToggle": "OFF", "clicks": 0}
+            "A": {"usedDays": 1, "targetDays": 10, "physicalToggle": "ON", "clicks": 5},
+            "B": {"usedDays": 2, "targetDays": 12, "physicalToggle": "ON", "clicks": 3},
+            "G": {"usedDays": 0, "targetDays": 10, "physicalToggle": "OFF", "clicks": 0}
         },
         "events": [{
             "eventId": str(uuid.uuid4()),
@@ -78,8 +78,11 @@ def simulate_pi():
                 elif cmd == "set_days":
                     wing = data.get("wing")
                     days = data.get("params", {}).get("days")
-                    print(f"⚡ Executing: Setting Wing {wing} to {days} days")
-                    event_msg = f"Command: Set Wing {wing} to {days} days"
+                    print(f"⚡ Executing: Setting Wing {wing} target to {days} days")
+                    # PRODUCTION FIX: Actually update the simulator's local state
+                    if wing in pi_state["wings"]:
+                        pi_state["wings"][wing]["targetDays"] = days
+                    event_msg = f"Command: Set Wing {wing} target to {days} days"
                     
                 # Generate a new event for the executed command
                 if event_msg:

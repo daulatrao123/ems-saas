@@ -14,7 +14,6 @@ export default function MemberDashboard() {
       const res = await api.get("/api/member/dashboard");
       setPiState(res.data);
     } catch (error) {
-      // CRITICAL FIX: If API fails, mark Pi as offline, but keep last known metrics
       setPiState((prev: any) => (prev ? { ...prev, connected: false } : null));
     } finally {
       setLoading(false);
@@ -25,7 +24,10 @@ export default function MemberDashboard() {
     try {
       const res = await api.get(`/api/member/events?last_id=${lastEventId}`);
       if (res.data.events.length > 0) {
-        setEvents((prev) => [...prev, ...res.data.events].slice(-50));
+        setEvents((prev) => {
+          const newEvents = res.data.events.filter((ne: any) => !prev.some((e: any) => e.id === ne.id));
+          return [...prev, ...newEvents].slice(-50);
+        });
         setLastEventId(res.data.last_id);
       }
     } catch (error) {
@@ -39,14 +41,13 @@ export default function MemberDashboard() {
     const interval = setInterval(() => {
       fetchPiState();
       fetchEvents();
-    }, 10000); // Poll every 10s
+    }, 10000);
     return () => clearInterval(interval);
   }, [fetchPiState, fetchEvents]);
 
   if (loading) return <div>Loading Dashboard...</div>;
   if (!piState) return <div>No Pi data available.</div>;
 
-  // CRITICAL FIX: Trust backend's 120s threshold completely
   const isOnline = Boolean(piState?.connected);
 
   return (
@@ -78,7 +79,7 @@ export default function MemberDashboard() {
         <h3 className="text-lg font-bold mb-2">Pi Events</h3>
         <div className="bg-gray-100 p-4 rounded h-64 overflow-y-auto">
           {events.map((ev: any, i: number) => (
-            <div key={i} className="text-sm border-b py-1">
+            <div key={`${ev.id}-${i}`} className="text-sm border-b py-1">
               <span className="font-mono text-gray-500">{new Date(ev.ts).toLocaleTimeString()}</span> 
               <span className="ml-2 font-bold text-blue-600">[{ev.level}]</span> 
               <span className="ml-2">{ev.msg}</span>
