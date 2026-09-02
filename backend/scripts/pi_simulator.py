@@ -2,17 +2,17 @@
 import requests, time, uuid
 
 BACKEND_URL = "https://ems-saass.onrender.com"
-SOCIETY_ID = 1
-API_KEY = "YOUR_ACTUAL_API_KEY_HERE"
+DEVICE_ID = "YOUR_DEVICE_ID_FROM_BOOTSTRAP"
+API_KEY = "YOUR_API_KEY_FROM_BOOTSTRAP"
 
 def simulate_pi():
-    print(f"Starting Pi Simulator for Society {SOCIETY_ID}...")
+    print(f"Starting Pi Simulator for Device {DEVICE_ID}...")
     session = requests.Session()
     
     pi_state = {
-        "societyId": SOCIETY_ID,
+        "deviceId": DEVICE_ID,
         "key": API_KEY,
-        "firmwareVersion": "4.0.0-SIMULATOR",
+        "firmwareVersion": "4.1.0-SIMULATOR",
         "activeWing": "A",
         "resetDay": 15,
         "emergencyStop": False,
@@ -67,7 +67,7 @@ def simulate_pi():
                     pi_state["activeWing"] = None
                     
                 ack_payload = {
-                    "societyId": SOCIETY_ID,
+                    "deviceId": DEVICE_ID,
                     "key": API_KEY,
                     "command_id": cmd_id,
                     "success": True,
