@@ -12,7 +12,7 @@ class State:
         self._last_persist = 0
         self.tz = pytz.timezone(config.timezone)
         
-        self.boot_count = 1
+        self.boot_count = 0  # Initialize to 0, will be loaded or left 0, then incremented
         self.last_shutdown_reason = "COLD_BOOT"
         boot_flag_file = os.path.join(os.path.dirname(config.stateFile), "boot_flag")
         if os.path.exists(boot_flag_file):
@@ -60,10 +60,10 @@ class State:
         # 2. Load persisted state from disk (safely overwrites defaults)
         if os.path.exists(config.stateFile):
             self._load_from_disk()
-            self.boot_count += 1
-            self.data["bootCount"] = self.boot_count
             
-        self.data["lastShutdownReason"] = self.last_shutdown_reason
+        # 3. Increment boot count EXACTLY ONCE for this boot
+        self.boot_count = max(1, self.boot_count + 1)
+        self.data["bootCount"] = self.boot_count
 
     def _local_now(self):
         return datetime.now(self.tz)
@@ -80,7 +80,7 @@ class State:
                         self.data["wings"][w]["lastActiveDate"] = wings[w].get("lastActiveDate")
                 self.data["activeWing"] = saved.get("activeWing")
                 self.data["resetDay"] = int(saved.get("resetDay", self.cfg.resetDayDefault))
-                self.boot_count = int(saved.get("bootCount", 0)) + 1
+                self.boot_count = int(saved.get("bootCount", 0))  # Load, but DO NOT increment here
                 self.config_version = int(saved.get("configVersion", 0))
         except Exception as e:
             self.log.warning(f"State load failed: {e}")
