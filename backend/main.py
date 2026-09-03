@@ -1,9 +1,10 @@
 """
-EMS SaaS Backend v5.5.0 — Industrial Production (8-Wing Profile & Inventory Lifecycle)
+EMS SaaS Backend v5.6.0 — Industrial Production (One-Pi-Per-Society Constraint)
 ====================================
+- Enforces ONE active Pi per society at the database level (Partial Unique Index).
+- get_societies() now returns device_id and device_name for correct frontend dropdown mapping.
+- Safe Pi assignment lifecycle in save_society() (clears old assignment before setting new).
 - Supports 8 internal wing slots (A-H) with dynamic customer-facing Display Names.
-- Implements Pi Inventory Lifecycle (society_id nullable, INVENTORY/ASSIGNED status).
-- Auto-provisions wing configurations (A-H) on society creation.
 - Auto-fixes database schema on startup (ALTER TABLE IF NOT EXISTS).
 - Strict cursor-based event pagination (last_id).
 - Transactional command ACK and configuration application.
@@ -47,7 +48,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="5.5.0-prod")
+app = FastAPI(title="EMS SaaS API", version="5.6.0-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -170,6 +171,9 @@ def ensure_db_schema():
             cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
             
+            # PRODUCTION FIX: Enforce ONE active Pi per society (allows multiple NULLs for inventory)
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_pi_devices_society_id ON pi_devices (society_id) WHERE society_id IS NOT NULL")
+            
             # Add Foreign Keys & Cascades safely
             cur.execute("""
                 DO $$ BEGIN
@@ -198,7 +202,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v5.5.0 Hardened)")
+        print("DB schema verified OK (Relational v5.6.0 Hardened)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -476,17 +480,18 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
             result = []
             for s in societies:
                 sid = s["id"]
-                cur.execute("SELECT * FROM pi_devices WHERE society_id = %s", (sid,))
+                cur.execute("SELECT id, name, firmware_version FROM pi_devices WHERE society_id = %s", (sid,))
                 dev = cur.fetchone()
                 
-                # PRODUCTION FIX: Handle societies with no Pi assigned yet
+                # PRODUCTION FIX: Handle societies with no Pi assigned yet, and return device_id/name
                 if not dev:
                     result.append({
                         "id": s["id"], "name": s["name"], "location": s["location"],
                         "plan": s["plan"], "status": s.get("status", "active"),
                         "society_code": s.get("society_code", ""),
                         "pi_online": False, "last_sync": None, "active_wing": None,
-                        "firmware_version": None, "reset_day": DEFAULT_RESET_DAY, "wings": {}
+                        "firmware_version": None, "reset_day": DEFAULT_RESET_DAY, "wings": {},
+                        "device_id": None, "device_name": None
                     })
                     continue
                 
@@ -515,9 +520,11 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
                     "society_code": s.get("society_code", ""),
                     "pi_online": online, "last_sync": pi.get("last_sync") if pi else None,
                     "active_wing": pi.get("active_wing") if pi else None,
-                    "firmware_version": dev.get("firmware_version", "?") if dev else None,
+                    "firmware_version": dev.get("firmware_version", "?"),
                     "reset_day": pi.get("reset_day", DEFAULT_RESET_DAY) if pi else DEFAULT_RESET_DAY,
                     "wings": wings_data,
+                    "device_id": str(dev["id"]),       # FIX: Return device_id
+                    "device_name": dev.get("name")      # FIX: Return device_name
                 })
             return result
     finally:
@@ -529,15 +536,14 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
     try:
         with conn.cursor() as cur:
             sid = data.get("id")
-            # PRODUCTION FIX: Cleaned up society dict to only include essential fields
             society = {
                 "name": data.get("name", ""), 
                 "location": data.get("location", ""),
-                "plan": "Basic", # Hardcoded default for DB compatibility
+                "plan": "Basic", 
                 "status": "active",
-                "tailscale_ip": "", # Hardcoded empty for DB compatibility
-                "pi_port": 5000, # Hardcoded default for DB compatibility
-                "society_code": f"SOC-{data.get('name', 'X')[:4].upper()}" # Auto-generate a simple code
+                "tailscale_ip": "", 
+                "pi_port": 5000,
+                "society_code": f"SOC-{data.get('name', 'X')[:4].upper()}"
             }
             
             wing_names = data.get("wing_names", {})
@@ -546,12 +552,10 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             device_id = data.get("device_id")
             
             if sid:
-                # UPDATE EXISTING SOCIETY
                 cur.execute("""UPDATE societies SET name=%s, location=%s, config_version=config_version+1 WHERE id=%s""",
                             (society["name"], society["location"], sid))
                 new_sid = int(sid)
             else:
-                # CREATE NEW SOCIETY
                 cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code, config_version) 
                                VALUES (%s, %s, %s, %s, %s, %s, %s, 1) RETURNING id""",
                             (society["name"], society["location"], society["plan"], society["status"],
@@ -559,7 +563,6 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 new_sid = cur.fetchone()["id"]
                 log_audit(cur, user, new_sid, "CREATE_SOCIETY", society)
                 
-            # UPSERT WING CONFIGURATIONS (Insert or Update names for all 8 wings)
             for wid in WING_ORDER:
                 w_name = wing_names.get(wid, f"Wing {wid}")
                 is_disabled = bool(wing_disabled.get(wid, True))
@@ -572,10 +575,18 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                                target_days=EXCLUDED.target_days, disabled=EXCLUDED.disabled""",
                             (new_sid, wid, w_name, w_name, w_target, is_disabled))
                             
-            # LINK DEVICE (if provided)
+            # PRODUCTION FIX: Safe Pi Assignment Lifecycle (Clear old before setting new to respect DB constraint)
             if device_id:
+                # Unassign any device previously assigned to this society
+                cur.execute("UPDATE pi_devices SET society_id=NULL, status='INVENTORY' WHERE society_id=%s AND id != %s", (new_sid, device_id))
+                # Unassign the selected device from any other society it might be attached to
+                cur.execute("UPDATE pi_devices SET society_id=NULL, status='INVENTORY' WHERE id=%s AND society_id IS NOT NULL AND society_id != %s", (device_id, new_sid))
+                # Assign the new device
                 cur.execute("UPDATE pi_devices SET society_id=%s, status='ASSIGNED' WHERE id=%s", (new_sid, device_id))
                 log_audit(cur, user, new_sid, "ASSIGN_DEVICE", {"device_id": device_id})
+            else:
+                # If no device selected, unassign any device currently assigned to this society
+                cur.execute("UPDATE pi_devices SET society_id=NULL, status='INVENTORY' WHERE society_id=%s", (new_sid,))
                 
         conn.commit()
     except Exception as e:

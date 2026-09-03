@@ -33,7 +33,6 @@ export default function SuperAdminDashboard() {
   useEffect(() => { if (localStorage.getItem("role") !== "super_admin") router.push("/login"); }, [router]);
 
   const fetchData = async () => {
-    // PRODUCTION FIX: Use Promise.allSettled so one failed API doesn't wipe out the whole dashboard
     const [sRes, uRes, dRes, fRes] = await Promise.allSettled([
       api.get("/api/super-admin/societies"), 
       api.get("/api/super-admin/users"),
@@ -56,7 +55,6 @@ export default function SuperAdminDashboard() {
 
   const initWings = () => {
     const wings: Record<string, { name: string; disabled: boolean; targetDays: number }> = {};
-    // PRODUCTION FIX: Initialize all 8 wings. Enabled by default, 10 target days.
     WING_CODES.forEach(code => {
       wings[code] = { name: `Wing ${code}`, disabled: false, targetDays: 10 };
     });
@@ -141,7 +139,10 @@ export default function SuperAdminDashboard() {
     { key: "firmware", label: "Firmware", count: fwVersions.length }
   ];
 
-  const availableDevices = devices.filter(d => !d.society_id || (editSoc && d.society_id === editSoc.id));
+  // PRODUCTION FIX: Cast both to String to prevent "12" === 12 mismatch
+  const availableDevices = devices.filter(d => 
+    !d.society_id || (editSoc && String(d.society_id) === String(editSoc.id))
+  );
 
   return (
     <div className="flex h-screen overflow-hidden">
