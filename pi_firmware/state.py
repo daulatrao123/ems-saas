@@ -21,16 +21,14 @@ class State:
                 if reason: self.last_shutdown_reason = reason
                 os.remove(boot_flag_file)
                 
-        if os.path.exists(config.stateFile):
-            self._load_from_disk()
-            self.boot_count += 1
-            
         self.clock_source = clock_source
         self.last_reboot_reason = self.last_shutdown_reason
         self.config_version = 0
         
+        # Load persistent reset period from DB
         self.last_reset_period = self.db.get_state("last_reset_period") or self._local_now().strftime("%Y-%m")
         
+        # 1. Initialize defaults FIRST
         self.data = {
             "deviceId": config.deviceId,
             "firmwareVersion": config.firmwareVersion,
@@ -58,8 +56,13 @@ class State:
             },
             "events": []
         }
-        self._load_from_disk()
-        self.data["bootCount"] = self.boot_count
+        
+        # 2. Load persisted state from disk (safely overwrites defaults)
+        if os.path.exists(config.stateFile):
+            self._load_from_disk()
+            self.boot_count += 1
+            self.data["bootCount"] = self.boot_count
+            
         self.data["lastShutdownReason"] = self.last_shutdown_reason
 
     def _local_now(self):
