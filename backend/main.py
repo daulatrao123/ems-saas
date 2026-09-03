@@ -586,19 +586,33 @@ def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
     try:
         with conn.cursor() as cur:
             society_id = int(data.get("society_id"))
-            name = data.get("name", "New Pi Device")
+            name = data.get("name", "Pi Device")
+            device_id = data.get("id")
             
-            # PRODUCTION FIX: Allow pasting custom Device ID and API Key, or auto-generate if missing
-            device_id = data.get("id") or str(uuid.uuid4())
-            raw_api_key = data.get("api_key") or str(uuid.uuid4())
-            api_key_hash = hash_api_key(raw_api_key)
-            
-            cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status) 
-                           VALUES (%s, %s, %s, %s, 'active')""",
-                        (device_id, society_id, name, api_key_hash))
-            
-            log_audit(cur, user, society_id, "CREATE_DEVICE", {"device_id": device_id, "name": name})
-        conn.commit()
+            if device_id:
+                # EDIT EXISTING DEVICE
+                if data.get("api_key"):
+                    api_key_hash = hash_api_key(data["api_key"])
+                    cur.execute("UPDATE pi_devices SET name=%s, society_id=%s, api_key_hash=%s WHERE id=%s",
+                                (name, society_id, api_key_hash, device_id))
+                else:
+                    cur.execute("UPDATE pi_devices SET name=%s, society_id=%s WHERE id=%s",
+                                (name, society_id, device_id))
+                log_audit(cur, user, society_id, "UPDATE_DEVICE", {"device_id": device_id, "name": name})
+                conn.commit()
+                return {"message": "Device updated"}
+            else:
+                # CREATE NEW DEVICE
+                device_id = str(uuid.uuid4())
+                raw_api_key = data.get("api_key") or str(uuid.uuid4())
+                api_key_hash = hash_api_key(raw_api_key)
+                
+                cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status) 
+                               VALUES (%s, %s, %s, %s, 'active')""",
+                            (device_id, society_id, name, api_key_hash))
+                log_audit(cur, user, society_id, "CREATE_DEVICE", {"device_id": device_id, "name": name})
+                conn.commit()
+                return {"message": "Device created", "device_id": device_id, "api_key": raw_api_key}
     except Exception as e:
         conn.rollback()
         raise e
