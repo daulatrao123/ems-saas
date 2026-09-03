@@ -37,24 +37,40 @@ class EmsController:
         self._last_heartbeat = time.time()
         self._last_rtc_sync = 0
 
-        # PRODUCTION FIX: Crash Recovery & Reconciliation
+        # PRODUCTION FIX: Real Crash Reconciliation Engine
         self._reconcile_interrupted_commands()
 
     def _reconcile_interrupted_commands(self):
-        """Check for commands that were STARTED but never completed (due to crash/power loss)."""
+        """Finds commands STARTED but never completed, reads actual GPIO, and reconciles."""
         interrupted = self.db.get_interrupted_commands()
         if not interrupted:
             return
             
         self.log.warning(f"CRASH RECOVERY: Found {len(interrupted)} interrupted commands. Reconciling hardware state...")
         
-        for cid in interrupted:
-            # In a full system, we would check the cloud's desired state vs actual GPIO here.
-            # For now, we mark them as UNKNOWN_AFTER_REBOOT so the cloud knows the state is uncertain.
-            self.db.update_command_status(cid, "UNKNOWN_AFTER_REBOOT")
-            self.state.add_event("SYSTEM", f"Crash recovery: Cmd {cid[:8]} marked UNKNOWN")
+        # 1. Read actual physical GPIO state
+        actual_active_wing = None
+        for w in self.cfg.wing_codes:
+            if self.gpio.verify_relay_state(w):
+                actual_active_wing = w
+                break
+                
+        # 2. Reconcile state based on hardware read
+        if actual_active_wing:
+            self.log.warning(f"Crash recovery: Wing {actual_active_wing} is physically ON. Reconciling state.")
+            self.state.data["activeWing"] = actual_active_wing
+            self.state.add_event("SYSTEM", f"Crash recovery: Wing {actual_active_wing} verified ON")
+        else:
+            self.log.warning("Crash recovery: No wings are physically ON. State set to OFF.")
+            self.state.data["activeWing"] = None
+            self.state.add_event("SYSTEM", "Crash recovery: All wings verified OFF")
             
-        self.log.info("Crash recovery complete. Interrupted commands marked.")
+        # 3. Mark all interrupted commands as RECONCILED (Terminal State)
+        for cid in interrupted:
+            self.db.update_command_status(cid, "RECONCILED")
+            
+        self.state.force_persist()
+        self.log.info("Crash recovery complete.")
 
     def _sync_loop(self):
         while not self._stop.is_set():
@@ -119,7 +135,6 @@ class EmsController:
                         "params": params
                     }
                     
-                    # Execute via the strict state machine handler
                     ack_data = self.cmd_handler.execute(cmd_payload)
                     
                     if ack_data:

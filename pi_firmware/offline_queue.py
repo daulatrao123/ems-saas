@@ -12,7 +12,6 @@ class OfflineQueue:
             conn.execute("""CREATE TABLE IF NOT EXISTS pending_acks (
                 command_id TEXT PRIMARY KEY, success INTEGER, result TEXT, error TEXT
             )""")
-            # PRODUCTION FIX: Added status and timestamps for state machine
             conn.execute("""CREATE TABLE IF NOT EXISTS executed_commands (
                 command_id TEXT PRIMARY KEY, 
                 status TEXT DEFAULT 'STARTED', 
@@ -48,21 +47,31 @@ class OfflineQueue:
             return {"status": row[0], "result": row[1]} if row else None
 
     def log_command_start(self, cid):
+        # PRODUCTION FIX: Use INSERT OR IGNORE to prevent overwriting history
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""INSERT OR REPLACE INTO executed_commands 
+            conn.execute("""INSERT OR IGNORE INTO executed_commands 
                              (command_id, status, result, started_at, completed_at) 
                              VALUES (?, 'STARTED', NULL, ?, NULL)""",
                          (cid, int(time.time())))
 
     def update_command_status(self, cid, status, result=None):
+        # PRODUCTION FIX: Enforce strict state transitions (never allow SUCCESS -> STARTED)
         with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT status FROM executed_commands WHERE command_id=?", (cid,))
+            row = cur.fetchone()
+            if not row: return
+            
+            current_status = row[0]
+            if current_status in ["SUCCESS", "FAILED", "RECONCILED", "EXPIRED"]:
+                self.log.warning(f"Attempted to change terminal command {cid} from {current_status} to {status}. Rejected.")
+                return
+                
             conn.execute("""UPDATE executed_commands 
                             SET status=?, result=?, completed_at=? 
                             WHERE command_id=?""",
                          (status, result, int(time.time()), cid))
 
     def get_interrupted_commands(self):
-        """Finds commands that were STARTED but never completed (crash recovery)"""
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute("SELECT command_id FROM executed_commands WHERE status = 'STARTED'")
             return [row[0] for row in cur.fetchall()]
