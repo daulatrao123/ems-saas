@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import api from "@/lib/api"; // Adjust import path as needed
+import api from "@/lib/api";
 
 export default function AdminDashboard() {
   const [societyId, setSocietyId] = useState<string | null>(null);
@@ -9,51 +9,37 @@ export default function AdminDashboard() {
   const [events, setEvents] = useState<any[]>([]);
   const [lastEventId, setLastEventId] = useState<number>(0);
 
-  // 1. Extract Society ID from JWT on component mount
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (token) {
       try {
         const payload = JSON.parse(atob(token.split(".")[1]));
-        if (payload.society_id) {
-          setSocietyId(String(payload.society_id));
-        } else {
-          console.error("No society_id found in token");
-        }
-      } catch (e) {
-        console.error("Failed to parse token", e);
-      }
+        if (payload.society_id) setSocietyId(String(payload.society_id));
+      } catch (e) { console.error("Failed to parse token", e); }
     }
   }, []);
 
-  // 2. Fetch Dashboard Data using dynamic Society ID
   const fetchDashboard = useCallback(async () => {
     if (!societyId) return;
     try {
       const res = await api.get(`/api/admin/dashboard?society_id=${societyId}`);
       setDashboardData(res.data);
-    } catch (error) {
-      console.error("Failed to fetch dashboard", error);
-    }
+    } catch (error) { console.error("Failed to fetch dashboard", error); }
   }, [societyId]);
 
-  // 3. Fetch Events using Cursor Pagination (last_id)
   const fetchEvents = useCallback(async () => {
     if (!societyId) return;
     try {
-      // PRODUCTION FIX: Use last_id instead of since, default to 0
       const res = await api.get(`/api/admin/pi-events?society_id=${societyId}&last_id=${lastEventId}`);
       if (res.data.events.length > 0) {
         setEvents((prev) => {
-          // PRODUCTION FIX: Filter out duplicates before appending
-          const newEvents = res.data.events.filter((ne: any) => !prev.some((e: any) => e.id === ne.id));
-          return [...prev, ...newEvents].slice(-100); // Keep last 100
+          const existingIds = new Set(prev.map((e: any) => e.id));
+          const newEvents = res.data.events.filter((ne: any) => !existingIds.has(ne.id));
+          return [...prev, ...newEvents].slice(-100);
         });
         setLastEventId(res.data.last_id);
       }
-    } catch (error) {
-      console.error("Failed to fetch events", error);
-    }
+    } catch (error) { console.error("Failed to fetch events", error); }
   }, [societyId, lastEventId]);
 
   useEffect(() => {
@@ -62,7 +48,7 @@ export default function AdminDashboard() {
     const interval = setInterval(() => {
       fetchDashboard();
       fetchEvents();
-    }, 5000); // Poll every 5s for Admin
+    }, 5000);
     return () => clearInterval(interval);
   }, [fetchDashboard, fetchEvents]);
 
@@ -73,16 +59,9 @@ export default function AdminDashboard() {
 
   const sendCommand = async (command: string, wing?: string) => {
     try {
-      await api.post("/api/admin/pi-command", {
-        society_id: societyId,
-        command,
-        wing: wing || "",
-        params: {}
-      });
+      await api.post("/api/admin/pi-command", { society_id: societyId, command, wing: wing || "", params: {} });
       fetchDashboard(); 
-    } catch (error) {
-      console.error("Command failed", error);
-    }
+    } catch (error) { console.error("Command failed", error); }
   };
 
   return (

@@ -1,12 +1,10 @@
 """
-EMS SaaS Backend v5.2.0 — Industrial Production (Hardened)
+EMS SaaS Backend v5.3.0 — Industrial Production (Coordinated Release)
 ====================================
-- Explicit Database Transactions for multi-step operations.
-- Audit logging no longer silently fails.
-- Added Rate Limiting (slowapi) for login and Pi sync.
-- Real Database readiness check in /api/health.
-- Wing contract strictly enforced: A, B, G.
-- PRODUCTION FIX: Cloud is authority for target_days (updated on ACK, not sync).
+- Implements Protocol v1 (configVersion, explicit wing_configs).
+- Cloud is strict authority for target_days.
+- Transactional command ACK and configuration application.
+- Explicit DB transactions, rate limiting, and audit logging.
 """
 
 import os
@@ -47,7 +45,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="5.2.0-prod")
+app = FastAPI(title="EMS SaaS API", version="5.3.0-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -68,7 +66,7 @@ VALID_COMMANDS = {
 
 def get_db():
     conn = psycopg.connect(DATABASE_URL, connect_timeout=10, row_factory=dict_row)
-    conn.autocommit = False # PRODUCTION HARDENING: Use explicit transactions
+    conn.autocommit = False
     return conn
 
 @app.on_event("startup")
@@ -80,7 +78,8 @@ def ensure_db_schema():
                 CREATE TABLE IF NOT EXISTS societies (
                     id SERIAL PRIMARY KEY,
                     name TEXT, location TEXT, plan TEXT, status TEXT,
-                    tailscale_ip TEXT, pi_port INT, society_code TEXT
+                    tailscale_ip TEXT, pi_port INT, society_code TEXT,
+                    config_version INT DEFAULT 1
                 );
             """)
             cur.execute("""
@@ -127,7 +126,8 @@ def ensure_db_schema():
                     active_wing TEXT, reset_day INT, emergency_stop BOOL,
                     uptime_seconds INT, cpu_temp FLOAT, disk_free_mb FLOAT,
                     last_sync TIMESTAMPTZ, boot_count INT, last_shutdown_reason TEXT, clock_source TEXT,
-                    watchdog_enabled BOOL, last_reboot_reason TEXT
+                    watchdog_enabled BOOL, last_reboot_reason TEXT,
+                    config_version INT DEFAULT 0
                 );
             """)
             cur.execute("""
@@ -159,7 +159,7 @@ def ensure_db_schema():
                 );
             """)
             
-            # PRODUCTION HARDENING: Add Foreign Keys & Cascades safely
+            # Add Foreign Keys & Cascades safely
             cur.execute("""
                 DO $$ BEGIN
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_society') THEN
@@ -186,8 +186,8 @@ def ensure_db_schema():
                 END $$;
             """)
 
-        conn.commit() # Commit schema changes
-        print("DB schema verified OK (Relational v5.2.0 Hardened)")
+        conn.commit()
+        print("DB schema verified OK (Relational v5.3.0 Hardened)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -199,7 +199,6 @@ def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 def log_audit(cur, user: dict, society_id: int, action: str, details: dict):
-    # PRODUCTION HARDENING: No more silent except: pass. Pass cursor in to make it transactional.
     cur.execute("""INSERT INTO audit_log (society_id, user_id, action, details, created_at) 
                    VALUES (%s, %s, %s, %s, %s)""",
                 (society_id, user.get("id"), action, psycopg.types.json.Json(details), datetime.now(timezone.utc)))
@@ -359,7 +358,6 @@ def ping():
 
 @app.get("/api/health")
 def health():
-    # PRODUCTION HARDENING: Real readiness check
     try:
         conn = get_db()
         with conn.cursor() as cur:
@@ -388,8 +386,8 @@ def bootstrap(request: Request):
             if cur.fetchone():
                 raise HTTPException(400, "System already initialized")
                 
-            cur.execute("INSERT INTO societies (name, location, plan, status, society_code) VALUES (%s, %s, %s, %s, %s) RETURNING id", 
-                        ("Prestine Pacific", "Mumbai", "Basic", "active", "prestine"))
+            cur.execute("INSERT INTO societies (name, location, plan, status, society_code, config_version) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id", 
+                        ("Prestine Pacific", "Mumbai", "Basic", "active", "prestine", 1))
             sid = cur.fetchone()["id"]
             
             device_id = str(uuid.uuid4())
@@ -409,9 +407,9 @@ def bootstrap(request: Request):
                            (sid, wid, f"Tower {wid}", f"Tower {wid}", 10 if wid == "A" else 12 if wid == "B" else 10, False))
                 cur.execute("INSERT INTO wing_state (device_id, wing_id) VALUES (%s, %s)", (device_id, wid))
                 
-            cur.execute("""INSERT INTO pi_state (device_id, active_wing, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, watchdog_enabled) 
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (device_id, "A", DEFAULT_RESET_DAY, False, 0, 0.0, 0.0, datetime.now(timezone.utc), 0, True))
+            cur.execute("""INSERT INTO pi_state (device_id, active_wing, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, watchdog_enabled, config_version) 
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (device_id, "A", DEFAULT_RESET_DAY, False, 0, 0.0, 0.0, datetime.now(timezone.utc), 0, True, 0))
                         
         conn.commit()
     except Exception as e:
@@ -514,12 +512,12 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             
             if sid:
                 cur.execute("""UPDATE societies SET name=%s, location=%s, plan=%s, status=%s, 
-                               tailscale_ip=%s, pi_port=%s, society_code=%s WHERE id=%s""",
+                               tailscale_ip=%s, pi_port=%s, society_code=%s, config_version=config_version+1 WHERE id=%s""",
                             (society["name"], society["location"], society["plan"], society["status"],
                              society["tailscale_ip"], society["pi_port"], society["society_code"], sid))
             else:
-                cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code) 
-                               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code, config_version) 
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, 1) RETURNING id""",
                             (society["name"], society["location"], society["plan"], society["status"],
                              society["tailscale_ip"], society["pi_port"], society["society_code"]))
                 new_sid = cur.fetchone()[0]
@@ -718,15 +716,22 @@ def pi_sync(request: Request, payload: dict):
                 physical_toggle = str(physical_toggle).upper()
                 if physical_toggle not in ("ON", "OFF", "UNKNOWN"): physical_toggle = "UNKNOWN"
                 
-                # PRODUCTION FIX: Pi only reports runtime state, NOT target_days config
                 cur.execute("""INSERT INTO wing_state (device_id, wing_id, physical_toggle, used_days, clicks) 
                                VALUES (%s, %s, %s, %s, %s) 
                                ON CONFLICT (device_id, wing_id) DO UPDATE SET 
                                physical_toggle=EXCLUDED.physical_toggle, used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks""",
                             (device_id, wid, physical_toggle, int(w.get("usedDays", 0)), int(w.get("clicks", 0))))
 
-            cur.execute("""INSERT INTO pi_state (device_id, active_wing, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason) 
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            cur.execute("SELECT config_version FROM societies WHERE id = %s", (society_id,))
+            soc = cur.fetchone()
+            cloud_config_version = soc["config_version"] if soc else 0
+            
+            cur.execute("SELECT wing_id, target_days, disabled FROM wing_configs WHERE society_id = %s", (society_id,))
+            configs = cur.fetchall()
+            wing_configs = {c["wing_id"]: {"target_days": c["target_days"], "disabled": c["disabled"]} for c in configs}
+
+            cur.execute("""INSERT INTO pi_state (device_id, active_wing, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason, config_version) 
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (device_id) DO UPDATE SET 
                            active_wing=EXCLUDED.active_wing, reset_day=EXCLUDED.reset_day, emergency_stop=EXCLUDED.emergency_stop, 
                            uptime_seconds=EXCLUDED.uptime_seconds, cpu_temp=EXCLUDED.cpu_temp, disk_free_mb=EXCLUDED.disk_free_mb, 
@@ -736,7 +741,7 @@ def pi_sync(request: Request, payload: dict):
                          bool(payload.get("emergencyStop", False)), int(payload.get("uptimeSeconds", 0)),
                          float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
-                         payload.get("lastRebootReason", "")))
+                         payload.get("lastRebootReason", ""), cloud_config_version))
 
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
@@ -752,7 +757,14 @@ def pi_sync(request: Request, payload: dict):
             cur.execute("SELECT * FROM pi_commands WHERE device_id = %s AND status = 'queued' ORDER BY created_at ASC LIMIT 1", (device_id,))
             cmd = cur.fetchone()
             
-            reply = {"success": True, "command": None, "command_id": None}
+            reply = {
+                "success": True, 
+                "command": None, 
+                "command_id": None,
+                "configVersion": cloud_config_version,
+                "wingConfigs": wing_configs,
+                "resetDay": int(payload.get("resetDay", DEFAULT_RESET_DAY))
+            }
             if cmd:
                 cur.execute("UPDATE pi_commands SET status = 'delivered', delivered_at = %s WHERE id = %s", (now, cmd["id"]))
                 reply["command"] = cmd["command"]
@@ -760,9 +772,9 @@ def pi_sync(request: Request, payload: dict):
                 if cmd.get("wing"): reply["wing"] = cmd["wing"]
                 reply["params"] = cmd.get("params", {})
 
-        conn.commit() # Commit all sync changes atomically
+        conn.commit()
     except Exception as e:
-        conn.rollback() # Rollback if any query fails
+        conn.rollback()
         raise e
     finally:
         conn.close()
@@ -782,23 +794,21 @@ def pi_command_ack(payload: dict):
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            # Fetch the command to see what it was
             cur.execute("SELECT command, wing, params FROM pi_commands WHERE id = %s AND device_id = %s", (command_id, device_id))
             cmd = cur.fetchone()
             if not cmd:
                 return {"success": True, "status": "unknown"}
 
-            # PRODUCTION FIX: If ACK is successful, apply configuration changes to DB
             if success:
                 if cmd["command"] == "set_days":
                     wing = cmd["wing"]
                     days = int(cmd["params"].get("days", 0))
                     cur.execute("UPDATE wing_configs SET target_days = %s WHERE society_id = %s AND wing_id = %s", (days, society_id, wing))
+                    cur.execute("UPDATE societies SET config_version = config_version + 1 WHERE id = %s", (society_id,))
                 elif cmd["command"] == "set_reset_day":
                     day = int(cmd["params"].get("day", 15))
                     cur.execute("UPDATE pi_state SET reset_day = %s WHERE device_id = %s", (day, device_id))
 
-            # Update command status
             cur.execute("""UPDATE pi_commands SET status = %s, acked_at = %s, error = %s, result = %s 
                            WHERE id = %s AND device_id = %s AND status = 'delivered'""",
                         ("succeeded" if success else "failed", datetime.now(timezone.utc), None if success else error, result, command_id, device_id))
@@ -923,7 +933,7 @@ def map_events(raw):
     out = []
     for e in raw:
         out.append({
-            "id": e["id"], # Return integer ID for cursor
+            "id": e["id"],
             "ts": e["timestamp"].isoformat() if e.get("timestamp") else "", 
             "level": (e.get("type","") or "").upper(), 
             "msg": e.get("message","")
