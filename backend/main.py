@@ -1,9 +1,10 @@
 """
-EMS SaaS Backend v5.3.1 — Industrial Production (Schema Auto-Fix)
+EMS SaaS Backend v5.3.2 — Industrial Production (Schema Auto-Fix & Device Provisioning)
 ====================================
 - Auto-applies ALTER TABLE IF NOT EXISTS for config_version to prevent 500 errors.
 - Strict cursor-based event pagination (last_id).
 - Transactional command ACK and configuration application.
+- Super Admin Device Auto-Provisioning (Editable Keys).
 """
 
 import os
@@ -44,7 +45,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="5.3.1-prod")
+app = FastAPI(title="EMS SaaS API", version="5.3.2-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -190,7 +191,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v5.3.1 Hardened)")
+        print("DB schema verified OK (Relational v5.3.2 Hardened)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -524,6 +525,13 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                             (society["name"], society["location"], society["plan"], society["status"],
                              society["tailscale_ip"], society["pi_port"], society["society_code"]))
                 new_sid = cur.fetchone()[0]
+                
+                # AUTO-PROVISION: Create default wing configs for the new society
+                for wid in WING_ORDER:
+                    cur.execute("""INSERT INTO wing_configs (society_id, wing_id, name, display_name, target_days, disabled) 
+                                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                                (new_sid, wid, f"Wing {wid}", f"Wing {wid}", 10, False))
+                
                 log_audit(cur, user, new_sid, "CREATE_SOCIETY", society)
         conn.commit()
     except Exception as e:
@@ -541,6 +549,72 @@ def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))
             sid = data.get("id")
             cur.execute("DELETE FROM societies WHERE id = %s", (sid,))
             log_audit(cur, user, sid, "DELETE_SOCIETY", {})
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+    return {"message": "Deleted"}
+
+# ================================================================
+# SUPER-ADMIN — DEVICES (Auto-Provisioning & Editable Keys)
+# ================================================================
+
+@app.get("/api/super-admin/devices")
+def get_devices(user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT d.id, d.society_id, d.name, d.firmware_version, d.last_seen, d.status, s.name as society_name 
+                FROM pi_devices d 
+                LEFT JOIN societies s ON d.society_id = s.id
+                ORDER BY d.name ASC
+            """)
+            devices = cur.fetchall()
+            for d in devices:
+                d["id"] = str(d["id"])
+                d["society_id"] = str(d["society_id"]) if d["society_id"] else None
+            return devices
+    finally:
+        conn.close()
+
+@app.post("/api/super-admin/devices/save")
+def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            society_id = int(data.get("society_id"))
+            name = data.get("name", "New Pi Device")
+            
+            # PRODUCTION FIX: Allow pasting custom Device ID and API Key, or auto-generate if missing
+            device_id = data.get("id") or str(uuid.uuid4())
+            raw_api_key = data.get("api_key") or str(uuid.uuid4())
+            api_key_hash = hash_api_key(raw_api_key)
+            
+            cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status) 
+                           VALUES (%s, %s, %s, %s, 'active')""",
+                        (device_id, society_id, name, api_key_hash))
+            
+            log_audit(cur, user, society_id, "CREATE_DEVICE", {"device_id": device_id, "name": name})
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+        
+    # Return the raw API key ONCE so the admin can give it to the Pi
+    return {"message": "Device created", "device_id": device_id, "api_key": raw_api_key}
+
+@app.post("/api/super-admin/devices/delete")
+def delete_device(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            device_id = data.get("id")
+            cur.execute("DELETE FROM pi_devices WHERE id = %s", (device_id,))
         conn.commit()
     except Exception as e:
         conn.rollback()
