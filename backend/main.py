@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v5.5.0 — Industrial Production (8-Wing Hardware Profile)
+EMS SaaS Backend v5.5.0 — Industrial Production (8-Wing Profile & Inventory Lifecycle)
 ====================================
 - Supports 8 internal wing slots (A-H) with dynamic customer-facing Display Names.
 - Implements Pi Inventory Lifecycle (society_id nullable, INVENTORY/ASSIGNED status).
@@ -542,6 +542,7 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             
             wing_names = data.get("wing_names", {})
             wing_disabled = data.get("wing_disabled", {})
+            wing_target_days = data.get("wing_target_days", {})
             device_id = data.get("device_id")
             
             if sid:
@@ -562,13 +563,14 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             for wid in WING_ORDER:
                 w_name = wing_names.get(wid, f"Wing {wid}")
                 is_disabled = bool(wing_disabled.get(wid, True))
-                if wid in ["A", "B", "G"] and wid not in wing_disabled:
-                    is_disabled = False # Backward compat: enable A,B,G by default if not specified
-                    
+                w_target = int(wing_target_days.get(wid, 0))
+                
                 cur.execute("""INSERT INTO wing_configs (society_id, wing_id, name, display_name, target_days, disabled) 
-                               VALUES (%s, %s, %s, %s, 10, %s) 
-                               ON CONFLICT (society_id, wing_id) DO UPDATE SET name=EXCLUDED.name, display_name=EXCLUDED.name, disabled=EXCLUDED.disabled""",
-                            (new_sid, wid, w_name, w_name, is_disabled))
+                               VALUES (%s, %s, %s, %s, %s, %s) 
+                               ON CONFLICT (society_id, wing_id) DO UPDATE SET 
+                               name=EXCLUDED.name, display_name=EXCLUDED.name, 
+                               target_days=EXCLUDED.target_days, disabled=EXCLUDED.disabled""",
+                            (new_sid, wid, w_name, w_name, w_target, is_disabled))
                             
             # LINK DEVICE (if provided)
             if device_id:

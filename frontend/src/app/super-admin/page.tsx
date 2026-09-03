@@ -19,7 +19,7 @@ export default function SuperAdminDashboard() {
   const [showKeyModal, setShowKeyModal] = useState(false);
   
   const [editSoc, setEditSoc] = useState<any>(null);
-  const [socForm, setSocForm] = useState({ name: "", location: "", device_id: "", wings: {} as Record<string, { name: string; disabled: boolean }> });
+  const [socForm, setSocForm] = useState({ name: "", location: "", device_id: "", wings: {} as Record<string, { name: string; disabled: boolean; targetDays: number }> });
   const [userForm, setUserForm] = useState({ email: "", name: "", password: "", role: "society_admin", society_id: "" });
   
   const [editDeviceId, setEditDeviceId] = useState<string | null>(null);
@@ -33,18 +33,19 @@ export default function SuperAdminDashboard() {
   useEffect(() => { if (localStorage.getItem("role") !== "super_admin") router.push("/login"); }, [router]);
 
   const fetchData = async () => {
-    try {
-      const [sRes, uRes, dRes, fRes] = await Promise.all([
-        api.get("/api/super-admin/societies"), 
-        api.get("/api/super-admin/users"),
-        api.get("/api/super-admin/devices"),
-        api.get("/api/super-admin/firmware/versions")
-      ]);
-      setSocieties(sRes.data); 
-      setUsers(uRes.data); 
-      setDevices(dRes.data);
-      setFwVersions(fRes.data || []);
-    } catch {}
+    // PRODUCTION FIX: Use Promise.allSettled so one failed API doesn't wipe out the whole dashboard
+    const [sRes, uRes, dRes, fRes] = await Promise.allSettled([
+      api.get("/api/super-admin/societies"), 
+      api.get("/api/super-admin/users"),
+      api.get("/api/super-admin/devices"),
+      api.get("/api/super-admin/firmware/versions")
+    ]);
+    
+    if (sRes.status === 'fulfilled') setSocieties(sRes.value.data); 
+    if (uRes.status === 'fulfilled') setUsers(uRes.value.data); 
+    if (dRes.status === 'fulfilled') setDevices(dRes.value.data);
+    if (fRes.status === 'fulfilled') setFwVersions(fRes.value.data || []);
+    
     setLoading(false);
   };
 
@@ -54,9 +55,10 @@ export default function SuperAdminDashboard() {
   const copyText = (t: string) => { navigator.clipboard.writeText(t); showToast("Copied!", true); };
 
   const initWings = () => {
-    const wings: Record<string, { name: string; disabled: boolean }> = {};
+    const wings: Record<string, { name: string; disabled: boolean; targetDays: number }> = {};
+    // PRODUCTION FIX: Initialize all 8 wings. Enabled by default, 10 target days.
     WING_CODES.forEach(code => {
-      wings[code] = { name: `Wing ${code}`, disabled: !["A", "B", "G"].includes(code) };
+      wings[code] = { name: `Wing ${code}`, disabled: false, targetDays: 10 };
     });
     return wings;
   };
@@ -65,12 +67,15 @@ export default function SuperAdminDashboard() {
     try {
       const wing_names: Record<string, string> = {};
       const wing_disabled: Record<string, boolean> = {};
+      const wing_target_days: Record<string, number> = {};
+      
       Object.entries(socForm.wings).forEach(([code, data]) => {
         wing_names[code] = data.name;
         wing_disabled[code] = data.disabled;
+        wing_target_days[code] = data.targetDays;
       });
 
-      const payload = { ...socForm, wing_names, wing_disabled };
+      const payload = { ...socForm, wing_names, wing_disabled, wing_target_days };
       await api.post("/api/super-admin/societies/save", editSoc ? { id: editSoc.id, ...payload } : payload);
       setShowSocModal(false); setEditSoc(null);
       setSocForm({ name: "", location: "", device_id: "", wings: initWings() });
@@ -83,7 +88,11 @@ export default function SuperAdminDashboard() {
     const currentWings = initWings();
     if (s.wings) {
       Object.keys(s.wings).forEach(code => {
-        currentWings[code] = { name: s.wings[code].name, disabled: s.wings[code].disabled };
+        currentWings[code] = { 
+          name: s.wings[code].name, 
+          disabled: s.wings[code].disabled,
+          targetDays: s.wings[code].target_days || 10
+        };
       });
     }
     setEditSoc(s); 
@@ -156,7 +165,6 @@ export default function SuperAdminDashboard() {
           ))}
         </div>
 
-        {/* Societies Tab */}
         {tab === "societies" && (
           <div className="bg-gray-900/80 border border-gray-800 rounded-xl overflow-hidden">
             <table className="w-full text-xs">
@@ -181,7 +189,6 @@ export default function SuperAdminDashboard() {
           </div>
         )}
 
-        {/* Users Tab */}
         {tab === "users" && (
           <div className="bg-gray-900/80 border border-gray-800 rounded-xl overflow-hidden">
             <table className="w-full text-xs">
@@ -201,7 +208,6 @@ export default function SuperAdminDashboard() {
           </div>
         )}
 
-        {/* Devices Tab */}
         {tab === "devices" && (
           <div className="bg-gray-900/80 border border-gray-800 rounded-xl overflow-hidden">
             <table className="w-full text-xs">
@@ -256,11 +262,18 @@ export default function SuperAdminDashboard() {
                           value={socForm.wings[code]?.name || ""} 
                           onChange={(e) => setSocForm({ ...socForm, wings: { ...socForm.wings, [code]: { ...socForm.wings[code], name: e.target.value } }})} 
                         />
+                        <input 
+                          type="number"
+                          className="w-16 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" 
+                          placeholder="Days" 
+                          value={socForm.wings[code]?.targetDays ?? 10} 
+                          onChange={(e) => setSocForm({ ...socForm, wings: { ...socForm.wings, [code]: { ...socForm.wings[code], targetDays: parseInt(e.target.value) || 0 } }})} 
+                        />
                         <button 
                           className={`px-2 py-1 text-[9px] font-bold rounded ${socForm.wings[code]?.disabled ? 'bg-gray-700 text-gray-400' : 'bg-emerald-500/15 text-emerald-400'}`}
                           onClick={() => setSocForm({ ...socForm, wings: { ...socForm.wings, [code]: { ...socForm.wings[code], disabled: !socForm.wings[code]?.disabled } }})}
                         >
-                          {socForm.wings[code]?.disabled ? "OFF" : "ON"}
+                          {socForm.wings[code]?.disabled ? "DISABLED" : "ENABLED"}
                         </button>
                       </div>
                     ))}
