@@ -1,11 +1,12 @@
 """
-EMS SaaS Backend v5.4.0 — Industrial Production (Inventory & Link Lifecycle)
+EMS SaaS Backend v5.5.0 — Industrial Production (8-Wing Hardware Profile)
 ====================================
-- Auto-applies ALTER TABLE IF NOT EXISTS for config_version to prevent 500 errors.
+- Supports 8 internal wing slots (A-H) with dynamic customer-facing Display Names.
 - Implements Pi Inventory Lifecycle (society_id nullable, INVENTORY/ASSIGNED status).
+- Auto-provisions wing configurations (A-H) on society creation.
+- Auto-fixes database schema on startup (ALTER TABLE IF NOT EXISTS).
 - Strict cursor-based event pagination (last_id).
 - Transactional command ACK and configuration application.
-- Super Admin Device Auto-Provisioning (Editable Keys).
 """
 
 import os
@@ -46,12 +47,13 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="5.4.0-prod")
+app = FastAPI(title="EMS SaaS API", version="5.5.0-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 DEFAULT_RESET_DAY = 15
-WING_ORDER = ["A", "B", "G"]
+# PRODUCTION FIX: Expanded to 8 wings (A-H)
+WING_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H"]
 PI_ONLINE_THRESHOLD_SECONDS = 120
 COMMAND_EXPIRY_SECONDS = 300
 VALID_ROLES = {"super_admin", "society_admin", "member"}
@@ -196,7 +198,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v5.4.0 Hardened)")
+        print("DB schema verified OK (Relational v5.5.0 Hardened)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -276,7 +278,7 @@ def validate_command(command: str, params: dict, wing: str = "") -> None:
         raise HTTPException(400, f"Unsupported command: {command}")
     if command in ("set_active_wing", "set_days", "off_wing"):
         if wing not in WING_ORDER:
-            raise HTTPException(400, "Valid wing A, B or G is required")
+            raise HTTPException(400, f"Valid wing ({', '.join(WING_ORDER)}) is required")
     if command == "set_days":
         try: days = int(params.get("days"))
         except: raise HTTPException(400, "days must be an integer")
@@ -414,9 +416,11 @@ def bootstrap(request: Request):
             cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
                         ("member@prestine.com", "Prestine Member", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "member", sid))
             
+            # PRODUCTION FIX: Initialize all 8 wings (A-H). A, B, G enabled by default.
             for wid in WING_ORDER:
+                is_disabled = wid not in ["A", "B", "G"]
                 cur.execute("INSERT INTO wing_configs (society_id, wing_id, name, display_name, target_days, disabled) VALUES (%s, %s, %s, %s, %s, %s)",
-                           (sid, wid, f"Tower {wid}", f"Tower {wid}", 10 if wid == "A" else 12 if wid == "B" else 10, False))
+                           (sid, wid, f"Wing {wid}", f"Wing {wid}", 10, is_disabled))
                 cur.execute("INSERT INTO wing_state (device_id, wing_id) VALUES (%s, %s)", (device_id, wid))
                 
             cur.execute("""INSERT INTO pi_state (device_id, active_wing, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, watchdog_enabled, config_version) 
@@ -525,24 +529,25 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
     try:
         with conn.cursor() as cur:
             sid = data.get("id")
+            # PRODUCTION FIX: Cleaned up society dict to only include essential fields
             society = {
-                "name": data.get("name", ""), "location": data.get("location", ""),
-                "plan": data.get("plan", "Basic"), "status": "active",
-                "tailscale_ip": data.get("tailscale_ip", ""),
-                "pi_port": int(data.get("pi_port", 5000)),
-                "society_code": data.get("society_code", ""),
+                "name": data.get("name", ""), 
+                "location": data.get("location", ""),
+                "plan": "Basic", # Hardcoded default for DB compatibility
+                "status": "active",
+                "tailscale_ip": "", # Hardcoded empty for DB compatibility
+                "pi_port": 5000, # Hardcoded default for DB compatibility
+                "society_code": f"SOC-{data.get('name', 'X')[:4].upper()}" # Auto-generate a simple code
             }
             
-            # PRODUCTION FIX: Accept wing names and device_id during society save
             wing_names = data.get("wing_names", {})
+            wing_disabled = data.get("wing_disabled", {})
             device_id = data.get("device_id")
             
             if sid:
                 # UPDATE EXISTING SOCIETY
-                cur.execute("""UPDATE societies SET name=%s, location=%s, plan=%s, status=%s, 
-                               tailscale_ip=%s, pi_port=%s, society_code=%s, config_version=config_version+1 WHERE id=%s""",
-                            (society["name"], society["location"], society["plan"], society["status"],
-                             society["tailscale_ip"], society["pi_port"], society["society_code"], sid))
+                cur.execute("""UPDATE societies SET name=%s, location=%s, config_version=config_version+1 WHERE id=%s""",
+                            (society["name"], society["location"], sid))
                 new_sid = int(sid)
             else:
                 # CREATE NEW SOCIETY
@@ -553,13 +558,17 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 new_sid = cur.fetchone()["id"]
                 log_audit(cur, user, new_sid, "CREATE_SOCIETY", society)
                 
-            # UPSERT WING CONFIGURATIONS (Insert or Update names)
+            # UPSERT WING CONFIGURATIONS (Insert or Update names for all 8 wings)
             for wid in WING_ORDER:
                 w_name = wing_names.get(wid, f"Wing {wid}")
+                is_disabled = bool(wing_disabled.get(wid, True))
+                if wid in ["A", "B", "G"] and wid not in wing_disabled:
+                    is_disabled = False # Backward compat: enable A,B,G by default if not specified
+                    
                 cur.execute("""INSERT INTO wing_configs (society_id, wing_id, name, display_name, target_days, disabled) 
-                               VALUES (%s, %s, %s, %s, 10, false) 
-                               ON CONFLICT (society_id, wing_id) DO UPDATE SET name=EXCLUDED.name, display_name=EXCLUDED.name""",
-                            (new_sid, wid, w_name, w_name))
+                               VALUES (%s, %s, %s, %s, 10, %s) 
+                               ON CONFLICT (society_id, wing_id) DO UPDATE SET name=EXCLUDED.name, display_name=EXCLUDED.name, disabled=EXCLUDED.disabled""",
+                            (new_sid, wid, w_name, w_name, is_disabled))
                             
             # LINK DEVICE (if provided)
             if device_id:
@@ -857,6 +866,7 @@ def pi_sync(request: Request, payload: dict):
             
             cur.execute("SELECT wing_id, target_days, disabled FROM wing_configs WHERE society_id = %s", (society_id,))
             configs = cur.fetchall()
+            # PRODUCTION FIX: Return disabled state to Pi for all 8 wings
             wing_configs = {c["wing_id"]: {"target_days": c["target_days"], "disabled": c["disabled"]} for c in configs}
 
             cur.execute("""INSERT INTO pi_state (device_id, active_wing, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason, config_version) 

@@ -6,20 +6,21 @@ class Config:
         with open(path) as f:
             data = json.load(f)
             
-        self.deviceId = data.get("deviceId", os.environ.get("PI_DEVICE_ID"))
-        self.apiKey = data.get("apiKey", os.environ.get("PI_API_KEY"))
-        self.backendUrl = data.get("backendUrl", os.environ.get("BACKEND_URL", "https://ems-saass.onrender.com")).rstrip("/")
-        self.firmwareVersion = data.get("firmwareVersion", "5.3.1-sim")
+        self.deviceId = data["deviceId"]
+        self.apiKey = data["apiKey"]
+        self.backendUrl = data["backendUrl"].rstrip("/")
+        self.firmwareVersion = data.get("firmwareVersion", "unknown")
         self.syncIntervalSec = int(data.get("syncIntervalSec", 60))
         self.pendingCommandIntervalSec = int(data.get("pendingCommandIntervalSec", 5))
         self.statePersistIntervalSec = int(data.get("statePersistIntervalSec", 300))
         self.resetDayDefault = int(data.get("resetDayDefault", 15))
         self.timezone = data.get("timezone", "Asia/Kolkata")
         self.serviceName = data.get("serviceName", "ems-controller.service")
-        self.stateFile = data.get("stateFile", f"/tmp/ems_state_{self.deviceId}.json")
-        self.offlineDbPath = data.get("offlineDbPath", f"/tmp/ems_queue_{self.deviceId}.db")
+        self.stateFile = data.get("stateFile", "/var/lib/ems/state.json")
+        self.offlineDbPath = data.get("offlineDbPath", "/var/lib/ems/offline.db")
         
-        # Hardware mapping (centralized)
+        # PRODUCTION FIX: 8-Wing Hardware Profile
+        # A, B, G are enabled and mapped to old wiring. C-H are unmapped.
         self.wings = {
             "A": {"relay": 17, "toggle": 5},
             "B": {"relay": 27, "toggle": 6},

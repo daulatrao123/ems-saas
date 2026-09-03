@@ -19,7 +19,7 @@ export default function SuperAdminDashboard() {
   const [showKeyModal, setShowKeyModal] = useState(false);
   
   const [editSoc, setEditSoc] = useState<any>(null);
-  const [socForm, setSocForm] = useState({ name: "", location: "", plan: "Basic", tailscale_ip: "", pi_port: "5000", society_code: "", device_id: "", wingA: "Wing A", wingB: "Wing B", wingG: "Wing G" });
+  const [socForm, setSocForm] = useState({ name: "", location: "", device_id: "", wings: {} as Record<string, { name: string; disabled: boolean }> });
   const [userForm, setUserForm] = useState({ email: "", name: "", password: "", role: "society_admin", society_id: "" });
   
   const [editDeviceId, setEditDeviceId] = useState<string | null>(null);
@@ -27,6 +27,8 @@ export default function SuperAdminDashboard() {
   const [newDeviceCreds, setNewDeviceCreds] = useState({ id: "", key: "" });
 
   const [toast, setToast] = useState<any>(null);
+
+  const WING_CODES = ["A", "B", "C", "D", "E", "F", "G", "H"];
 
   useEffect(() => { if (localStorage.getItem("role") !== "super_admin") router.push("/login"); }, [router]);
 
@@ -51,34 +53,44 @@ export default function SuperAdminDashboard() {
   const showToast = (msg: string, ok: boolean) => { setToast({ msg, ok }); setTimeout(() => setToast(null), 3000); };
   const copyText = (t: string) => { navigator.clipboard.writeText(t); showToast("Copied!", true); };
 
-  // --- Society Actions ---
+  const initWings = () => {
+    const wings: Record<string, { name: string; disabled: boolean }> = {};
+    WING_CODES.forEach(code => {
+      wings[code] = { name: `Wing ${code}`, disabled: !["A", "B", "G"].includes(code) };
+    });
+    return wings;
+  };
+
   const saveSoc = async () => {
     try {
-      // Format wing names for backend
-      const payload = {
-        ...socForm,
-        wing_names: { A: socForm.wingA, B: socForm.wingB, G: socForm.wingG }
-      };
+      const wing_names: Record<string, string> = {};
+      const wing_disabled: Record<string, boolean> = {};
+      Object.entries(socForm.wings).forEach(([code, data]) => {
+        wing_names[code] = data.name;
+        wing_disabled[code] = data.disabled;
+      });
+
+      const payload = { ...socForm, wing_names, wing_disabled };
       await api.post("/api/super-admin/societies/save", editSoc ? { id: editSoc.id, ...payload } : payload);
       setShowSocModal(false); setEditSoc(null);
-      setSocForm({ name: "", location: "", plan: "Basic", tailscale_ip: "", pi_port: "5000", society_code: "", device_id: "", wingA: "Wing A", wingB: "Wing B", wingG: "Wing G" });
+      setSocForm({ name: "", location: "", device_id: "", wings: initWings() });
       fetchData(); showToast("Society saved", true);
     } catch { showToast("Failed", false); }
   };
+  
   const deleteSoc = async (id: string) => { if (!confirm("Delete this society?")) return; try { await api.post("/api/super-admin/societies/delete", { id }); fetchData(); showToast("Deleted", true); } catch { showToast("Failed", false); } };
   const openEditSoc = (s: any) => { 
+    const currentWings = initWings();
+    if (s.wings) {
+      Object.keys(s.wings).forEach(code => {
+        currentWings[code] = { name: s.wings[code].name, disabled: s.wings[code].disabled };
+      });
+    }
     setEditSoc(s); 
-    setSocForm({ 
-      name: s.name, location: s.location, plan: s.plan, tailscale_ip: s.tailscale_ip || "", pi_port: String(s.pi_port || 5000), society_code: s.society_code || "", 
-      device_id: s.device_id || "", 
-      wingA: s.wings?.A?.name || "Wing A", 
-      wingB: s.wings?.B?.name || "Wing B", 
-      wingG: s.wings?.G?.name || "Wing G" 
-    }); 
+    setSocForm({ name: s.name, location: s.location, device_id: s.device_id || "", wings: currentWings }); 
     setShowSocModal(true); 
   };
 
-  // --- User Actions ---
   const saveUser = async () => {
     try {
       await api.post("/api/super-admin/users/save", userForm);
@@ -88,18 +100,15 @@ export default function SuperAdminDashboard() {
   };
   const deleteUser = async (id: string) => { if (!confirm("Delete?")) return; try { await api.post("/api/super-admin/users/delete", { id }); fetchData(); showToast("Deleted", true); } catch { showToast("Failed", false); } };
 
-  // --- Device Actions ---
   const saveDevice = async () => {
     try {
       const payload = { ...deviceForm, id: editDeviceId };
       const res = await api.post("/api/super-admin/devices/save", payload);
       setShowDeviceModal(false);
-      
       if (!editDeviceId && res.data.api_key) {
         setNewDeviceCreds({ id: res.data.device_id, key: res.data.api_key });
         setShowKeyModal(true);
       }
-      
       setEditDeviceId(null);
       setDeviceForm({ name: "", society_id: "" });
       fetchData(); showToast("Pi Device Saved", true);
@@ -123,7 +132,6 @@ export default function SuperAdminDashboard() {
     { key: "firmware", label: "Firmware", count: fwVersions.length }
   ];
 
-  // Filter devices for the dropdown (show unassigned + the one currently assigned to the editing society)
   const availableDevices = devices.filter(d => !d.society_id || (editSoc && d.society_id === editSoc.id));
 
   return (
@@ -135,7 +143,7 @@ export default function SuperAdminDashboard() {
             <h1 className="text-2xl font-bold text-white">Super Admin</h1>
             <p className="text-xs text-gray-500">{societies.length} societies, {users.length} users, {devices.length} pi devices</p>
           </div>
-          {tab === "societies" && <button onClick={() => { setEditSoc(null); setSocForm({ name: "", location: "", plan: "Basic", tailscale_ip: "", pi_port: "5000", society_code: "", device_id: "", wingA: "Wing A", wingB: "Wing B", wingG: "Wing G" }); setShowSocModal(true); }} className="px-4 py-2 bg-cyan-500 text-black text-xs font-bold rounded-lg hover:bg-cyan-600">+ Add Society</button>}
+          {tab === "societies" && <button onClick={() => { setEditSoc(null); setSocForm({ name: "", location: "", device_id: "", wings: initWings() }); setShowSocModal(true); }} className="px-4 py-2 bg-cyan-500 text-black text-xs font-bold rounded-lg hover:bg-cyan-600">+ Add Society</button>}
           {tab === "users" && <button onClick={() => { setUserForm({ email: "", name: "", password: "", role: "society_admin", society_id: societies[0]?.id || "" }); setShowUserModal(true); }} className="px-4 py-2 bg-emerald-500 text-black text-xs font-bold rounded-lg hover:bg-emerald-600">+ Add User</button>}
           {tab === "devices" && <button onClick={() => { setEditDeviceId(null); setDeviceForm({ name: "", society_id: "" }); setShowDeviceModal(true); }} className="px-4 py-2 bg-emerald-500 text-black text-xs font-bold rounded-lg hover:bg-emerald-600">+ Add Pi Device</button>}
         </div>
@@ -152,14 +160,12 @@ export default function SuperAdminDashboard() {
         {tab === "societies" && (
           <div className="bg-gray-900/80 border border-gray-800 rounded-xl overflow-hidden">
             <table className="w-full text-xs">
-              <thead><tr className="text-gray-500 border-b border-gray-800"><th className="text-left px-4 py-2">Name</th><th className="text-left px-4 py-2">Location</th><th className="text-left px-4 py-2">Plan</th><th className="text-left px-4 py-2">Code</th><th className="text-left px-4 py-2">Pi</th><th className="text-left px-4 py-2">FW</th><th className="text-left px-4 py-2">Wing</th><th className="text-right px-4 py-2">Actions</th></tr></thead>
+              <thead><tr className="text-gray-500 border-b border-gray-800"><th className="text-left px-4 py-2">Name</th><th className="text-left px-4 py-2">Location</th><th className="text-left px-4 py-2">Pi</th><th className="text-left px-4 py-2">FW</th><th className="text-left px-4 py-2">Wing</th><th className="text-right px-4 py-2">Actions</th></tr></thead>
               <tbody>
                 {societies.map((s) => (
                   <tr key={s.id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
                     <td className="px-4 py-3 text-gray-200 font-semibold">{s.name}</td>
                     <td className="px-4 py-3 text-gray-400">{s.location}</td>
-                    <td className="px-4 py-3"><span className={`px-2 py-0.5 rounded-full text-[9px] font-bold ${s.plan === "Professional" ? "bg-cyan-500/15 text-cyan-400" : "bg-gray-700 text-gray-400"}`}>{s.plan}</span></td>
-                    <td className="px-4 py-3 text-gray-500 font-mono">{s.society_code || "--"}</td>
                     <td className="px-4 py-3"><span className={`flex items-center gap-1 ${s.pi_online ? "text-emerald-400" : "text-red-400"}`}><span className={`w-1.5 h-1.5 rounded-full ${s.pi_online ? "bg-emerald-400" : "bg-red-400"}`} />{s.pi_online ? "Online" : "Offline"}</span></td>
                     <td className="px-4 py-3 text-gray-500 font-mono text-[10px]">{s.firmware_version || "--"}</td>
                     <td className="px-4 py-3 text-cyan-400 font-mono">{s.active_wing || "--"}</td>
@@ -227,18 +233,9 @@ export default function SuperAdminDashboard() {
             <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
               <h3 className="text-sm font-bold text-white mb-4">{editSoc ? "Edit Society" : "Add Society"}</h3>
               <div className="space-y-3">
-                <input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Name" value={socForm.name} onChange={(e) => setSocForm({ ...socForm, name: e.target.value })} />
+                <input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Society Name" value={socForm.name} onChange={(e) => setSocForm({ ...socForm, name: e.target.value })} />
                 <input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Location" value={socForm.location} onChange={(e) => setSocForm({ ...socForm, location: e.target.value })} />
-                <select className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" value={socForm.society_code} onChange={(e) => setSocForm({ ...socForm, society_code: e.target.value })}>
-                  <option value="">Select Society Code</option>
-                  <option value="prestine">prestine</option>
-                  <option value="green_heights">green_heights</option>
-                  <option value="sunshine">sunshine</option>
-                  <option value="sai_residency">sai_residency</option>
-                </select>
-                <input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Tailscale IP" value={socForm.tailscale_ip} onChange={(e) => setSocForm({ ...socForm, tailscale_ip: e.target.value })} />
                 
-                {/* PRODUCTION FIX: Assign Device Dropdown */}
                 <div>
                   <label className="text-[9px] text-gray-500 uppercase">Assign Pi Device</label>
                   <select className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" value={socForm.device_id} onChange={(e) => setSocForm({ ...socForm, device_id: e.target.value })}>
@@ -247,13 +244,26 @@ export default function SuperAdminDashboard() {
                   </select>
                 </div>
 
-                {/* PRODUCTION FIX: Wing Name Inputs */}
                 <div className="pt-2 border-t border-gray-800 mt-2">
-                  <label className="text-[9px] text-gray-500 uppercase block mb-2">Wing Names</label>
-                  <div className="grid grid-cols-3 gap-2">
-                    <input className="px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Wing A Name" value={socForm.wingA} onChange={(e) => setSocForm({ ...socForm, wingA: e.target.value })} />
-                    <input className="px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Wing B Name" value={socForm.wingB} onChange={(e) => setSocForm({ ...socForm, wingB: e.target.value })} />
-                    <input className="px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Wing G Name" value={socForm.wingG} onChange={(e) => setSocForm({ ...socForm, wingG: e.target.value })} />
+                  <label className="text-[9px] text-gray-500 uppercase block mb-2">Wing Configuration (A-H)</label>
+                  <div className="space-y-2">
+                    {WING_CODES.map(code => (
+                      <div key={code} className="flex items-center gap-2">
+                        <span className="text-gray-500 font-mono text-[10px] w-4">{code}</span>
+                        <input 
+                          className="flex-1 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" 
+                          placeholder={`Wing ${code} Name`} 
+                          value={socForm.wings[code]?.name || ""} 
+                          onChange={(e) => setSocForm({ ...socForm, wings: { ...socForm.wings, [code]: { ...socForm.wings[code], name: e.target.value } }})} 
+                        />
+                        <button 
+                          className={`px-2 py-1 text-[9px] font-bold rounded ${socForm.wings[code]?.disabled ? 'bg-gray-700 text-gray-400' : 'bg-emerald-500/15 text-emerald-400'}`}
+                          onClick={() => setSocForm({ ...socForm, wings: { ...socForm.wings, [code]: { ...socForm.wings[code], disabled: !socForm.wings[code]?.disabled } }})}
+                        >
+                          {socForm.wings[code]?.disabled ? "OFF" : "ON"}
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 </div>
 
