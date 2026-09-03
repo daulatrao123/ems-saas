@@ -533,27 +533,39 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 "society_code": data.get("society_code", ""),
             }
             
+            # PRODUCTION FIX: Accept wing names and device_id during society save
+            wing_names = data.get("wing_names", {})
+            device_id = data.get("device_id")
+            
             if sid:
+                # UPDATE EXISTING SOCIETY
                 cur.execute("""UPDATE societies SET name=%s, location=%s, plan=%s, status=%s, 
                                tailscale_ip=%s, pi_port=%s, society_code=%s, config_version=config_version+1 WHERE id=%s""",
                             (society["name"], society["location"], society["plan"], society["status"],
                              society["tailscale_ip"], society["pi_port"], society["society_code"], sid))
+                new_sid = int(sid)
             else:
+                # CREATE NEW SOCIETY
                 cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code, config_version) 
                                VALUES (%s, %s, %s, %s, %s, %s, %s, 1) RETURNING id""",
                             (society["name"], society["location"], society["plan"], society["status"],
                              society["tailscale_ip"], society["pi_port"], society["society_code"]))
-                
-                # PRODUCTION FIX: fetchone() returns a dict when using dict_row, so we access by key "id"
                 new_sid = cur.fetchone()["id"]
-                
-                # AUTO-PROVISION: Create default wing configs for the new society
-                for wid in WING_ORDER:
-                    cur.execute("""INSERT INTO wing_configs (society_id, wing_id, name, display_name, target_days, disabled) 
-                                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                                (new_sid, wid, f"Wing {wid}", f"Wing {wid}", 10, False))
-                
                 log_audit(cur, user, new_sid, "CREATE_SOCIETY", society)
+                
+            # UPSERT WING CONFIGURATIONS (Insert or Update names)
+            for wid in WING_ORDER:
+                w_name = wing_names.get(wid, f"Wing {wid}")
+                cur.execute("""INSERT INTO wing_configs (society_id, wing_id, name, display_name, target_days, disabled) 
+                               VALUES (%s, %s, %s, %s, 10, false) 
+                               ON CONFLICT (society_id, wing_id) DO UPDATE SET name=EXCLUDED.name, display_name=EXCLUDED.name""",
+                            (new_sid, wid, w_name, w_name))
+                            
+            # LINK DEVICE (if provided)
+            if device_id:
+                cur.execute("UPDATE pi_devices SET society_id=%s, status='ASSIGNED' WHERE id=%s", (new_sid, device_id))
+                log_audit(cur, user, new_sid, "ASSIGN_DEVICE", {"device_id": device_id})
+                
         conn.commit()
     except Exception as e:
         conn.rollback()
