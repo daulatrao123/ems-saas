@@ -1,7 +1,8 @@
 """
-EMS SaaS Backend v5.3.2 — Industrial Production (Schema Auto-Fix & Device Provisioning)
+EMS SaaS Backend v5.4.0 — Industrial Production (Inventory & Link Lifecycle)
 ====================================
 - Auto-applies ALTER TABLE IF NOT EXISTS for config_version to prevent 500 errors.
+- Implements Pi Inventory Lifecycle (society_id nullable, INVENTORY/ASSIGNED status).
 - Strict cursor-based event pagination (last_id).
 - Transactional command ACK and configuration application.
 - Super Admin Device Auto-Provisioning (Editable Keys).
@@ -45,7 +46,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="5.3.2-prod")
+app = FastAPI(title="EMS SaaS API", version="5.4.0-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -96,7 +97,7 @@ def ensure_db_schema():
                     api_key_hash TEXT UNIQUE,
                     firmware_version TEXT,
                     last_seen TIMESTAMPTZ,
-                    status TEXT DEFAULT 'active'
+                    status TEXT DEFAULT 'INVENTORY'
                 );
             """)
             cur.execute("""
@@ -163,6 +164,10 @@ def ensure_db_schema():
             cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
             cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
             
+            # PRODUCTION FIX: Make society_id nullable for Inventory lifecycle
+            cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
+            
             # Add Foreign Keys & Cascades safely
             cur.execute("""
                 DO $$ BEGIN
@@ -170,7 +175,7 @@ def ensure_db_schema():
                         ALTER TABLE users ADD CONSTRAINT fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
                     END IF;
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_devices_society') THEN
-                        ALTER TABLE pi_devices ADD CONSTRAINT fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE CASCADE;
+                        ALTER TABLE pi_devices ADD CONSTRAINT fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
                     END IF;
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_wing_configs_society') THEN
                         ALTER TABLE wing_configs ADD CONSTRAINT fk_wing_configs_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE CASCADE;
@@ -191,7 +196,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v5.3.2 Hardened)")
+        print("DB schema verified OK (Relational v5.4.0 Hardened)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -205,7 +210,7 @@ def hash_api_key(key: str) -> str:
 def log_audit(cur, user: dict, society_id: int, action: str, details: dict):
     cur.execute("""INSERT INTO audit_log (society_id, user_id, action, details, created_at) 
                    VALUES (%s, %s, %s, %s, %s)""",
-                (society_id, user.get("id"), action, psycopg.types.json.Json(details), datetime.now(timezone.utc)))
+                (society_id if society_id else 0, user.get("id"), action, psycopg.types.json.Json(details), datetime.now(timezone.utc)))
 
 # ================================================================
 # EXCEPTION HANDLERS & CORS
@@ -334,9 +339,12 @@ def authenticate_pi(payload: dict) -> tuple:
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT id, society_id FROM pi_devices WHERE id = %s AND api_key_hash = %s", (device_id, hash_api_key(supplied_key)))
+            cur.execute("SELECT id, society_id, status FROM pi_devices WHERE id = %s AND api_key_hash = %s", (device_id, hash_api_key(supplied_key)))
             dev = cur.fetchone()
             if not dev: raise HTTPException(403, "Invalid Pi API key or Device ID.")
+            # PRODUCTION FIX: Reject syncs from unassigned inventory devices
+            if not dev["society_id"] or dev["status"] != "ASSIGNED":
+                raise HTTPException(403, "Device is in inventory and not assigned to a society.")
             return dev["id"], dev["society_id"]
     finally:
         conn.close()
@@ -397,7 +405,7 @@ def bootstrap(request: Request):
             device_id = str(uuid.uuid4())
             raw_api_key = str(uuid.uuid4())
             cur.execute("INSERT INTO pi_devices (id, society_id, name, api_key_hash, status) VALUES (%s, %s, %s, %s, %s)",
-                        (device_id, sid, "Main Controller", hash_api_key(raw_api_key), "active"))
+                        (device_id, sid, "Main Controller", hash_api_key(raw_api_key), "ASSIGNED"))
                         
             cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
                         ("admin@ems.com", "Super Admin", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "super_admin", None))
@@ -466,6 +474,17 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
                 sid = s["id"]
                 cur.execute("SELECT * FROM pi_devices WHERE society_id = %s", (sid,))
                 dev = cur.fetchone()
+                
+                # PRODUCTION FIX: Handle societies with no Pi assigned yet
+                if not dev:
+                    result.append({
+                        "id": s["id"], "name": s["name"], "location": s["location"],
+                        "plan": s["plan"], "status": s.get("status", "active"),
+                        "society_code": s.get("society_code", ""),
+                        "pi_online": False, "last_sync": None, "active_wing": None,
+                        "firmware_version": None, "reset_day": DEFAULT_RESET_DAY, "wings": {}
+                    })
+                    continue
                 
                 cur.execute("SELECT * FROM pi_state WHERE device_id = %s", (dev["id"],))
                 pi = cur.fetchone()
@@ -558,7 +577,7 @@ def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))
     return {"message": "Deleted"}
 
 # ================================================================
-# SUPER-ADMIN — DEVICES (Auto-Provisioning & Editable Keys)
+# SUPER-ADMIN — DEVICES (Inventory Lifecycle & Editable Keys)
 # ================================================================
 
 @app.get("/api/super-admin/devices")
@@ -585,20 +604,28 @@ def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            society_id = int(data.get("society_id"))
-            name = data.get("name", "Pi Device")
+            society_id_raw = data.get("society_id")
+            # PRODUCTION FIX: Handle Inventory vs Assigned lifecycle
+            if society_id_raw and society_id_raw != "":
+                society_id = int(society_id_raw)
+                status = "ASSIGNED"
+            else:
+                society_id = None
+                status = "INVENTORY"
+                
+            name = data.get("name", "New Pi Device")
             device_id = data.get("id")
             
             if device_id:
                 # EDIT EXISTING DEVICE
                 if data.get("api_key"):
                     api_key_hash = hash_api_key(data["api_key"])
-                    cur.execute("UPDATE pi_devices SET name=%s, society_id=%s, api_key_hash=%s WHERE id=%s",
-                                (name, society_id, api_key_hash, device_id))
+                    cur.execute("UPDATE pi_devices SET name=%s, society_id=%s, status=%s, api_key_hash=%s WHERE id=%s",
+                                (name, society_id, status, api_key_hash, device_id))
                 else:
-                    cur.execute("UPDATE pi_devices SET name=%s, society_id=%s WHERE id=%s",
-                                (name, society_id, device_id))
-                log_audit(cur, user, society_id, "UPDATE_DEVICE", {"device_id": device_id, "name": name})
+                    cur.execute("UPDATE pi_devices SET name=%s, society_id=%s, status=%s WHERE id=%s",
+                                (name, society_id, status, device_id))
+                log_audit(cur, user, society_id if society_id else 0, "UPDATE_DEVICE", {"device_id": device_id, "name": name})
                 conn.commit()
                 return {"message": "Device updated"}
             else:
@@ -608,9 +635,9 @@ def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
                 api_key_hash = hash_api_key(raw_api_key)
                 
                 cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status) 
-                               VALUES (%s, %s, %s, %s, 'active')""",
-                            (device_id, society_id, name, api_key_hash))
-                log_audit(cur, user, society_id, "CREATE_DEVICE", {"device_id": device_id, "name": name})
+                               VALUES (%s, %s, %s, %s, %s)""",
+                            (device_id, society_id, name, api_key_hash, status))
+                log_audit(cur, user, society_id if society_id else 0, "CREATE_DEVICE", {"device_id": device_id, "name": name})
                 conn.commit()
                 return {"message": "Device created", "device_id": device_id, "api_key": raw_api_key}
     except Exception as e:
@@ -618,9 +645,6 @@ def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
         raise e
     finally:
         conn.close()
-        
-    # Return the raw API key ONCE so the admin can give it to the Pi
-    return {"message": "Device created", "device_id": device_id, "api_key": raw_api_key}
 
 @app.post("/api/super-admin/devices/delete")
 def delete_device(data: dict, user: dict = Depends(require_role("super_admin"))):
