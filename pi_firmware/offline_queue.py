@@ -12,8 +12,13 @@ class OfflineQueue:
             conn.execute("""CREATE TABLE IF NOT EXISTS pending_acks (
                 command_id TEXT PRIMARY KEY, success INTEGER, result TEXT, error TEXT
             )""")
+            # PRODUCTION FIX: Added status and timestamps for state machine
             conn.execute("""CREATE TABLE IF NOT EXISTS executed_commands (
-                command_id TEXT PRIMARY KEY, status TEXT, result TEXT, executed_at INTEGER
+                command_id TEXT PRIMARY KEY, 
+                status TEXT DEFAULT 'STARTED', 
+                result TEXT, 
+                started_at INTEGER,
+                completed_at INTEGER
             )""")
             conn.execute("""CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE, payload TEXT, created_at INTEGER
@@ -44,13 +49,23 @@ class OfflineQueue:
 
     def log_command_start(self, cid):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO executed_commands (command_id, status, result, executed_at) VALUES (?, 'STARTED', NULL, ?)",
+            conn.execute("""INSERT OR REPLACE INTO executed_commands 
+                             (command_id, status, result, started_at, completed_at) 
+                             VALUES (?, 'STARTED', NULL, ?, NULL)""",
                          (cid, int(time.time())))
 
-    def update_command_status(self, cid, status, result):
+    def update_command_status(self, cid, status, result=None):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("UPDATE executed_commands SET status=?, result=? WHERE command_id=?",
-                         (status, result, cid))
+            conn.execute("""UPDATE executed_commands 
+                            SET status=?, result=?, completed_at=? 
+                            WHERE command_id=?""",
+                         (status, result, int(time.time()), cid))
+
+    def get_interrupted_commands(self):
+        """Finds commands that were STARTED but never completed (crash recovery)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT command_id FROM executed_commands WHERE status = 'STARTED'")
+            return [row[0] for row in cur.fetchall()]
 
     def push_event(self, event_id, payload):
         with sqlite3.connect(self.db_path) as conn:
