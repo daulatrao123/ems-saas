@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import api from "@/lib/api"; // Adjust import path as needed
+import api from "@/lib/api";
 
 export default function MemberDashboard() {
   const [piState, setPiState] = useState<any>(null);
@@ -25,14 +25,13 @@ export default function MemberDashboard() {
       const res = await api.get(`/api/member/events?last_id=${lastEventId}`);
       if (res.data.events.length > 0) {
         setEvents((prev) => {
-          const newEvents = res.data.events.filter((ne: any) => !prev.some((e: any) => e.id === ne.id));
+          const existingIds = new Set(prev.map((e: any) => e.id));
+          const newEvents = res.data.events.filter((ne: any) => !existingIds.has(ne.id));
           return [...prev, ...newEvents].slice(-50);
         });
         setLastEventId(res.data.last_id);
       }
-    } catch (error) {
-      console.error("Failed to fetch events", error);
-    }
+    } catch (error) { console.error("Failed to fetch events", error); }
   }, [lastEventId]);
 
   useEffect(() => {

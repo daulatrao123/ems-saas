@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import requests, time, uuid, os
 
-BACKEND_URL = os.getenv("BACKEND_URL", "https://ems-saass.onrender.com")
-DEVICE_ID = os.getenv("PI_DEVICE_ID", "d9e8206b-a9f3-4294-91f8-df66d65bf417")
-API_KEY = os.getenv("PI_API_KEY", "b68c8b3b-3633-4c77-a36e-478bff1e7430")
+BACKEND_URL = os.environ.get("BACKEND_URL")
+DEVICE_ID = os.environ.get("PI_DEVICE_ID")
+API_KEY = os.environ.get("PI_API_KEY")
+
+if not all([BACKEND_URL, DEVICE_ID, API_KEY]):
+    print("❌ ERROR: BACKEND_URL, PI_DEVICE_ID, and PI_API_KEY environment variables are required.")
+    exit(1)
 
 def simulate_pi():
     print(f"Starting Pi Simulator for Device {DEVICE_ID}...")
@@ -12,7 +16,7 @@ def simulate_pi():
     pi_state = {
         "deviceId": DEVICE_ID,
         "key": API_KEY,
-        "firmwareVersion": "5.2.0-SIMULATOR",
+        "firmwareVersion": "5.3.1-SIMULATOR",
         "activeWing": "A",
         "resetDay": 15,
         "emergencyStop": False,
@@ -61,27 +65,57 @@ def simulate_pi():
             if cmd and cmd_id:
                 print(f"📦 Received Command: {cmd} (ID: {cmd_id})")
                 event_msg = ""
+                success = True
+                error_msg = None
                 
                 if cmd == "set_active_wing":
                     wing = data.get("wing")
-                    print(f"⚡ Executing: Activating Wing {wing}")
-                    pi_state["activeWing"] = wing
-                    event_msg = f"Command: Activated Wing {wing}"
+                    if wing in pi_state["wings"]:
+                        pi_state["activeWing"] = wing
+                        event_msg = f"Command: Activated Wing {wing}"
+                    else:
+                        success = False
+                        error_msg = f"Invalid wing: {wing}"
                 elif cmd == "off_all":
-                    print("⚡ Executing: Turning off all wings")
                     pi_state["activeWing"] = None
                     event_msg = "Command: All wings turned OFF"
                 elif cmd == "reset_days":
-                    print("⚡ Executing: Resetting days")
                     for w in pi_state["wings"]: pi_state["wings"][w]["usedDays"] = 0
                     event_msg = "System: Monthly reset executed"
                 elif cmd == "set_days":
                     wing = data.get("wing")
                     days = data.get("params", {}).get("days")
-                    print(f"⚡ Executing: Setting Wing {wing} target to {days} days")
-                    event_msg = f"Command: Set Wing {wing} target to {days} days"
+                    if wing in pi_state["wings"] and days is not None:
+                        pi_state["wings"][wing]["targetDays"] = int(days)
+                        event_msg = f"Command: Set Wing {wing} target to {days} days"
+                    else:
+                        success = False
+                        error_msg = "Invalid wing or days parameter"
+                elif cmd == "set_reset_day":
+                    day = data.get("params", {}).get("day")
+                    if day:
+                        pi_state["resetDay"] = int(day)
+                        event_msg = f"Command: Set reset day to {day}"
+                    else:
+                        success = False
+                        error_msg = "Missing day parameter"
+                elif cmd == "off_wing":
+                    wing = data.get("wing")
+                    if wing in pi_state["wings"] and pi_state["activeWing"] == wing:
+                        pi_state["activeWing"] = None
+                        event_msg = f"Command: Turned OFF Wing {wing}"
+                    else:
+                        event_msg = f"Command: Wing {wing} already OFF"
+                elif cmd == "lcd_display":
+                    l1 = data.get("params", {}).get("line1", "")
+                    l2 = data.get("params", {}).get("line2", "")
+                    event_msg = f"Command: LCD displayed '{l1} | {l2}'"
+                elif cmd in ["restart", "reboot"]:
+                    event_msg = f"Command: {cmd} initiated (simulated)"
+                else:
+                    success = False
+                    error_msg = f"Unsupported command: {cmd}"
                     
-                # Generate a new event for the executed command
                 if event_msg:
                     pi_state["events"].append({
                         "eventId": str(uuid.uuid4()),
@@ -94,13 +128,13 @@ def simulate_pi():
                     "deviceId": DEVICE_ID,
                     "key": API_KEY,
                     "command_id": cmd_id,
-                    "success": True,
-                    "error": None,
-                    "result": f"Executed {cmd}"
+                    "success": success,
+                    "error": error_msg,
+                    "result": "Executed" if success else "Failed"
                 }
                 ack_res = session.post(f"{BACKEND_URL}/api/pi/command-ack", json=ack_payload, timeout=10)
                 if ack_res.status_code == 200:
-                    print("✅ ACK Sent Successfully.")
+                    print(f"{'✅ ACK Sent Successfully.' if success else '❌ ACK Sent (Failed).'}")
                 else:
                     print(f"❌ ACK Failed: {ack_res.status_code} - {ack_res.text}")
             else:

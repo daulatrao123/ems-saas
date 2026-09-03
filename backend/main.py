@@ -1,10 +1,9 @@
 """
-EMS SaaS Backend v5.3.0 — Industrial Production (Coordinated Release)
+EMS SaaS Backend v5.3.1 — Industrial Production (Schema Auto-Fix)
 ====================================
-- Implements Protocol v1 (configVersion, explicit wing_configs).
-- Cloud is strict authority for target_days.
+- Auto-applies ALTER TABLE IF NOT EXISTS for config_version to prevent 500 errors.
+- Strict cursor-based event pagination (last_id).
 - Transactional command ACK and configuration application.
-- Explicit DB transactions, rate limiting, and audit logging.
 """
 
 import os
@@ -45,7 +44,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="5.3.0-prod")
+app = FastAPI(title="EMS SaaS API", version="5.3.1-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -159,6 +158,10 @@ def ensure_db_schema():
                 );
             """)
             
+            # PRODUCTION FIX: Auto-add missing columns to existing tables
+            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
+            cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
+            
             # Add Foreign Keys & Cascades safely
             cur.execute("""
                 DO $$ BEGIN
@@ -187,7 +190,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v5.3.0 Hardened)")
+        print("DB schema verified OK (Relational v5.3.1 Hardened)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
