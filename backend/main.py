@@ -543,7 +543,9 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                                VALUES (%s, %s, %s, %s, %s, %s, %s, 1) RETURNING id""",
                             (society["name"], society["location"], society["plan"], society["status"],
                              society["tailscale_ip"], society["pi_port"], society["society_code"]))
-                new_sid = cur.fetchone()[0]
+                
+                # PRODUCTION FIX: fetchone() returns a dict when using dict_row, so we access by key "id"
+                new_sid = cur.fetchone()["id"]
                 
                 # AUTO-PROVISION: Create default wing configs for the new society
                 for wid in WING_ORDER:
