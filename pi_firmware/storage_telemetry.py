@@ -1,28 +1,25 @@
-import time
 import os
+import json
 import subprocess
-import csv
 from datetime import datetime
-from config import TELEMETRY_DIR
+from config import DATA_DIR, TELEMETRY_DIR
 from logger import logger
 
 class StorageTelemetry:
-    def __init__(self, mount_point="/"):
-        self.device_name = self._get_device_name(mount_point)
+    def __init__(self):
+        self.device_name = self._get_device_name(DATA_DIR)
         if not self.device_name:
-            logger.error("Telemetry: Could not find block device.")
+            logger.error("Telemetry: Could not find block device for /mnt/ems-data.")
             return
         
-        self.current_day = datetime.utcnow().strftime("%Y-%m-%d")
-        self.daily_file = os.path.join(TELEMETRY_DIR, f"telemetry_{self.current_day}.csv")
+        self.cumulative_file = os.path.join(TELEMETRY_DIR, "cumulative_telemetry.json")
+        self.state = self._load_cumulative_state()
         
-        # Track sectors written at the start of the day
-        self.start_sectors = self._read_diskstats()
-        
-        if not os.path.exists(self.daily_file):
-            with open(self.daily_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['timestamp', 'device', 'sectors_written_delta', 'mb_written'])
+        # Update start sectors for this session
+        current_sectors = self._read_diskstats()
+        if current_sectors is not None:
+            self.state["session_start_sectors"] = current_sectors
+            self._save_cumulative_state()
 
     def _get_device_name(self, mount_point):
         try:
@@ -48,23 +45,51 @@ class StorageTelemetry:
         except Exception:
             return None
 
+    def _load_cumulative_state(self):
+        if os.path.exists(self.cumulative_file):
+            try:
+                with open(self.cumulative_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {
+            "device": self.device_name,
+            "lifetime_sectors_written": 0,
+            "session_start_sectors": 0
+        }
+
+    def _save_cumulative_state(self):
+        try:
+            tmp = self.cumulative_file + ".tmp"
+            with open(tmp, 'w') as f:
+                json.dump(self.state, f, indent=4)
+            os.replace(tmp, self.cumulative_file)
+        except Exception as e:
+            logger.error(f"Failed to save telemetry state: {e}")
+
     def log_daily_usage(self):
-        """Called once per day (e.g., via cron or internal scheduler)."""
+        """Called once per day."""
         if not self.device_name: return
         
         current_sectors = self._read_diskstats()
-        if current_sectors is None or self.start_sectors is None:
+        if current_sectors is None or self.state["session_start_sectors"] == 0:
             return
             
-        delta_sectors = current_sectors - self.start_sectors
-        delta_mb = round((delta_sectors * 512) / (1024 * 1024), 2)
+        # Calculate daily delta
+        delta_this_session = current_sectors - self.state["session_start_sectors"]
+        delta_mb = round((delta_this_session * 512) / (1024 * 1024), 2)
         
-        # Append single line to CSV (minimal wear)
-        with open(self.daily_file, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([datetime.utcnow().isoformat(), self.device_name, delta_sectors, delta_mb])
+        # Update lifetime
+        self.state["lifetime_sectors_written"] += delta_this_session
+        lifetime_tb = round((self.state["lifetime_sectors_written"] * 512) / (1024**4), 4)
+        
+        # Append to daily CSV
+        daily_file = os.path.join(TELEMETRY_DIR, f"daily_{datetime.utcnow().strftime('%Y-%m-%d')}.csv")
+        with open(daily_file, 'a') as f:
+            f.write(f"{datetime.utcnow().isoformat()},{self.device_name},{delta_this_session},{delta_mb}\n")
             
-        logger.info(f"Telemetry: {delta_mb} MB written to disk today.")
+        logger.info(f"Telemetry: {delta_mb} MB written today. Lifetime: {lifetime_tb} TB.")
         
-        # Reset for next day
-        self.start_sectors = current_sectors
+        # Reset session start for tomorrow
+        self.state["session_start_sectors"] = current_sectors
+        self._save_cumulative_state()
