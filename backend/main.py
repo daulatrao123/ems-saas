@@ -1,11 +1,5 @@
 """
-EMS SaaS Backend v6.1.0 — Industrial Production (Safe Multi-Pi & 4-Slot Migration)
-====================================
-- 1 Society can have Multiple Pis.
-- 1 Pi has 4 physical slots (A, B, C, D).
-- Wing configurations are mapped to (device_id, slot).
-- Commands target specific devices and slots.
-- Safe DB migration: Renames old tables instead of dropping them.
+EMS SaaS Backend v6.2.0 — Industrial Production (Strict Multi-Pi & 4-Slot Contract)
 """
 
 import os
@@ -46,13 +40,12 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.1.0-prod")
+app = FastAPI(title="EMS SaaS API", version="6.2.0-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 DEFAULT_RESET_DAY = 15
-# PRODUCTION v6.0: 4 physical slots per Pi
-WING_SLOTS = ["A", "B", "C", "D"]
+SLOTS = ["A", "B", "C", "D"] # Strict 4-slot architecture
 PI_ONLINE_THRESHOLD_SECONDS = 120
 COMMAND_EXPIRY_SECONDS = 300
 VALID_ROLES = {"super_admin", "society_admin", "member"}
@@ -98,38 +91,40 @@ def ensure_db_schema():
                     api_key_hash TEXT UNIQUE,
                     firmware_version TEXT,
                     last_seen TIMESTAMPTZ,
-                    status TEXT DEFAULT 'INVENTORY'
+                    status TEXT DEFAULT 'INVENTORY',
+                    hardware_profile TEXT DEFAULT 'EMS-4CH-v1',
+                    feedback_hardware_installed BOOLEAN DEFAULT FALSE
                 );
             """)
             
-            # PRODUCTION v6.1: Safe migration from old schema to new schema
-            # If the old `wing_configs` table exists and has `society_id`, it's the v5.x schema.
-            # We rename it to _old to preserve data, then create the clean v6.0 table.
+            # PRODUCTION v6.2: Rename legacy wing_* tables to slot_*
             cur.execute("""
                 DO $$ BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.columns 
-                        WHERE table_name='wing_configs' AND column_name='society_id'
-                    ) THEN
-                        ALTER TABLE wing_configs RENAME TO wing_configs_old;
-                        ALTER TABLE wing_state RENAME TO wing_state_old;
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs') THEN
+                        ALTER TABLE wing_configs RENAME TO slot_configs;
+                        ALTER TABLE slot_configs RENAME COLUMN wing_code TO slot_code;
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state') THEN
+                        ALTER TABLE wing_state RENAME TO slot_state;
+                        ALTER TABLE slot_state RENAME COLUMN wing_code TO slot_code;
                     END IF;
                 END $$;
             """)
             
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS wing_configs (
+                CREATE TABLE IF NOT EXISTS slot_configs (
                     device_id UUID,
                     slot TEXT,
                     display_name TEXT,
                     target_days INT,
                     disabled BOOL DEFAULT FALSE,
+                    feedback_enabled BOOL DEFAULT FALSE,
                     PRIMARY KEY (device_id, slot),
                     FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
                 );
             """)
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS wing_state (
+                CREATE TABLE IF NOT EXISTS slot_state (
                     device_id UUID,
                     slot TEXT,
                     physical_toggle TEXT DEFAULT 'UNKNOWN',
@@ -186,6 +181,9 @@ def ensure_db_schema():
             cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
             cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS hardware_profile TEXT DEFAULT 'EMS-4CH-v1'")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS feedback_hardware_installed BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE slot_configs ADD COLUMN IF NOT EXISTS feedback_enabled BOOLEAN DEFAULT FALSE")
             
             # Drop the unique constraint from v5.6 if it exists
             cur.execute("DROP INDEX IF EXISTS uq_pi_devices_society_id")
@@ -196,12 +194,6 @@ def ensure_db_schema():
                     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
                         ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
                     END IF;
-                END $$;
-            """)
-            
-            # Safely rename wing to slot in pi_commands
-            cur.execute("""
-                DO $$ BEGIN
                     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
                         ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
                     END IF;
@@ -220,7 +212,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v6.1 Safe Migration)")
+        print("DB schema verified OK (Relational v6.2 Strict Slot Migration)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -287,7 +279,7 @@ def is_pi_online(pi_state: dict) -> bool:
     if last_sync.tzinfo is None: last_sync = last_sync.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - last_sync).total_seconds() <= PI_ONLINE_THRESHOLD_SECONDS
 
-def wing_is_visible(config: dict, state: dict) -> bool:
+def slot_is_visible(config: dict, state: dict) -> bool:
     physical = str(state.get("physical_toggle", "UNKNOWN")).upper()
     return (
         int(config.get("target_days", 0)) > 0
@@ -299,8 +291,8 @@ def validate_command(command: str, params: dict, slot: str = "") -> None:
     if command not in VALID_COMMANDS:
         raise HTTPException(400, f"Unsupported command: {command}")
     if command in ("set_active_slot", "set_days", "off_slot"):
-        if slot not in WING_SLOTS:
-            raise HTTPException(400, f"Valid slot ({', '.join(WING_SLOTS)}) is required")
+        if slot not in SLOTS:
+            raise HTTPException(400, f"Valid slot ({', '.join(SLOTS)}) is required")
     if command == "set_days":
         try: days = int(params.get("days"))
         except: raise HTTPException(400, "days must be an integer")
@@ -309,16 +301,6 @@ def validate_command(command: str, params: dict, slot: str = "") -> None:
         try: day = int(params.get("day"))
         except: raise HTTPException(400, "day must be an integer")
         if not 1 <= day <= 28: raise HTTPException(400, "reset day must be 1-28")
-    if command == "lcd_display":
-        line1 = str(params.get("line1", ""))[:16]
-        line2 = str(params.get("line2", ""))[:16]
-        if not line1 and not line2: raise HTTPException(400, "LCD message cannot be empty")
-        params["line1"] = line1
-        params["line2"] = line2
-        try: dur = float(params.get("duration", 10))
-        except: raise HTTPException(400, "duration must be a number")
-        if not 1 <= dur <= 120: raise HTTPException(400, "duration must be 1-120 seconds")
-        params["duration"] = dur
 
 # ================================================================
 # AUTH
@@ -376,19 +358,13 @@ def authenticate_pi(payload: dict) -> tuple:
 # HEALTH & KEEPALIVE
 # ================================================================
 
-_keepalive_ts = time.time()
-
 @app.get("/keepalive")
 def keepalive():
-    global _keepalive_ts
-    _keepalive_ts = time.time()
     return PlainTextResponse("alive")
 
 @app.head("/ping")
 @app.get("/ping")
 def ping():
-    global _keepalive_ts
-    _keepalive_ts = time.time()
     return PlainTextResponse("pong")
 
 @app.get("/api/health")
@@ -399,7 +375,7 @@ def health():
             cur.execute("SELECT 1")
         conn.commit()
         conn.close()
-        return {"status": "ok", "database": "ok", "uptime_keepalive": round(time.time() - _keepalive_ts)}
+        return {"status": "ok", "database": "ok"}
     except Exception:
         return JSONResponse(status_code=503, content={"status": "error", "database": "unavailable"})
 
@@ -427,22 +403,19 @@ def bootstrap(request: Request):
             
             device_id = str(uuid.uuid4())
             raw_api_key = str(uuid.uuid4())
-            cur.execute("INSERT INTO pi_devices (id, society_id, name, api_key_hash, status) VALUES (%s, %s, %s, %s, %s)",
-                        (device_id, sid, "Main Controller", hash_api_key(raw_api_key), "ASSIGNED"))
+            cur.execute("INSERT INTO pi_devices (id, society_id, name, api_key_hash, status, feedback_hardware_installed) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (device_id, sid, "Main Controller", hash_api_key(raw_api_key), "ASSIGNED", True))
                         
             cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
                         ("admin@ems.com", "Super Admin", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "super_admin", None))
-            cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
-                        ("admin@prestine.com", "Prestine Admin", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "society_admin", sid))
-            cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
-                        ("member@prestine.com", "Prestine Member", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "member", sid))
             
-            # PRODUCTION v6.0: Initialize 4 slots (A-D) for the bootstrap Pi. A and B enabled.
-            for slot_code in WING_SLOTS:
+            # Initialize 4 slots (A-D) for the bootstrap Pi. A and B enabled with feedback.
+            for slot_code in SLOTS:
                 is_disabled = slot_code not in ["A", "B"]
-                cur.execute("INSERT INTO wing_configs (device_id, slot, display_name, target_days, disabled) VALUES (%s, %s, %s, %s, %s)",
-                           (device_id, slot_code, f"Slot {slot_code}", 10, is_disabled))
-                cur.execute("INSERT INTO wing_state (device_id, slot) VALUES (%s, %s)", (device_id, slot_code))
+                cur.execute("""INSERT INTO slot_configs (device_id, slot, display_name, target_days, disabled, feedback_enabled) 
+                               VALUES (%s, %s, %s, %s, %s, %s)""",
+                           (device_id, slot_code, f"Slot {slot_code}", 10, is_disabled, not is_disabled))
+                cur.execute("INSERT INTO slot_state (device_id, slot) VALUES (%s, %s)", (device_id, slot_code))
                 
             cur.execute("""INSERT INTO pi_state (device_id, active_slot, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, watchdog_enabled, config_version) 
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -497,7 +470,7 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
             result = []
             for s in societies:
                 sid = s["id"]
-                cur.execute("SELECT id, name, firmware_version, last_seen FROM pi_devices WHERE society_id = %s ORDER BY name ASC", (sid,))
+                cur.execute("SELECT id, name, firmware_version, last_seen, hardware_profile, feedback_hardware_installed FROM pi_devices WHERE society_id = %s ORDER BY name ASC", (sid,))
                 devs = cur.fetchall()
                 
                 devices_data = []
@@ -509,15 +482,16 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
                     if is_pi_online(pi): society_online = True
                     
                     slots_data = {}
-                    cur.execute("SELECT * FROM wing_configs WHERE device_id = %s", (dev["id"],))
+                    cur.execute("SELECT * FROM slot_configs WHERE device_id = %s", (dev["id"],))
                     configs = cur.fetchall()
                     for c in configs:
-                        cur.execute("SELECT * FROM wing_state WHERE device_id = %s AND slot = %s", (dev["id"], c["slot"]))
+                        cur.execute("SELECT * FROM slot_state WHERE device_id = %s AND slot = %s", (dev["id"], c["slot"]))
                         st = cur.fetchone()
                         slots_data[c["slot"]] = {
                             "display_name": c["display_name"],
                             "target_days": c["target_days"],
                             "disabled": c["disabled"],
+                            "feedback_enabled": c["feedback_enabled"],
                             "used_days": st["used_days"] if st else 0,
                             "physical_toggle": st["physical_toggle"] if st else "UNKNOWN",
                         }
@@ -527,6 +501,8 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
                         "name": dev["name"],
                         "online": is_pi_online(pi),
                         "active_slot": pi.get("active_slot") if pi else None,
+                        "hardware_profile": dev["hardware_profile"],
+                        "feedback_hardware_installed": dev["feedback_hardware_installed"],
                         "slots": slots_data
                     })
                     
@@ -563,35 +539,42 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 new_sid = cur.fetchone()["id"]
                 log_audit(cur, user, new_sid, "CREATE_SOCIETY", society)
                 
-            # PRODUCTION v6.0: Handle Multiple Pi Assignments and Slot Configs
+            # Handle Multiple Pi Assignments and Slot Configs
             devices = data.get("devices", [])
-            assigned_ids = [d["id"] for d in devices if d.get("id")]
+            assigned_ids = [d["device_id"] for d in devices if d.get("device_id")]
             
-            # Unassign devices no longer in the list
             if assigned_ids:
                 cur.execute("UPDATE pi_devices SET society_id=NULL, status='INVENTORY' WHERE society_id=%s AND id != ALL(%s)", (new_sid, assigned_ids))
             else:
                 cur.execute("UPDATE pi_devices SET society_id=NULL, status='INVENTORY' WHERE society_id=%s", (new_sid,))
                 
             for dev in devices:
-                dev_id = dev["id"]
-                # Assign device to society
-                cur.execute("UPDATE pi_devices SET society_id=%s, status='ASSIGNED' WHERE id=%s", (new_sid, dev_id))
+                dev_id = dev["device_id"]
+                if not dev_id: continue
+                
+                # Update device-level hardware config
+                cur.execute(
+                    "UPDATE pi_devices SET society_id=%s, status='ASSIGNED', hardware_profile=%s, feedback_hardware_installed=%s WHERE id=%s",
+                    (new_sid, dev.get("hardware_profile", "EMS-4CH-v1"), bool(dev.get("feedback_hardware_installed", False)), dev_id)
+                )
                 
                 # Upsert slot configurations
                 slots = dev.get("slots", {})
-                for slot_code in WING_SLOTS:
+                for slot_code in SLOTS:
                     slot_data = slots.get(slot_code, {})
                     s_name = slot_data.get("display_name", f"Slot {slot_code}")
                     s_disabled = bool(slot_data.get("disabled", True))
                     s_target = int(slot_data.get("target_days", 0))
+                    s_feedback = bool(slot_data.get("feedback_enabled", False))
                     
-                    cur.execute("""INSERT INTO wing_configs (device_id, slot, display_name, target_days, disabled) 
-                                   VALUES (%s, %s, %s, %s, %s) 
+                    cur.execute("""INSERT INTO slot_configs (device_id, slot, display_name, target_days, disabled, feedback_enabled) 
+                                   VALUES (%s, %s, %s, %s, %s, %s) 
                                    ON CONFLICT (device_id, slot) DO UPDATE SET 
                                    display_name=EXCLUDED.display_name, 
-                                   target_days=EXCLUDED.target_days, disabled=EXCLUDED.disabled""",
-                                (dev_id, slot_code, s_name, s_target, s_disabled))
+                                   target_days=EXCLUDED.target_days, 
+                                   disabled=EXCLUDED.disabled,
+                                   feedback_enabled=EXCLUDED.feedback_enabled""",
+                                (dev_id, slot_code, s_name, s_target, s_disabled, s_feedback))
                 
         conn.commit()
     except Exception as e:
@@ -764,90 +747,8 @@ def delete_user(data: dict, user: dict = Depends(require_role("super_admin"))):
         conn.close()
     return {"message": "Deleted"}
 
-@app.get("/api/super-admin/firmware/versions")
-def get_firmware_versions(user: dict = Depends(require_role("super_admin"))):
-    conn = get_db()
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT version, changelog, forced, created_at, updated_at FROM firmware_versions ORDER BY created_at DESC")
-            versions = cur.fetchall()
-            return versions
-    finally:
-        conn.close()
-
-@app.post("/api/super-admin/firmware/save")
-def save_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            version = data.get("version", "").strip()
-            code = data.get("code", "")
-            changelog = data.get("changelog", "")
-            forced = data.get("forced", False)
-            if not version or not code:
-                raise HTTPException(400, "Version and code required")
-                
-            if forced:
-                cur.execute("UPDATE firmware_versions SET forced = FALSE")
-                
-            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at) 
-                           VALUES (%s, %s, %s, %s, %s, %s) 
-                           ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s""",
-                        (version, code, changelog, forced, datetime.now(timezone.utc), datetime.now(timezone.utc), code, changelog, forced, datetime.now(timezone.utc)))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-    return {"message": "Saved"}
-
-@app.post("/api/super-admin/firmware/delete")
-def delete_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM firmware_versions WHERE version = %s", (data.get("version"),))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-    return {"message": "Deleted"}
-
-@app.post("/api/super-admin/firmware/force")
-def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))):
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE firmware_versions SET forced = FALSE")
-            cur.execute("UPDATE firmware_versions SET forced = TRUE WHERE version = %s", (data.get("version"),))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-    return {"message": "Force flag updated"}
-
-@app.get("/api/pi/firmware-download")
-def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-Key")):
-    if not x_api_key:
-        raise HTTPException(403, "API key required in X-Api-Key header")
-    conn = get_db()
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT code FROM firmware_versions WHERE version = %s", (version,))
-            fv = cur.fetchone()
-            if not fv:
-                raise HTTPException(404, "Version not found")
-            return PlainTextResponse(fv["code"], media_type="text/plain")
-    finally:
-        conn.close()
-
 # ================================================================
-# PI SYNC (Returns config for THIS specific Pi)
+# PI SYNC (Returns canonical config for THIS specific Pi)
 # ================================================================
 
 @app.post("/api/pi/sync")
@@ -862,27 +763,36 @@ def pi_sync(request: Request, payload: dict):
             cur.execute("UPDATE pi_devices SET last_seen = %s, firmware_version = %s WHERE id = %s",
                         (now, payload.get("firmwareVersion", "unknown"), device_id))
                         
-            for slot_code, w in payload.get("wings", {}).items():
-                if slot_code not in WING_SLOTS: continue
-                physical_toggle = w.get("physicalToggle", "UNKNOWN")
+            # v6.2: Accept slots instead of wings
+            for slot_code, w in payload.get("slots", {}).items():
+                if slot_code not in SLOTS: continue
+                physical_toggle = w.get("physical_toggle", "UNKNOWN")
                 if isinstance(physical_toggle, bool): physical_toggle = "ON" if physical_toggle else "OFF"
                 physical_toggle = str(physical_toggle).upper()
                 if physical_toggle not in ("ON", "OFF", "UNKNOWN"): physical_toggle = "UNKNOWN"
                 
-                cur.execute("""INSERT INTO wing_state (device_id, slot, physical_toggle, used_days, clicks) 
+                cur.execute("""INSERT INTO slot_state (device_id, slot, physical_toggle, used_days, clicks) 
                                VALUES (%s, %s, %s, %s, %s) 
                                ON CONFLICT (device_id, slot) DO UPDATE SET 
                                physical_toggle=EXCLUDED.physical_toggle, used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks""",
-                            (device_id, slot_code, physical_toggle, int(w.get("usedDays", 0)), int(w.get("clicks", 0))))
+                            (device_id, slot_code, physical_toggle, int(w.get("used_days", 0)), int(w.get("clicks", 0))))
 
             cur.execute("SELECT config_version FROM societies WHERE id = %s", (society_id,))
             soc = cur.fetchone()
             cloud_config_version = soc["config_version"] if soc else 0
             
-            # PRODUCTION v6.0: Return configs ONLY for this Pi
-            cur.execute("SELECT slot, target_days, disabled FROM wing_configs WHERE device_id = %s", (device_id,))
+            # Build Canonical Pi Config payload
+            cur.execute("SELECT hardware_profile, feedback_hardware_installed FROM pi_devices WHERE id = %s", (device_id,))
+            dev_info = cur.fetchone()
+            
+            cur.execute("SELECT slot, target_days, disabled, display_name, feedback_enabled FROM slot_configs WHERE device_id = %s", (device_id,))
             configs = cur.fetchall()
-            wing_configs = {c["slot"]: {"target_days": c["target_days"], "disabled": c["disabled"]} for c in configs}
+            slot_configs = {c["slot"]: {
+                "target_days": c["target_days"], 
+                "disabled": c["disabled"],
+                "display_name": c["display_name"],
+                "feedback_enabled": c["feedback_enabled"]
+            } for c in configs}
 
             cur.execute("""INSERT INTO pi_state (device_id, active_slot, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason, config_version) 
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -891,7 +801,7 @@ def pi_sync(request: Request, payload: dict):
                            uptime_seconds=EXCLUDED.uptime_seconds, cpu_temp=EXCLUDED.cpu_temp, disk_free_mb=EXCLUDED.disk_free_mb, 
                            last_sync=EXCLUDED.last_sync, boot_count=EXCLUDED.boot_count, last_shutdown_reason=EXCLUDED.last_shutdown_reason, 
                            clock_source=EXCLUDED.clock_source, watchdog_enabled=EXCLUDED.watchdog_enabled, last_reboot_reason=EXCLUDED.last_reboot_reason""",
-                        (device_id, payload.get("activeWing"), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
+                        (device_id, payload.get("active_slot"), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
                          bool(payload.get("emergencyStop", False)), int(payload.get("uptimeSeconds", 0)),
                          float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
@@ -915,15 +825,18 @@ def pi_sync(request: Request, payload: dict):
                 "success": True, 
                 "command": None, 
                 "command_id": None,
-                "configVersion": cloud_config_version,
-                "wingConfigs": wing_configs,
+                "config_version": cloud_config_version,
+                "device_id": device_id,
+                "hardware_profile": dev_info["hardware_profile"],
+                "feedback_hardware_installed": dev_info["feedback_hardware_installed"],
+                "slots": slot_configs,
                 "resetDay": int(payload.get("resetDay", DEFAULT_RESET_DAY))
             }
             if cmd:
                 cur.execute("UPDATE pi_commands SET status = 'delivered', delivered_at = %s WHERE id = %s", (now, cmd["id"]))
                 reply["command"] = cmd["command"]
                 reply["command_id"] = str(cmd["id"])
-                if cmd.get("slot"): reply["slot"] = cmd["slot"] # Changed from wing to slot
+                if cmd.get("slot"): reply["slot"] = cmd["slot"]
                 reply["params"] = cmd.get("params", {})
 
         conn.commit()
@@ -934,6 +847,10 @@ def pi_sync(request: Request, payload: dict):
         conn.close()
     return reply
 
+# ================================================================
+# PI COMMAND ACK (Unified Contract)
+# ================================================================
+
 @app.post("/api/pi/command-ack")
 def pi_command_ack(payload: dict):
     device_id, society_id = authenticate_pi(payload)
@@ -941,9 +858,10 @@ def pi_command_ack(payload: dict):
     if not command_id:
         raise HTTPException(400, "command_id required")
 
-    success = bool(payload.get("success", True))
+    # Unified payload from Pi: status, verification_state, error
+    status = str(payload.get("status", "FAILED")).upper()
+    verification = str(payload.get("verification_state", "UNKNOWN"))
     error = payload.get("error")
-    result = payload.get("result")
 
     conn = get_db()
     try:
@@ -953,11 +871,12 @@ def pi_command_ack(payload: dict):
             if not cmd:
                 return {"success": True, "status": "unknown"}
 
-            if success:
+            # If the Pi confirms the hardware physically verified, update server result
+            if status == "COMPLETED":
                 if cmd["command"] == "set_days":
                     slot = cmd["slot"]
                     days = int(cmd["params"].get("days", 0))
-                    cur.execute("UPDATE wing_configs SET target_days = %s WHERE device_id = %s AND slot = %s", (days, device_id, slot))
+                    cur.execute("UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s", (days, device_id, slot))
                     cur.execute("UPDATE societies SET config_version = config_version + 1 WHERE id = %s", (society_id,))
                 elif cmd["command"] == "set_reset_day":
                     day = int(cmd["params"].get("day", 15))
@@ -965,7 +884,7 @@ def pi_command_ack(payload: dict):
 
             cur.execute("""UPDATE pi_commands SET status = %s, acked_at = %s, error = %s, result = %s 
                            WHERE id = %s AND device_id = %s AND status = 'delivered'""",
-                        ("succeeded" if success else "failed", datetime.now(timezone.utc), None if success else error, result, command_id, device_id))
+                        (status.lower(), datetime.now(timezone.utc), error if status != "COMPLETED" else None, verification, command_id, device_id))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -988,8 +907,8 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
         raise HTTPException(403, "Cannot access other society data")
 
     command = str(data.get("command", ""))
-    slot = str(data.get("slot", "")) # Changed from wing to slot
-    device_id = data.get("device_id") # PRODUCTION v6.0: Commands now target a specific Pi
+    slot = str(data.get("slot", ""))
+    device_id = data.get("device_id")
     params = dict(data.get("params", {}))
 
     validate_command(command, params, slot)
@@ -997,7 +916,6 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            # Verify device belongs to society
             cur.execute("SELECT id FROM pi_devices WHERE id=%s AND society_id=%s", (device_id, sid))
             if not cur.fetchone(): raise HTTPException(404, "Device not found in this society")
             
@@ -1033,19 +951,19 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                 pi = cur.fetchone()
                 
                 slots_data = {}
-                cur.execute("SELECT * FROM wing_configs WHERE device_id = %s", (dev["id"],))
+                cur.execute("SELECT * FROM slot_configs WHERE device_id = %s", (dev["id"],))
                 configs = cur.fetchall()
                 for c in configs:
-                    cur.execute("SELECT * FROM wing_state WHERE device_id = %s AND slot = %s", (dev["id"], c["slot"]))
+                    cur.execute("SELECT * FROM slot_state WHERE device_id = %s AND slot = %s", (dev["id"], c["slot"]))
                     st = cur.fetchone() or {}
                     slots_data[c["slot"]] = {
                         "used_days": st.get("used_days", 0),
                         "target_days": c["target_days"],
-                        "status": "ACTIVE" if pi.get("active_slot") == c["slot"] else "IDLE",
+                        "status": "ACTIVE" if pi and pi.get("active_slot") == c["slot"] else "IDLE",
                         "display_name": c["display_name"],
                         "disabled": c["disabled"],
                         "physical_toggle": st.get("physical_toggle", "UNKNOWN"),
-                        "visible": wing_is_visible(c, st),
+                        "visible": slot_is_visible(c, st),
                     }
                 
                 devices_data.append({
@@ -1113,12 +1031,12 @@ def member_dashboard(user: dict = Depends(get_current_user)):
                 pi = cur.fetchone()
                 
                 slots_data = {}
-                cur.execute("SELECT * FROM wing_configs WHERE device_id = %s", (dev["id"],))
+                cur.execute("SELECT * FROM slot_configs WHERE device_id = %s", (dev["id"],))
                 configs = cur.fetchall()
                 for c in configs:
-                    cur.execute("SELECT * FROM wing_state WHERE device_id = %s AND slot = %s", (dev["id"], c["slot"]))
+                    cur.execute("SELECT * FROM slot_state WHERE device_id = %s AND slot = %s", (dev["id"], c["slot"]))
                     st = cur.fetchone() or {}
-                    if not wing_is_visible(c, st): continue
+                    if not slot_is_visible(c, st): continue
                     slots_data[c["slot"]] = {
                         "used_days": st.get("used_days", 0),
                         "target_days": c["target_days"],
@@ -1134,7 +1052,7 @@ def member_dashboard(user: dict = Depends(get_current_user)):
                     "slots": slots_data
                 })
 
-            return { "devices": devices_data, "reset_day": DEFAULT_RESET_DAY } # reset_day could be society-level in future
+            return { "devices": devices_data, "reset_day": DEFAULT_RESET_DAY }
     finally:
         conn.close()
 

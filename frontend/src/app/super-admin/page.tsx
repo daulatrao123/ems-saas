@@ -19,7 +19,7 @@ export default function SuperAdminDashboard() {
   const [showKeyModal, setShowKeyModal] = useState(false);
   
   const [editSoc, setEditSoc] = useState<any>(null);
-  const [socForm, setSocForm] = useState({ name: "", location: "", device_id: "", wings: {} as Record<string, { name: string; disabled: boolean; targetDays: number }> });
+  const [socForm, setSocForm] = useState<any>(null);
   const [userForm, setUserForm] = useState({ email: "", name: "", password: "", role: "society_admin", society_id: "" });
   
   const [editDeviceId, setEditDeviceId] = useState<string | null>(null);
@@ -28,7 +28,7 @@ export default function SuperAdminDashboard() {
 
   const [toast, setToast] = useState<any>(null);
 
-  const WING_CODES = ["A", "B", "C", "D", "E", "F", "G", "H"];
+  const SLOTS = ["A", "B", "C", "D"]; // Strict 4-slot architecture
 
   useEffect(() => { if (localStorage.getItem("role") !== "super_admin") router.push("/login"); }, [router]);
 
@@ -53,49 +53,72 @@ export default function SuperAdminDashboard() {
   const showToast = (msg: string, ok: boolean) => { setToast({ msg, ok }); setTimeout(() => setToast(null), 3000); };
   const copyText = (t: string) => { navigator.clipboard.writeText(t); showToast("Copied!", true); };
 
-  const initWings = () => {
-    const wings: Record<string, { name: string; disabled: boolean; targetDays: number }> = {};
-    WING_CODES.forEach(code => {
-      wings[code] = { name: `Wing ${code}`, disabled: false, targetDays: 10 };
+  const initSlots = () => {
+    const slots: Record<string, any> = {};
+    SLOTS.forEach(code => {
+      slots[code] = { display_name: `Slot ${code}`, disabled: false, target_days: 10, feedback_enabled: false };
     });
-    return wings;
+    return slots;
   };
+
+  const initDevice = () => ({
+    device_id: "",
+    hardware_profile: "EMS-4CH-v1",
+    feedback_hardware_installed: false,
+    slots: initSlots()
+  });
 
   const saveSoc = async () => {
     try {
-      const wing_names: Record<string, string> = {};
-      const wing_disabled: Record<string, boolean> = {};
-      const wing_target_days: Record<string, number> = {};
-      
-      Object.entries(socForm.wings).forEach(([code, data]) => {
-        wing_names[code] = data.name;
-        wing_disabled[code] = data.disabled;
-        wing_target_days[code] = data.targetDays;
-      });
-
-      const payload = { ...socForm, wing_names, wing_disabled, wing_target_days };
+      const payload = { ...socForm };
       await api.post("/api/super-admin/societies/save", editSoc ? { id: editSoc.id, ...payload } : payload);
       setShowSocModal(false); setEditSoc(null);
-      setSocForm({ name: "", location: "", device_id: "", wings: initWings() });
+      setSocForm(null);
       fetchData(); showToast("Society saved", true);
     } catch { showToast("Failed", false); }
   };
   
   const deleteSoc = async (id: string) => { if (!confirm("Delete this society?")) return; try { await api.post("/api/super-admin/societies/delete", { id }); fetchData(); showToast("Deleted", true); } catch { showToast("Failed", false); } };
+  
   const openEditSoc = (s: any) => { 
-    const currentWings = initWings();
-    if (s.wings) {
-      Object.keys(s.wings).forEach(code => {
-        currentWings[code] = { 
-          name: s.wings[code].name, 
-          disabled: s.wings[code].disabled,
-          targetDays: s.wings[code].target_days || 10
-        };
-      });
-    }
     setEditSoc(s); 
-    setSocForm({ name: s.name, location: s.location, device_id: s.device_id || "", wings: currentWings }); 
+    // Deep copy to avoid mutating state directly
+    const devices = s.devices?.map((d: any) => ({
+      device_id: d.id,
+      hardware_profile: d.hardware_profile || "EMS-4CH-v1",
+      feedback_hardware_installed: d.feedback_hardware_installed || false,
+      slots: d.slots || initSlots()
+    })) || [];
+    
+    setSocForm({ name: s.name, location: s.location, devices }); 
     setShowSocModal(true); 
+  };
+
+  const openNewSoc = () => {
+    setEditSoc(null);
+    setSocForm({ name: "", location: "", devices: [] });
+    setShowSocModal(true);
+  };
+
+  const addDeviceToSociety = () => {
+    const newDev = initDevice();
+    // Auto-assign from inventory if available
+    const inventoryDev = devices.find(d => !d.society_id);
+    if (inventoryDev) newDev.device_id = inventoryDev.id;
+    
+    setSocForm((prev: any) => ({ ...prev, devices: [...prev.devices, newDev] }));
+  };
+
+  const handleDeviceChange = (dIdx: number, field: string, value: any) => {
+    const newDevices = [...socForm.devices];
+    newDevices[dIdx][field] = value;
+    setSocForm({ ...socForm, devices: newDevices });
+  };
+
+  const handleSlotChange = (dIdx: number, slot: string, field: string, value: any) => {
+    const newDevices = [...socForm.devices];
+    newDevices[dIdx].slots[slot][field] = value;
+    setSocForm({ ...socForm, devices: newDevices });
   };
 
   const saveUser = async () => {
@@ -139,7 +162,6 @@ export default function SuperAdminDashboard() {
     { key: "firmware", label: "Firmware", count: fwVersions.length }
   ];
 
-  // PRODUCTION FIX: Cast both to String to prevent "12" === 12 mismatch
   const availableDevices = devices.filter(d => 
     !d.society_id || (editSoc && String(d.society_id) === String(editSoc.id))
   );
@@ -153,7 +175,7 @@ export default function SuperAdminDashboard() {
             <h1 className="text-2xl font-bold text-white">Super Admin</h1>
             <p className="text-xs text-gray-500">{societies.length} societies, {users.length} users, {devices.length} pi devices</p>
           </div>
-          {tab === "societies" && <button onClick={() => { setEditSoc(null); setSocForm({ name: "", location: "", device_id: "", wings: initWings() }); setShowSocModal(true); }} className="px-4 py-2 bg-cyan-500 text-black text-xs font-bold rounded-lg hover:bg-cyan-600">+ Add Society</button>}
+          {tab === "societies" && <button onClick={openNewSoc} className="px-4 py-2 bg-cyan-500 text-black text-xs font-bold rounded-lg hover:bg-cyan-600">+ Add Society</button>}
           {tab === "users" && <button onClick={() => { setUserForm({ email: "", name: "", password: "", role: "society_admin", society_id: societies[0]?.id || "" }); setShowUserModal(true); }} className="px-4 py-2 bg-emerald-500 text-black text-xs font-bold rounded-lg hover:bg-emerald-600">+ Add User</button>}
           {tab === "devices" && <button onClick={() => { setEditDeviceId(null); setDeviceForm({ name: "", society_id: "" }); setShowDeviceModal(true); }} className="px-4 py-2 bg-emerald-500 text-black text-xs font-bold rounded-lg hover:bg-emerald-600">+ Add Pi Device</button>}
         </div>
@@ -169,15 +191,14 @@ export default function SuperAdminDashboard() {
         {tab === "societies" && (
           <div className="bg-gray-900/80 border border-gray-800 rounded-xl overflow-hidden">
             <table className="w-full text-xs">
-              <thead><tr className="text-gray-500 border-b border-gray-800"><th className="text-left px-4 py-2">Name</th><th className="text-left px-4 py-2">Location</th><th className="text-left px-4 py-2">Pi</th><th className="text-left px-4 py-2">FW</th><th className="text-left px-4 py-2">Wing</th><th className="text-right px-4 py-2">Actions</th></tr></thead>
+              <thead><tr className="text-gray-500 border-b border-gray-800"><th className="text-left px-4 py-2">Name</th><th className="text-left px-4 py-2">Location</th><th className="text-left px-4 py-2">Pi</th><th className="text-left px-4 py-2">Active Slot</th><th className="text-right px-4 py-2">Actions</th></tr></thead>
               <tbody>
                 {societies.map((s) => (
                   <tr key={s.id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
                     <td className="px-4 py-3 text-gray-200 font-semibold">{s.name}</td>
                     <td className="px-4 py-3 text-gray-400">{s.location}</td>
                     <td className="px-4 py-3"><span className={`flex items-center gap-1 ${s.pi_online ? "text-emerald-400" : "text-red-400"}`}><span className={`w-1.5 h-1.5 rounded-full ${s.pi_online ? "bg-emerald-400" : "bg-red-400"}`} />{s.pi_online ? "Online" : "Offline"}</span></td>
-                    <td className="px-4 py-3 text-gray-500 font-mono text-[10px]">{s.firmware_version || "--"}</td>
-                    <td className="px-4 py-3 text-cyan-400 font-mono">{s.active_wing || "--"}</td>
+                    <td className="px-4 py-3 text-cyan-400 font-mono">{s.devices?.[0]?.active_slot || "--"}</td>
                     <td className="px-4 py-3 text-right">
                       <button onClick={() => router.push(`/society/${s.id}`)} className="text-cyan-400 hover:underline mr-2 font-semibold">Details</button>
                       <button onClick={() => openEditSoc(s)} className="text-gray-400 hover:text-cyan-400 hover:underline mr-2">Edit</button>
@@ -234,56 +255,69 @@ export default function SuperAdminDashboard() {
           </div>
         )}
 
-        {/* Society Modal */}
-        {showSocModal && (
-          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setShowSocModal(false)}>
-            <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        {/* Society Modal - Multi-Pi & 4-Slot Config */}
+        {showSocModal && socForm && (
+          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={() => setShowSocModal(false)}>
+            <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-4xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
               <h3 className="text-sm font-bold text-white mb-4">{editSoc ? "Edit Society" : "Add Society"}</h3>
               <div className="space-y-3">
-                <input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Society Name" value={socForm.name} onChange={(e) => setSocForm({ ...socForm, name: e.target.value })} />
-                <input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Location" value={socForm.location} onChange={(e) => setSocForm({ ...socForm, location: e.target.value })} />
-                
-                <div>
-                  <label className="text-[9px] text-gray-500 uppercase">Assign Pi Device</label>
-                  <select className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" value={socForm.device_id} onChange={(e) => setSocForm({ ...socForm, device_id: e.target.value })}>
-                    <option value="">Unassigned (Inventory)</option>
-                    {availableDevices.map((d) => <option key={d.id} value={d.id}>{d.name} ({d.id.slice(0,8)}...)</option>)}
-                  </select>
+                <div className="grid grid-cols-2 gap-4">
+                  <input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Society Name" value={socForm.name} onChange={(e) => setSocForm({ ...socForm, name: e.target.value })} />
+                  <input className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Location" value={socForm.location} onChange={(e) => setSocForm({ ...socForm, location: e.target.value })} />
                 </div>
 
-                <div className="pt-2 border-t border-gray-800 mt-2">
-                  <label className="text-[9px] text-gray-500 uppercase block mb-2">Wing Configuration (A-H)</label>
-                  <div className="space-y-2">
-                    {WING_CODES.map(code => (
-                      <div key={code} className="flex items-center gap-2">
-                        <span className="text-gray-500 font-mono text-[10px] w-4">{code}</span>
-                        <input 
-                          className="flex-1 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" 
-                          placeholder={`Wing ${code} Name`} 
-                          value={socForm.wings[code]?.name || ""} 
-                          onChange={(e) => setSocForm({ ...socForm, wings: { ...socForm.wings, [code]: { ...socForm.wings[code], name: e.target.value } }})} 
-                        />
-                        <input 
-                          type="number"
-                          className="w-16 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" 
-                          placeholder="Days" 
-                          value={socForm.wings[code]?.targetDays ?? 10} 
-                          onChange={(e) => setSocForm({ ...socForm, wings: { ...socForm.wings, [code]: { ...socForm.wings[code], targetDays: parseInt(e.target.value) || 0 } }})} 
-                        />
-                        <button 
-                          className={`px-2 py-1 text-[9px] font-bold rounded ${socForm.wings[code]?.disabled ? 'bg-gray-700 text-gray-400' : 'bg-emerald-500/15 text-emerald-400'}`}
-                          onClick={() => setSocForm({ ...socForm, wings: { ...socForm.wings, [code]: { ...socForm.wings[code], disabled: !socForm.wings[code]?.disabled } }})}
-                        >
-                          {socForm.wings[code]?.disabled ? "DISABLED" : "ENABLED"}
-                        </button>
-                      </div>
-                    ))}
+                <div className="pt-4 border-t border-gray-800">
+                  <div className="flex justify-between items-center mb-2">
+                    <label className="text-[9px] text-gray-500 uppercase">Assigned Raspberry Pis</label>
+                    <button onClick={addDeviceToSociety} className="text-cyan-400 text-[10px] font-bold">+ Add Pi to Society</button>
                   </div>
-                </div>
+                  
+                  {socForm.devices.length === 0 && <p className="text-gray-600 text-xs text-center py-4">No Pis assigned. Click "+ Add Pi to Society".</p>}
 
+                  {socForm.devices.map((dev: any, dIdx: number) => (
+                    <div key={dIdx} className="border border-gray-800 p-4 rounded-lg mb-4 bg-gray-900/50">
+                      <div className="grid grid-cols-3 gap-4 mb-4">
+                        <div>
+                          <label className="text-[9px] text-gray-500 uppercase">Device ID</label>
+                          <select className="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" value={dev.device_id} onChange={(e) => handleDeviceChange(dIdx, 'device_id', e.target.value)}>
+                            <option value="">Select Pi...</option>
+                            {availableDevices.map((d) => <option key={d.id} value={d.id}>{d.name} ({d.id.slice(0,8)}...)</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-[9px] text-gray-500 uppercase">Hardware Profile</label>
+                          <input className="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 focus:outline-none focus:border-cyan-500" value={dev.hardware_profile} onChange={(e) => handleDeviceChange(dIdx, 'hardware_profile', e.target.value)} />
+                        </div>
+                        <div className="flex items-center mt-5">
+                          <input type="checkbox" checked={dev.feedback_hardware_installed} onChange={(e) => handleDeviceChange(dIdx, 'feedback_hardware_installed', e.target.checked)} className="mr-2" />
+                          <label className="text-[10px] text-gray-400">Feedback Hardware Installed</label>
+                        </div>
+                      </div>
+
+                      <label className="text-[9px] text-gray-500 uppercase block mb-2">Slot Configuration (A-D)</label>
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        {SLOTS.map(slot => (
+                          <div key={slot} className="border border-gray-800 p-3 rounded bg-gray-800/30">
+                            <h4 className="font-bold text-cyan-400 mb-2">Slot {slot}</h4>
+                            <input className="w-full px-2 py-1 bg-gray-900 border border-gray-700 rounded text-[10px] text-gray-200 mb-2" placeholder="Display Name" value={dev.slots[slot].display_name} onChange={(e) => handleSlotChange(dIdx, slot, 'display_name', e.target.value)} />
+                            <input type="number" className="w-full px-2 py-1 bg-gray-900 border border-gray-700 rounded text-[10px] text-gray-200 mb-2" placeholder="Target Days" value={dev.slots[slot].target_days} onChange={(e) => handleSlotChange(dIdx, slot, 'target_days', parseInt(e.target.value))} />
+                            <div className="flex items-center mb-1">
+                              <input type="checkbox" checked={dev.slots[slot].disabled} onChange={(e) => handleSlotChange(dIdx, slot, 'disabled', e.target.checked)} className="mr-2" />
+                              <label className="text-[10px] text-gray-400">Disabled</label>
+                            </div>
+                            <div className="flex items-center">
+                              <input type="checkbox" checked={dev.slots[slot].feedback_enabled} onChange={(e) => handleSlotChange(dIdx, slot, 'feedback_enabled', e.target.checked)} className="mr-2" />
+                              <label className="text-[10px] text-gray-400">Feedback Enabled</label>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
               <div className="flex gap-2 mt-5">
-                <button onClick={saveSoc} className="flex-1 py-2 bg-cyan-500 text-black text-xs font-bold rounded hover:bg-cyan-600">Save</button>
+                <button onClick={saveSoc} className="flex-1 py-2 bg-cyan-500 text-black text-xs font-bold rounded hover:bg-cyan-600">Save Society Config</button>
                 <button onClick={() => setShowSocModal(false)} className="flex-1 py-2 border border-gray-700 text-gray-400 text-xs rounded hover:border-gray-500">Cancel</button>
               </div>
             </div>
