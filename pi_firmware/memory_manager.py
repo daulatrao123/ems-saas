@@ -3,7 +3,7 @@ import threading
 from collections import deque
 
 class MemoryManager:
-    """Tracks RAM, Swap, and EMS RSS in RAM with trend detection."""
+    """Tracks RAM, Swap, and EMS RSS in RAM with independent trend detection."""
     def __init__(self):
         self.metrics = {
             "ram_total": 0, "ram_used": 0, "swap_total": 0, "swap_used": 0,
@@ -15,6 +15,7 @@ class MemoryManager:
         self.rss_history = deque(maxlen=144)
         self.vms_history = deque(maxlen=144)
         self.fd_history = deque(maxlen=144)
+        self.thread_history = deque(maxlen=144)
         self.lock = threading.Lock()
 
     def update_metrics(self):
@@ -51,27 +52,38 @@ class MemoryManager:
             self.rss_history.append(self.metrics["ems_rss"])
             self.vms_history.append(self.metrics["ems_vms"])
             self.fd_history.append(self.metrics["ems_fds"])
+            self.thread_history.append(self.metrics["ems_threads"])
             
-            # Industrial Memory Leak Detection (Sustained Trends)
-            if len(self.rss_history) >= 100:
-                # Simple slope calculation: compare recent quarter to oldest quarter
+            # 1. Immediate OOM Detection (Do not wait for history samples)
+            if self.metrics["oom_kills"] > 0:
+                self.metrics["memory_state"] = "OOM_DETECTED"
+            # 2. Immediate Swap Pressure
+            elif self.metrics["swap_used"] > 10000: # > 10MB swap used
+                self.metrics["memory_state"] = "SWAP_ACTIVE"
+            # 3. Independent Trend Leak Detection (Requires 100 samples / ~10 hours)
+            elif len(self.rss_history) >= 100:
+                leak_detected = False
+                
+                # Check RSS trend independently
                 old_rss = list(self.rss_history)[:25]
                 recent_rss = list(self.rss_history)[-25:]
-                avg_old = sum(old_rss) / len(old_rss)
-                avg_recent = sum(recent_rss) / len(recent_rss)
-                
+                if sum(recent_rss)/len(recent_rss) > sum(old_rss)/len(old_rss) * 1.2:
+                    leak_detected = True
+                    
+                # Check FD trend independently
                 old_fds = list(self.fd_history)[:25]
                 recent_fds = list(self.fd_history)[-25:]
-                avg_old_fds = sum(old_fds) / len(old_fds)
-                avg_recent_fds = sum(recent_fds) / len(recent_fds)
+                if sum(recent_fds)/len(recent_fds) > sum(old_fds)/len(old_fds) * 1.1:
+                    leak_detected = True
+                    
+                # Check Thread trend independently
+                old_threads = list(self.thread_history)[:25]
+                recent_threads = list(self.thread_history)[-25:]
+                if sum(recent_threads)/len(recent_threads) > sum(old_threads)/len(old_threads) * 1.1:
+                    leak_detected = True
 
-                # Require sustained monotonic growth ( > 20% over 10 hours)
-                if avg_recent > avg_old * 1.2 and avg_recent_fds > avg_old_fds * 1.1:
+                if leak_detected:
                     self.metrics["memory_state"] = "MEMORY_LEAK_SUSPECTED"
-                elif self.metrics["swap_used"] > 10000: # > 10MB swap used
-                    self.metrics["memory_state"] = "SWAP_ACTIVE"
-                elif self.metrics["oom_kills"] > 0:
-                    self.metrics["memory_state"] = "OOM_DETECTED"
                 else:
                     self.metrics["memory_state"] = "MEMORY_NORMAL"
 

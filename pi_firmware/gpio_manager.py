@@ -56,19 +56,23 @@ class GPIOManager:
         return VerificationState.PENDING
 
     def reconcile_hardware_state(self):
+        """STRICT HARDWARE TRUTH: Scan all 4 channels explicitly. Do not infer OFF from missing active_slot."""
         self.state_manager.system_state = SystemState.HARDWARE_RECONCILIATION
-        logger.info("Starting Hardware Reconciliation...")
+        logger.info("Starting Strict Hardware Reconciliation...")
         active_relays = []
         active_feedbacks = []
 
         for slot in self.profile["slots"]:
             is_fb_enabled = self._is_feedback_enabled(slot)
+            
+            # 1. Read physical relay GPIO
             if self.relays[slot].is_active:
                 active_relays.append(slot)
                 self.state_manager.set_gpio_output(slot, GpioOutputState.ON)
             else:
                 self.state_manager.set_gpio_output(slot, GpioOutputState.OFF)
                 
+            # 2. Read physical feedback
             if is_fb_enabled:
                 if self._read_feedback_raw(slot):
                     active_feedbacks.append(slot)
@@ -78,11 +82,13 @@ class GPIOManager:
             else:
                 self.state_manager.set_feedback(slot, FeedbackState.UNKNOWN)
 
+        # 3. Interlock Fault Detection
         if len(active_relays) > 1 or len(active_feedbacks) > 1:
             logger.critical("CRITICAL FAULT: MULTIPLE CONTACTORS DETECTED ON!")
             self.state_manager.system_state = SystemState.FAULT
             return False
             
+        # 4. Reconcile Active Slot strictly from Hardware
         if len(active_feedbacks) == 1:
             slot = active_feedbacks[0]
             self.state_manager.active_slot = slot
@@ -100,6 +106,7 @@ class GPIOManager:
                 self.state_manager.set_commanded(slot, CommandedState.ON, immediate=True)
                 self.state_manager.set_verification(slot, VerificationState.GPIO_CONFIRMED, immediate=True)
         else:
+            # Explicitly verify ALL slots are OFF
             for slot in self.profile["slots"]:
                 self.state_manager.set_commanded(slot, CommandedState.OFF)
                 self.state_manager.set_verification(slot, VerificationState.VERIFIED_OFF if self._is_feedback_enabled(slot) else VerificationState.NOT_CONFIGURED)
