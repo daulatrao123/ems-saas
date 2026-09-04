@@ -1,35 +1,29 @@
-# pi_firmware/config.py
-import json, os
+import json
+import os
 
-class Config:
-    def __init__(self, path="/etc/ems/config.json"):
-        self.path = path
-        with open(path) as f:
-            data = json.load(f)
-            
-        self.deviceId = data["deviceId"]
-        self.apiKey = data["apiKey"]
-        self.backendUrl = data["backendUrl"].rstrip("/")
-        self.firmwareVersion = data.get("firmwareVersion", "6.0.0-pi")
-        self.syncIntervalSec = int(data.get("syncIntervalSec", 60))
-        self.pendingCommandIntervalSec = int(data.get("pendingCommandIntervalSec", 5))
-        self.statePersistIntervalSec = int(data.get("statePersistIntervalSec", 300))
-        self.resetDayDefault = int(data.get("resetDayDefault", 15))
-        self.timezone = data.get("timezone", "Asia/Kolkata")
-        self.serviceName = data.get("serviceName", "ems-controller.service")
-        self.stateFile = data.get("stateFile", "/var/lib/ems/state.json")
-        self.offlineDbPath = data.get("offlineDbPath", "/var/lib/ems/offline.db")
-        
-        # PRODUCTION v6.0: 4-Slot Hardware Profile (A, B, C, D)
-        # TODO: VERIFY AND UPDATE GPIO PINS FOR C AND D TO MATCH YOUR PHYSICAL WIRING
-        self.slots = {
-            "A": {"relay": 17, "toggle": 5},
-            "B": {"relay": 27, "toggle": 6},
-            "C": {"relay": 24, "toggle": 25}, # Example pins - UPDATE THESE
-            "D": {"relay": 22, "toggle": 12}  # Example pins - UPDATE THESE
-        }
-        self.lcd = data.get("lcd", {"i2cBus": 1, "address": "0x27", "cols": 16, "rows": 2})
+# --- Hardware Profiles ---
+# Never let the web UI define GPIO pins. They are fixed to the hardware version.
+HARDWARE_PROFILES = {
+    "EMS-4CH-v1": {
+        "slots": ["A", "B", "C", "D"],
+        "relay_gpio": {"A": 17, "B": 27, "C": 22, "D": 23},
+        "feedback_gpio": {"A": 5, "B": 6, "C": 13, "D": 19},
+        "feedback_capable": True
+    }
+}
 
-    @property
-    def slot_codes(self):
-        return list(self.slots.keys())
+# --- Timing Constants (Critical for Industrial Reliability) ---
+FEEDBACK_TIMEOUT_MS = 2000       # Max time to wait for contactor to close/open
+FEEDBACK_DEBOUNCE_MS = 50        # Ignore contact bounce shorter than this
+INTERLOCK_DELAY_MS = 500         # Break-before-make delay to prevent cross-connection
+LOCAL_MONITOR_INTERVAL_S = 2.0   # Fast local fault checking (does not hit backend)
+SYNC_INTERVAL_S = 60.0           # Normal backend sync interval
+
+# --- Persistence ---
+STATE_FILE = os.path.join(os.path.dirname(__file__), 'pi_state.json')
+
+def get_hardware_profile(profile_name: str = "EMS-4CH-v1") -> dict:
+    profile = HARDWARE_PROFILES.get(profile_name)
+    if not profile:
+        raise ValueError(f"Unknown hardware profile: {profile_name}")
+    return profile
