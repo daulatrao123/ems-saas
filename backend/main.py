@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v6.2.2 — Industrial Production (Strict Multi-Pi & 4-Slot Contract)
+EMS SaaS Backend v6.2.3 — Industrial Production (Strict Multi-Pi & 4-Slot Contract)
 """
 
 import os
@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.2.2-prod")
+app = FastAPI(title="EMS SaaS API", version="6.2.3-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -97,7 +97,7 @@ def ensure_db_schema():
                 );
             """)
             
-            # PRODUCTION v6.2.2: Bulletproof Migration
+            # PRODUCTION v6.2.3: Bulletproof Migration
             cur.execute("""
                 DO $$ BEGIN
                     -- 1. Handle slot_configs collision
@@ -109,7 +109,6 @@ def ensure_db_schema():
                         END IF;
                     END IF;
                     
-                    -- Handle v6.1 old tables just in case
                     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs_old') THEN
                         IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
                             ALTER TABLE wing_configs_old RENAME TO slot_configs;
@@ -250,7 +249,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v6.2.2 Strict Slot Migration)")
+        print("DB schema verified OK (Relational v6.2.3 Strict Slot Migration)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -603,7 +602,11 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                     s_name = slot_data.get("display_name", f"Slot {slot_code}")
                     s_disabled = bool(slot_data.get("disabled", True))
                     s_target = int(slot_data.get("target_days", 0))
-                    s_feedback = bool(slot_data.get("feedback_enabled", False))
+                    
+                    # RED 12 Fix: Enforce hardware consistency
+                    dev_has_feedback_hw = bool(dev.get("feedback_hardware_installed", False))
+                    s_feedback_requested = bool(slot_data.get("feedback_enabled", False))
+                    s_feedback = s_feedback_requested and dev_has_feedback_hw
                     
                     cur.execute("""INSERT INTO slot_configs (device_id, slot, display_name, target_days, disabled, feedback_enabled) 
                                    VALUES (%s, %s, %s, %s, %s, %s) 
