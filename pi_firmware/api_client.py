@@ -35,10 +35,15 @@ class ApiClient:
         except Exception:
             return False
 
-    def push_ack(self, command_id: str, status: str, verification: str) -> bool:
+    def push_ack(self, command_id: str, status: str, verification: str, error: str = None) -> bool:
         try:
-            # FIX: Aligned exactly with backend's expected /api/pi/command-ack endpoint
-            payload = {"command_id": command_id, "status": status, "verification_state": verification}
+            # Unified strict contract
+            payload = {
+                "command_id": command_id, 
+                "status": status, 
+                "verification_state": verification,
+                "error": error
+            }
             r = requests.post(f"{self.base_url}/pi/command-ack", json=payload, headers=self.headers, timeout=10)
             return r.status_code == 200
         except Exception:

@@ -35,7 +35,6 @@ class GPIOManager:
         self.monitor_thread.start()
 
     def _is_feedback_enabled(self, slot: str) -> bool:
-        # Authoritative internal check
         return self.device_config.get("slots", {}).get(slot, {}).get("feedback_enabled", False)
 
     def _read_feedback_raw(self, slot: str) -> bool:
@@ -159,6 +158,39 @@ class GPIOManager:
                     self.state_manager.set_commanded(target_slot, CommandedState.OFF)
                     self.state_manager.system_state = SystemState.FAULT
                     return False
+                time.sleep(0.05)
+
+    def deactivate_slot(self, target_slot: str) -> bool:
+        with self._lock:
+            if self.state_manager.system_state == SystemState.FAULT: return False
+            is_fb_enabled = self._is_feedback_enabled(target_slot)
+            
+            self.relays[target_slot].off()
+            self.state_manager.set_gpio_output(target_slot, GpioOutputState.OFF)
+            self.state_manager.set_commanded(target_slot, CommandedState.OFF)
+            
+            start_time = time.time()
+            while True:
+                if is_fb_enabled:
+                    v_state = self.verify_slot(target_slot, CommandedState.OFF)
+                    if v_state == VerificationState.VERIFIED_OFF:
+                        if self.state_manager.active_slot == target_slot:
+                            self.state_manager.active_slot = None
+                        self.state_manager.set_verification(target_slot, VerificationState.VERIFIED_OFF, immediate=True)
+                        return True
+                    if v_state == VerificationState.MISMATCH_OFF_ON:
+                        logger.critical(f"Slot {target_slot} WELDED! Failed to open during DEACTIVATE.")
+                        self.state_manager.system_state = SystemState.FAULT
+                        return False
+                    if (time.time() - start_time) * 1000 > FEEDBACK_TIMEOUT_MS:
+                        logger.error(f"Slot {target_slot} deactivate timeout.")
+                        self.state_manager.system_state = SystemState.FAULT
+                        return False
+                else:
+                    if self.state_manager.active_slot == target_slot:
+                        self.state_manager.active_slot = None
+                    self.state_manager.set_verification(target_slot, VerificationState.GPIO_CONFIRMED, immediate=True)
+                    return True
                 time.sleep(0.05)
 
     def _local_monitor_loop(self):

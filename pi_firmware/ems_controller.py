@@ -1,7 +1,7 @@
 import time
 import threading
 from config import SYNC_INTERVAL_S
-from state import PiStateManager, SystemState, VerificationState, CommandedState
+from state import PiStateManager, SystemState, VerificationState, CommandedState, GpioOutputState
 from gpio_manager import GPIOManager
 from api_client import ApiClient
 from offline_queue import OfflineQueue
@@ -24,12 +24,13 @@ class EmsController:
         if config.get("device_id") != self.api.device_id: return False
         if config.get("hardware_profile") not in ["EMS-4CH-v1"]: return False
         if set(config.get("slots", {}).keys()) != {"A", "B", "C", "D"}: return False
+        if not config.get("config_version"): return False
         
         for slot, cfg in config.get("slots", {}).items():
-            if "feedback_enabled" not in cfg: return False
-            if "display_name" not in cfg: return False
-            if "target_days" not in cfg: return False
-            
+            if not isinstance(cfg.get("feedback_enabled"), bool): return False
+            if not isinstance(cfg.get("display_name"), str) or not (1 <= len(cfg["display_name"]) <= 50): return False
+            if not isinstance(cfg.get("target_days"), int) or not (0 <= cfg["target_days"] <= 365): return False
+            if not isinstance(cfg.get("disabled"), bool): return False
         return True
 
     def run_boot_sequence(self):
@@ -59,25 +60,28 @@ class EmsController:
             logger.critical("System State: FAULT (Hardware Mismatch)")
             return False
             
-        # Reboot Recovery for Interrupted Commands
+        # Reboot Recovery for Interrupted Commands (Hardware Truth)
         interrupted = self.queue.get_interrupted()
         for cmd_id, slot, action in interrupted:
             logger.warning(f"Command {cmd_id} was interrupted by reboot. Marking UNKNOWN_AFTER_REBOOT.")
             self.queue.update_status(cmd_id, "UNKNOWN_AFTER_REBOOT")
             
-            # Reconcile against hardware truth
-            current_active = self.state_manager.active_slot
-            target_state = CommandedState.ON if action == "ACTIVATE" else CommandedState.OFF
+            # Reconcile against hardware truth (already read by gpio_manager)
+            slot_state = self.state_manager.slots[slot]
+            is_off = slot_state.gpio_output_state == GpioOutputState.OFF
             
-            if (action == "ACTIVATE" and current_active == slot) or \
-               (action == "DEACTIVATE" and current_active != slot):
-                # The command effectively succeeded before the crash
-                verif = self.state_manager.slots[slot].verification_state.value
-                self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", verif)
-                self.queue.update_status(cmd_id, "COMPLETED", verif)
-            else:
-                # The command failed before the crash
-                self.queue.update_status(cmd_id, "FAILED", "MISMATCH_AFTER_REBOOT")
+            if action == "ACTIVATE":
+                if slot_state.commanded_state == CommandedState.ON and slot_state.verification_state in [VerificationState.VERIFIED_ON, VerificationState.GPIO_CONFIRMED]:
+                    self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", slot_state.verification_state.value)
+                    self.queue.update_status(cmd_id, "COMPLETED", slot_state.verification_state.value)
+                else:
+                    self.queue.update_status(cmd_id, "FAILED", "MISMATCH_AFTER_REBOOT")
+            elif action == "DEACTIVATE":
+                if is_off and slot_state.verification_state in [VerificationState.VERIFIED_OFF, VerificationState.GPIO_CONFIRMED, VerificationState.NOT_CONFIGURED]:
+                    self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", slot_state.verification_state.value)
+                    self.queue.update_status(cmd_id, "COMPLETED", slot_state.verification_state.value)
+                else:
+                    self.queue.update_status(cmd_id, "FAILED", "MISMATCH_AFTER_REBOOT")
                 
         logger.info("System State: READY")
         return True
@@ -91,24 +95,25 @@ class EmsController:
         
         success = False
         verification = VerificationState.NOT_CONFIGURED
+        error_msg = None
         
-        if action == "ACTIVATE":
-            success = self.gpio_manager.transition_slot(target_slot)
-            if success: verification = VerificationState.VERIFIED_ON if self.gpio_manager._is_feedback_enabled(target_slot) else VerificationState.GPIO_CONFIRMED
-        elif action == "DEACTIVATE":
-            if self.state_manager.active_slot == target_slot:
-                success = self.gpio_manager.transition_slot(target_slot) # Assuming transition handles off-path safely
-                verification = VerificationState.VERIFIED_OFF if self.gpio_manager._is_feedback_enabled(target_slot) else VerificationState.GPIO_CONFIRMED
-            else:
-                success = True
-                verification = VerificationState.VERIFIED_OFF
+        try:
+            if action == "ACTIVATE":
+                success = self.gpio_manager.transition_slot(target_slot)
+                if success: verification = VerificationState.VERIFIED_ON if self.gpio_manager._is_feedback_enabled(target_slot) else VerificationState.GPIO_CONFIRMED
+            elif action == "DEACTIVATE":
+                success = self.gpio_manager.deactivate_slot(target_slot)
+                if success: verification = VerificationState.VERIFIED_OFF if self.gpio_manager._is_feedback_enabled(target_slot) else VerificationState.GPIO_CONFIRMED
+        except Exception as e:
+            error_msg = str(e)
+            logger.critical(f"Command {cmd_id} execution failed: {e}")
                 
         if success:
-            # Exact Industrial Lifecycle: HARDWARE_VERIFIED -> COMPLETED
             self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", verification.value)
             self.queue.update_status(cmd_id, "COMPLETED", verification.value)
         else:
-            self.queue.update_status(cmd_id, "FAILED", verification.value)
+            if not error_msg: error_msg = "Transition failed"
+            self.queue.update_status(cmd_id, "FAILED", verification.value, error_msg)
             
         self.state_manager.system_state = SystemState.READY
 

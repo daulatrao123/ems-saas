@@ -38,11 +38,18 @@ class StorageManager:
                 
             # Read-only / I/O test
             test_file = os.path.join(DATA_DIR, ".health_test")
-            with open(test_file, 'w') as f: f.write("ok")
-            os.remove(test_file)
-                
+            try:
+                with open(test_file, 'w') as f: f.write("ok")
+                os.remove(test_file)
+            except OSError as e:
+                if e.errno == 30: # Read-only filesystem
+                    logger.critical("Storage CRITICAL: Filesystem is READ-ONLY.")
+                    self.storage_ok = False
+                else:
+                    raise
+                    
         except Exception as e:
-            logger.critical(f"Storage health check failed (USB unmounted/read-only?): {e}")
+            logger.critical(f"Storage health check failed (USB unmounted?): {e}")
             self.storage_ok = False
 
     def cleanup_logs(self, aggressive=False, emergency=False):
@@ -51,14 +58,12 @@ class StorageManager:
             files.sort(key=lambda x: os.path.getmtime(os.path.join(LOG_DIR, x)))
             
             if emergency:
-                # Keep only critical.log, wipe all app logs
                 for f in files:
                     if 'critical' not in f:
                         os.remove(os.path.join(LOG_DIR, f))
                 logger.info("Emergency log cleanup executed.")
                 return
                 
-            # Retention by age (7 days) or count (5 files)
             now = time.time()
             for f in files:
                 filepath = os.path.join(LOG_DIR, f)
@@ -68,6 +73,5 @@ class StorageManager:
                 if file_age > (7 * 86400) or (aggressive and len(files) > 2):
                     os.remove(filepath)
                     logger.info(f"Cleaned up log file: {f}")
-                    # Do not break; clean up all eligible files in aggressive mode
         except Exception as e:
             logger.error(f"Log cleanup failed: {e}")
