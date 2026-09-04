@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v6.2.1 — Industrial Production (Strict Multi-Pi & 4-Slot Contract)
+EMS SaaS Backend v6.2.2 — Industrial Production (Strict Multi-Pi & 4-Slot Contract)
 """
 
 import os
@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.2.1-prod")
+app = FastAPI(title="EMS SaaS API", version="6.2.2-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -97,37 +97,64 @@ def ensure_db_schema():
                 );
             """)
             
-            # PRODUCTION v6.2: Safe Rename of legacy wing_* tables and columns
+            # PRODUCTION v6.2.2: Bulletproof Migration
             cur.execute("""
                 DO $$ BEGIN
-                    -- 1. Rename tables if they exist
+                    -- 1. Handle slot_configs collision
                     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs') THEN
-                        ALTER TABLE wing_configs RENAME TO slot_configs;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
+                            ALTER TABLE wing_configs RENAME TO slot_configs;
+                        ELSE
+                            ALTER TABLE wing_configs RENAME TO wing_configs_abandoned;
+                        END IF;
                     END IF;
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state') THEN
-                        ALTER TABLE wing_state RENAME TO slot_state;
+                    
+                    -- Handle v6.1 old tables just in case
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs_old') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
+                            ALTER TABLE wing_configs_old RENAME TO slot_configs;
+                        ELSE
+                            ALTER TABLE wing_configs_old RENAME TO wing_configs_old_abandoned;
+                        END IF;
                     END IF;
 
-                    -- 2. Normalize column names to 'slot' in slot_configs
+                    -- 2. Handle slot_state collision
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
+                            ALTER TABLE wing_state RENAME TO slot_state;
+                        ELSE
+                            ALTER TABLE wing_state RENAME TO wing_state_abandoned;
+                        END IF;
+                    END IF;
+                    
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state_old') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
+                            ALTER TABLE wing_state_old RENAME TO slot_state;
+                        ELSE
+                            ALTER TABLE wing_state_old RENAME TO wing_state_old_abandoned;
+                        END IF;
+                    END IF;
+
+                    -- 3. Normalize column names to 'slot' in slot_configs
                     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='wing_code') THEN
                         ALTER TABLE slot_configs RENAME COLUMN wing_code TO slot;
                     ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='slot_code') THEN
                         ALTER TABLE slot_configs RENAME COLUMN slot_code TO slot;
                     END IF;
 
-                    -- 3. Normalize column names to 'slot' in slot_state
+                    -- 4. Normalize column names to 'slot' in slot_state
                     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='wing_code') THEN
                         ALTER TABLE slot_state RENAME COLUMN wing_code TO slot;
                     ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='slot_code') THEN
                         ALTER TABLE slot_state RENAME COLUMN slot_code TO slot;
                     END IF;
 
-                    -- 4. Normalize column names in pi_commands
+                    -- 5. Normalize column names in pi_commands
                     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
                         ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
                     END IF;
 
-                    -- 5. Normalize column names in pi_state
+                    -- 6. Normalize column names in pi_state
                     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
                         ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
                     END IF;
@@ -223,7 +250,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v6.2.1 Strict Slot Migration)")
+        print("DB schema verified OK (Relational v6.2.2 Strict Slot Migration)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
