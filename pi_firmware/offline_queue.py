@@ -3,7 +3,7 @@ from datetime import datetime
 from config import DB_FILE, SQLITE_BUSY_TIMEOUT_MS
 from logger import logger
 
-# Valid state transitions
+# Strict State Machine Definition
 VALID_TRANSITIONS = {
     "DELIVERED": ["EXECUTING", "EXPIRED"],
     "EXECUTING": ["HARDWARE_VERIFIED", "FAILED", "UNKNOWN_AFTER_REBOOT"],
@@ -15,7 +15,8 @@ VALID_TRANSITIONS = {
 }
 
 class OfflineQueue:
-    def __init__(self):
+    def __init__(self, storage_manager):
+        self.storage = storage_manager
         self.conn = sqlite3.connect(DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, check_same_thread=False)
         
         # Industrial Flash Optimization
@@ -33,6 +34,7 @@ class OfflineQueue:
         self.conn.commit()
 
     def add_command(self, cmd_id, slot, action, created_at, expires_at):
+        if not self.storage.is_write_allowed("queue_db"): return
         try:
             ts = datetime.utcnow().isoformat()
             self.conn.execute("""INSERT INTO commands 
@@ -40,8 +42,7 @@ class OfflineQueue:
                 VALUES (?, ?, ?, 'DELIVERED', ?, ?, ?)""",
                 (cmd_id, slot, action, created_at, ts, expires_at))
             self.conn.commit()
-            # Approximate DB write attribution
-            if hasattr(self, '_storage_mgr'): self._storage_mgr.io_meter.record_ems_write("queue_db", 512)
+            self.storage.io_meter.record_ems_write("queue_db", 512)
         except sqlite3.IntegrityError: pass
 
     def get_next(self):
@@ -53,6 +54,8 @@ class OfflineQueue:
         return cur.fetchall()
 
     def update_status(self, cmd_id, status, verification=None, error=None):
+        if not self.storage.is_write_allowed("queue_db"): return
+        
         # Enforce State Machine
         cur = self.conn.execute("SELECT status FROM commands WHERE id=?", (cmd_id,))
         row = cur.fetchone()
@@ -76,19 +79,21 @@ class OfflineQueue:
             self.conn.execute("""UPDATE commands SET status=?, hardware_verification=?, last_error=? WHERE id=?""",
                                (status, verification, error, cmd_id))
         self.conn.commit()
-        if hasattr(self, '_storage_mgr'): self._storage_mgr.io_meter.record_ems_write("queue_db", 512)
+        self.storage.io_meter.record_ems_write("queue_db", 512)
 
     def mark_acked(self, cmd_id):
+        if not self.storage.is_write_allowed("queue_db"): return
         ts = datetime.utcnow().isoformat()
         self.conn.execute("UPDATE commands SET ack_status='ACKED', acked_at=? WHERE id=?", (ts, cmd_id))
         self.conn.commit()
-        if hasattr(self, '_storage_mgr'): self._storage_mgr.io_meter.record_ems_write("queue_db", 256)
+        self.storage.io_meter.record_ems_write("queue_db", 256)
 
     def get_unacked(self):
         cur = self.conn.execute("SELECT id, status, hardware_verification FROM commands WHERE ack_status='PENDING' AND status IN ('COMPLETED', 'FAILED', 'EXPIRED')")
         return cur.fetchall()
 
     def cleanup_acked(self):
+        if not self.storage.is_write_allowed("queue_db"): return
         # Strict bounded queue: Keep max 500 records to prevent database bloat
         self.conn.execute("DELETE FROM commands WHERE ack_status='ACKED' LIMIT 100")
         
@@ -100,3 +105,4 @@ class OfflineQueue:
             )""", (count - 500,))
             
         self.conn.commit()
+        self.storage.io_meter.record_ems_write("queue_db", 1024)

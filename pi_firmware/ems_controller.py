@@ -13,10 +13,10 @@ class EmsController:
     def __init__(self):
         logger.info("Initializing EMS Controller...")
         self.storage = StorageManager()
-        logger_module.set_storage_manager(self.storage) # Allow logger to check write budget
+        logger_module.set_storage_manager(self.storage) # Allow logger to check ResourceGuard
         
         self.state_manager = PiStateManager(self.storage)
-        self.queue = OfflineQueue()
+        self.queue = OfflineQueue(self.storage)
         self.api = ApiClient()
         self.device_config = {}
         self.gpio_manager = None
@@ -47,12 +47,11 @@ class EmsController:
         self.state_manager.system_state = SystemState.BOOT
         self.state_manager.system_state = SystemState.SELF_TEST
         
-        self.storage.check_health()
-        if not self.storage.storage_ok:
-            logger.critical("Self-test failed: Storage unavailable.")
-            self.state_manager.system_state = SystemState.FAULT
-            return False
-            
+        self.storage.guard.evaluate_state()
+        if self.storage.guard.state == "STORAGE_FAILED":
+            logger.critical("Self-test failed: Storage unavailable. Entering RAM-ONLY DEGRADED MODE.")
+            # Control continues, but no persistent logs/state until recovered
+        
         logger.info("Fetching cloud configuration...")
         self.device_config = self.api.get_config()
         

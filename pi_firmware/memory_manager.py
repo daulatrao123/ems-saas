@@ -11,8 +11,10 @@ class MemoryManager:
             "ems_vms": 0, "ems_threads": 0, "ems_fds": 0,
             "memory_state": "MEMORY_NORMAL"
         }
-        # Store 24 hours of RSS history (144 samples @ 10 min interval)
+        # Store 24 hours of history (144 samples @ 10 min interval)
         self.rss_history = deque(maxlen=144)
+        self.vms_history = deque(maxlen=144)
+        self.fd_history = deque(maxlen=144)
         self.lock = threading.Lock()
 
     def update_metrics(self):
@@ -42,19 +44,29 @@ class MemoryManager:
                         elif line.startswith("VmSize:"): self.metrics["ems_vms"] = int(line.split()[1])
                         elif line.startswith("Threads:"): self.metrics["ems_threads"] = int(line.split()[1])
                 
-                # Count FDs
                 self.metrics["ems_fds"] = len(os.listdir(f"/proc/{pid}/fd"))
             except: pass
 
-            # Memory Leak Detection (Simple linear trend)
+            # Track trends
             self.rss_history.append(self.metrics["ems_rss"])
+            self.vms_history.append(self.metrics["ems_vms"])
+            self.fd_history.append(self.metrics["ems_fds"])
+            
+            # Industrial Memory Leak Detection (Sustained Trends)
             if len(self.rss_history) >= 100:
-                older_half = list(self.rss_history)[:50]
-                recent_half = list(self.rss_history)[50:]
-                avg_older = sum(older_half) / len(older_half)
-                avg_recent = sum(recent_half) / len(recent_half)
+                # Simple slope calculation: compare recent quarter to oldest quarter
+                old_rss = list(self.rss_history)[:25]
+                recent_rss = list(self.rss_history)[-25:]
+                avg_old = sum(old_rss) / len(old_rss)
+                avg_recent = sum(recent_rss) / len(recent_rss)
                 
-                if avg_recent > avg_older * 1.5: # 50% growth over 10 hours
+                old_fds = list(self.fd_history)[:25]
+                recent_fds = list(self.fd_history)[-25:]
+                avg_old_fds = sum(old_fds) / len(old_fds)
+                avg_recent_fds = sum(recent_fds) / len(recent_fds)
+
+                # Require sustained monotonic growth ( > 20% over 10 hours)
+                if avg_recent > avg_old * 1.2 and avg_recent_fds > avg_old_fds * 1.1:
                     self.metrics["memory_state"] = "MEMORY_LEAK_SUSPECTED"
                 elif self.metrics["swap_used"] > 10000: # > 10MB swap used
                     self.metrics["memory_state"] = "SWAP_ACTIVE"

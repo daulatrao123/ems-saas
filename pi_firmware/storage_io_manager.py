@@ -11,7 +11,7 @@ class StorageIOMeter:
     def __init__(self):
         self.device = self._get_device_name(DATA_DIR)
         self.device_serial = self._get_device_serial()
-        self.state_file = os.path.join(TELEMETRY_DIR, "io_baseline.json")
+        self.epoch_file = os.path.join(TELEMETRY_DIR, "storage_epoch.json")
         self.lifetime_file = os.path.join(TELEMETRY_DIR, "lifetime_counters.json")
         
         self.lock = threading.Lock()
@@ -30,6 +30,9 @@ class StorageIOMeter:
             
             if self.device_serial != self.state.get("device_serial") and self.state.get("device_serial"):
                 logger.critical("STORAGE_DEVICE_CHANGED: USB drive replaced! Starting new endurance epoch.")
+                # Archive old lifetime state and reset
+                self.lifetime_state = {"lifetime_logical_writes": 0, "lifetime_physical_writes": 0, "lifetime_physical_reads": 0}
+                self._save_lifetime_state()
                 
             self.state = {
                 "date": today,
@@ -70,9 +73,9 @@ class StorageIOMeter:
         except: return (0, 0)
 
     def _load_state(self):
-        if os.path.exists(self.state_file):
+        if os.path.exists(self.epoch_file):
             try:
-                with open(self.state_file, 'r') as f: return json.load(f)
+                with open(self.epoch_file, 'r') as f: return json.load(f)
             except: pass
         return {}
 
@@ -85,7 +88,7 @@ class StorageIOMeter:
 
     def _save_state(self):
         try:
-            with open(self.state_file, 'w') as f: json.dump(self.state, f)
+            with open(self.epoch_file, 'w') as f: json.dump(self.state, f)
         except: pass
 
     def _save_lifetime_state(self):
@@ -100,13 +103,17 @@ class StorageIOMeter:
                 category = "other"
             self.state["logical_writes"][category] += bytes_written
 
-    def get_sqlite_wal_size(self):
-        """Measure SQLite WAL contribution to account for DB write amplification."""
-        wal_file = os.path.join(TELEMETRY_DIR, "..", "queue", "ems_queue.sqlite-wal")
+    def get_sqlite_stats(self):
+        """Measure SQLite DB and WAL contribution."""
+        db_file = os.path.join(DATA_DIR, "queue", "ems_queue.sqlite")
+        wal_file = db_file + "-wal"
+        db_size = 0
+        wal_size = 0
         try:
-            return os.path.getsize(wal_file)
-        except OSError:
-            return 0
+            if os.path.exists(db_file): db_size = os.path.getsize(db_file)
+            if os.path.exists(wal_file): wal_size = os.path.getsize(wal_file)
+        except: pass
+        return {"db_size": db_size, "wal_size": wal_size}
 
     def update_metrics(self):
         with self.lock:
@@ -146,7 +153,20 @@ class StorageIOMeter:
             logical_writes_dict = self.state.get("logical_writes", {})
             logical_writes = sum(logical_writes_dict.values())
             
-            waf = (phys_writes / logical_writes) if logical_writes > 0 else 0
+            # Calculate System WAF vs EMS WAF
+            system_waf = (phys_writes / logical_writes) if logical_writes > 0 else 0
+            
+            # Capacity check
+            used_percent = 0
+            storage_ok = True
+            try:
+                stat = os.statvfs(DATA_DIR)
+                total = stat.f_blocks * stat.f_frsize
+                free = stat.f_bavail * stat.f_frsize
+                used_percent = ((total - free) / total) * 100 if total > 0 else 100
+            except:
+                storage_ok = False
+                
             budget_exceeded = phys_writes > TOTAL_DAILY_PHYSICAL_BUDGET_BYTES
             
             return {
@@ -154,9 +174,11 @@ class StorageIOMeter:
                 "daily_logical_breakdown": logical_writes_dict,
                 "daily_physical_writes": phys_writes,
                 "daily_physical_reads": phys_reads,
-                "sqlite_wal_size": self.get_sqlite_wal_size(),
-                "waf": round(waf, 2),
+                "sqlite_stats": self.get_sqlite_stats(),
+                "system_waf": round(system_waf, 2),
                 "budget_exceeded": budget_exceeded,
+                "used_percent": used_percent,
+                "storage_ok": storage_ok,
                 "lifetime_logical_writes": self.lifetime_state["lifetime_logical_writes"] + logical_writes,
                 "lifetime_physical_writes": self.lifetime_state["lifetime_physical_writes"] + phys_writes,
                 "device_serial": self.device_serial

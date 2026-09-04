@@ -49,7 +49,7 @@ class DailyBudgetHandler(logging.Handler):
     def emit(self, record):
         self._rotate_if_new_day()
         
-        # Check storage policy
+        # Check Resource Guard Policy
         if _storage_mgr and not _storage_mgr.is_write_allowed(self.category):
             return
             

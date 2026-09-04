@@ -5,7 +5,6 @@ from enum import Enum
 from datetime import datetime
 from config import STATE_FILE, BACKUP_STATE_FILE, STATE_VERSION
 from logger import logger
-from storage_manager import StorageManager
 
 class CommandedState(str, Enum):
     ON = "ON"; OFF = "OFF"; UNKNOWN = "UNKNOWN"
@@ -60,7 +59,7 @@ class SlotState:
             return False
 
 class PiStateManager:
-    def __init__(self, storage_manager: StorageManager):
+    def __init__(self, storage_manager):
         self.system_state = SystemState.BOOT
         self.active_slot = None
         self.slots = {code: SlotState(code) for code in ["A", "B", "C", "D"]}
@@ -92,6 +91,9 @@ class PiStateManager:
 
     def _flush_to_disk(self):
         """Atomic write with fsync. Called ONLY on critical events."""
+        if not self.storage.is_write_allowed("state"):
+            return # RAM-only mode if storage failed
+            
         with self._save_lock:
             data = {
                 "version": STATE_VERSION,
@@ -113,7 +115,7 @@ class PiStateManager:
                 finally: os.close(dir_fd)
 
                 # Track I/O for endurance budget
-                self.storage.io_meter.record_ems_write(len(json.dumps(data)))
+                self.storage.io_meter.record_ems_write("state", len(json.dumps(data)))
             except Exception as e:
                 logger.critical(f"CRITICAL: State save failed: {e}")
 
