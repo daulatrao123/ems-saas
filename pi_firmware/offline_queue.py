@@ -6,7 +6,13 @@ from logger import logger
 class OfflineQueue:
     def __init__(self):
         self.conn = sqlite3.connect(DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, check_same_thread=False)
+        
+        # Industrial Flash Optimization: WAL mode + NORMAL sync is safe and reduces write amplification
         self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;") 
+        self.conn.execute("PRAGMA temp_store=MEMORY;")
+        self.conn.execute("PRAGMA wal_autocheckpoint=1000;")
+        
         self.conn.execute("""CREATE TABLE IF NOT EXISTS commands (
             id TEXT PRIMARY KEY, slot TEXT, action TEXT, status TEXT DEFAULT 'DELIVERED',
             created_at TEXT, delivered_at TEXT, started_at TEXT, hardware_verified_at TEXT,
@@ -58,5 +64,6 @@ class OfflineQueue:
         return cur.fetchall()
 
     def cleanup_acked(self):
-        self.conn.execute("DELETE FROM commands WHERE ack_status='ACKED'")
+        # Controlled batch deletion to prevent long write locks
+        self.conn.execute("DELETE FROM commands WHERE ack_status='ACKED' LIMIT 100")
         self.conn.commit()

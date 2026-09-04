@@ -1,11 +1,11 @@
 import json
 import os
 import threading
-import time
 from enum import Enum
 from datetime import datetime
 from config import STATE_FILE, BACKUP_STATE_FILE, STATE_VERSION
 from logger import logger
+from storage_manager import StorageManager
 
 class CommandedState(str, Enum):
     ON = "ON"; OFF = "OFF"; UNKNOWN = "UNKNOWN"
@@ -60,14 +60,12 @@ class SlotState:
             return False
 
 class PiStateManager:
-    def __init__(self):
+    def __init__(self, storage_manager: StorageManager):
         self.system_state = SystemState.BOOT
         self.active_slot = None
         self.slots = {code: SlotState(code) for code in ["A", "B", "C", "D"]}
-        self._dirty = False
+        self.storage = storage_manager
         self._save_lock = threading.Lock()
-        self._save_thread = threading.Thread(target=self._async_save_loop, daemon=True)
-        self._save_thread.start()
         self.state_loaded = self._load_state()
 
     def _load_state(self) -> bool:
@@ -76,13 +74,13 @@ class PiStateManager:
             try:
                 with open(STATE_FILE, 'r') as f: data = json.load(f)
             except Exception: logger.error("Primary state file corrupt. Trying backup.")
-                
+
         if data is None and os.path.exists(BACKUP_STATE_FILE):
             try:
                 with open(BACKUP_STATE_FILE, 'r') as f: data = json.load(f)
                 logger.warning("Loaded from backup_state.json.")
             except Exception: logger.critical("Backup state file also corrupt.")
-                
+
         if data:
             self.active_slot = data.get("active_slot")
             valid = True
@@ -92,12 +90,8 @@ class PiStateManager:
             return valid
         return False
 
-    def _async_save_loop(self):
-        while True:
-            time.sleep(60.0)
-            if self._dirty: self._flush_to_disk()
-
     def _flush_to_disk(self):
+        """Atomic write with fsync. Called ONLY on critical events."""
         with self._save_lock:
             data = {
                 "version": STATE_VERSION,
@@ -110,21 +104,22 @@ class PiStateManager:
                     json.dump(data, f, indent=4)
                     f.flush()
                     os.fsync(f.fileno())
-                
+
                 if os.path.exists(STATE_FILE): os.replace(STATE_FILE, BACKUP_STATE_FILE)
                 os.replace(tmp_file, STATE_FILE)
-                
+
                 dir_fd = os.open(os.path.dirname(STATE_FILE), os.O_DIRECTORY)
                 try: os.fsync(dir_fd)
                 finally: os.close(dir_fd)
-                    
-                self._dirty = False
+
+                # Track I/O for endurance budget
+                self.storage.io_meter.record_ems_write(len(json.dumps(data)))
             except Exception as e:
                 logger.critical(f"CRITICAL: State save failed: {e}")
 
     def save_state(self, immediate=False):
-        self._dirty = True
-        if immediate: self._flush_to_disk()
+        if immediate:
+            self._flush_to_disk()
 
     def set_commanded(self, slot_code: str, state: CommandedState, immediate=False):
         if slot_code in self.slots:

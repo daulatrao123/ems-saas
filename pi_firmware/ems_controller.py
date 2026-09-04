@@ -11,13 +11,16 @@ from logger import logger
 class EmsController:
     def __init__(self):
         logger.info("Initializing EMS Controller...")
-        self.state_manager = PiStateManager()
+        self.storage = StorageManager()
+        self.state_manager = PiStateManager(self.storage)
         self.queue = OfflineQueue()
         self.api = ApiClient()
-        self.storage = StorageManager()
         self.device_config = {}
         self.gpio_manager = None
         self._running = True
+        
+        # Track last day for daily telemetry flush
+        self.last_telemetry_day = time.strftime("%Y-%m-%d")
 
     def validate_config(self, config: dict) -> bool:
         if not config: return False
@@ -26,11 +29,16 @@ class EmsController:
         if set(config.get("slots", {}).keys()) != {"A", "B", "C", "D"}: return False
         if not config.get("config_version"): return False
         
+        if not isinstance(config.get("feedback_hardware_installed"), bool): return False
+        
         for slot, cfg in config.get("slots", {}).items():
             if not isinstance(cfg.get("feedback_enabled"), bool): return False
             if not isinstance(cfg.get("display_name"), str) or not (1 <= len(cfg["display_name"]) <= 50): return False
             if not isinstance(cfg.get("target_days"), int) or not (0 <= cfg["target_days"] <= 365): return False
             if not isinstance(cfg.get("disabled"), bool): return False
+            if cfg.get("feedback_enabled") and not config.get("feedback_hardware_installed"):
+                logger.error(f"Slot {slot} has feedback enabled, but device hardware does not support it.")
+                return False
         return True
 
     def run_boot_sequence(self):
@@ -60,26 +68,35 @@ class EmsController:
             logger.critical("System State: FAULT (Hardware Mismatch)")
             return False
             
-        # Reboot Recovery for Interrupted Commands (Hardware Truth)
         interrupted = self.queue.get_interrupted()
         for cmd_id, slot, action in interrupted:
             logger.warning(f"Command {cmd_id} was interrupted by reboot. Marking UNKNOWN_AFTER_REBOOT.")
             self.queue.update_status(cmd_id, "UNKNOWN_AFTER_REBOOT")
             
-            # Reconcile against hardware truth (already read by gpio_manager)
             slot_state = self.state_manager.slots[slot]
             is_off = slot_state.gpio_output_state == GpioOutputState.OFF
             
             if action == "ACTIVATE":
-                if slot_state.commanded_state == CommandedState.ON and slot_state.verification_state in [VerificationState.VERIFIED_ON, VerificationState.GPIO_CONFIRMED]:
-                    self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", slot_state.verification_state.value)
-                    self.queue.update_status(cmd_id, "COMPLETED", slot_state.verification_state.value)
+                if slot_state.commanded_state == CommandedState.ON:
+                    if slot_state.verification_state == VerificationState.VERIFIED_ON:
+                        self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", slot_state.verification_state.value)
+                        self.queue.update_status(cmd_id, "COMPLETED", slot_state.verification_state.value)
+                    elif slot_state.verification_state == VerificationState.GPIO_CONFIRMED:
+                        self.queue.update_status(cmd_id, "COMPLETED", slot_state.verification_state.value)
+                    else:
+                        self.queue.update_status(cmd_id, "FAILED", "MISMATCH_AFTER_REBOOT")
                 else:
                     self.queue.update_status(cmd_id, "FAILED", "MISMATCH_AFTER_REBOOT")
+                    
             elif action == "DEACTIVATE":
-                if is_off and slot_state.verification_state in [VerificationState.VERIFIED_OFF, VerificationState.GPIO_CONFIRMED, VerificationState.NOT_CONFIGURED]:
-                    self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", slot_state.verification_state.value)
-                    self.queue.update_status(cmd_id, "COMPLETED", slot_state.verification_state.value)
+                if is_off:
+                    if slot_state.verification_state == VerificationState.VERIFIED_OFF:
+                        self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", slot_state.verification_state.value)
+                        self.queue.update_status(cmd_id, "COMPLETED", slot_state.verification_state.value)
+                    elif slot_state.verification_state in [VerificationState.GPIO_CONFIRMED, VerificationState.NOT_CONFIGURED]:
+                        self.queue.update_status(cmd_id, "COMPLETED", slot_state.verification_state.value)
+                    else:
+                        self.queue.update_status(cmd_id, "FAILED", "MISMATCH_AFTER_REBOOT")
                 else:
                     self.queue.update_status(cmd_id, "FAILED", "MISMATCH_AFTER_REBOOT")
                 
@@ -109,7 +126,8 @@ class EmsController:
             logger.critical(f"Command {cmd_id} execution failed: {e}")
                 
         if success:
-            self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", verification.value)
+            if verification in [VerificationState.VERIFIED_ON, VerificationState.VERIFIED_OFF]:
+                self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", verification.value)
             self.queue.update_status(cmd_id, "COMPLETED", verification.value)
         else:
             if not error_msg: error_msg = "Transition failed"
@@ -120,6 +138,13 @@ class EmsController:
     def sync_loop(self):
         while self._running:
             time.sleep(SYNC_INTERVAL_S)
+            
+            # Daily Telemetry Flush (Exactly once per day)
+            current_day = time.strftime("%Y-%m-%d")
+            if current_day != self.last_telemetry_day:
+                self.storage.save_daily_telemetry()
+                self.last_telemetry_day = current_day
+
             if self.state_manager.system_state == SystemState.READY:
                 snapshot = {
                     "system_state": self.state_manager.system_state.value,
