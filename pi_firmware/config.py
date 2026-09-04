@@ -27,7 +27,27 @@ HARDWARE_PROFILES = {
     }
 }
 
-SUPPORTED_SLOTS = ("A", "B", "C", "D")
+
+SUPPORTED_SLOTS = (
+    "A",
+    "B",
+    "C",
+    "D",
+)
+
+
+# ================================================================
+# FEEDBACK POLARITY
+# ================================================================
+
+# TRUE:
+#     Button.is_pressed() == True means contactor ON.
+#
+# FALSE:
+#     Button.is_pressed() == True means contactor OFF.
+#
+# MUST be confirmed against the actual electrical wiring.
+FEEDBACK_ACTIVE_WHEN_PRESSED = True
 
 
 # ================================================================
@@ -38,7 +58,6 @@ FEEDBACK_TIMEOUT_MS = 2000
 FEEDBACK_DEBOUNCE_MS = 50
 INTERLOCK_DELAY_MS = 500
 
-# Physical contactor monitoring is RAM-only.
 LOCAL_MONITOR_INTERVAL_S = 2.0
 
 
@@ -48,6 +67,8 @@ LOCAL_MONITOR_INTERVAL_S = 2.0
 
 SYNC_INTERVAL_S = 60.0
 
+API_TIMEOUT_S = 10
+
 
 # ================================================================
 # SQLITE
@@ -55,7 +76,6 @@ SYNC_INTERVAL_S = 60.0
 
 SQLITE_BUSY_TIMEOUT_MS = 5000
 
-# Smaller WAL checkpoint keeps WAL bounded.
 SQLITE_WAL_AUTOCHECKPOINT_PAGES = 512
 
 
@@ -63,21 +83,45 @@ SQLITE_WAL_AUTOCHECKPOINT_PAGES = 512
 # STATE
 # ================================================================
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 # ================================================================
-# LOCAL STORAGE
+# STORAGE
 # ================================================================
 
 DATA_DIR = "/mnt/ems-data"
 
-STATE_DIR = os.path.join(DATA_DIR, "state")
-LOG_DIR = os.path.join(DATA_DIR, "logs")
-QUEUE_DIR = os.path.join(DATA_DIR, "queue")
-TELEMETRY_DIR = os.path.join(DATA_DIR, "telemetry")
-DIAGNOSTICS_DIR = os.path.join(DATA_DIR, "diagnostics")
-HEALTH_DIR = os.path.join(DATA_DIR, "health")
+STATE_DIR = os.path.join(
+    DATA_DIR,
+    "state",
+)
+
+LOG_DIR = os.path.join(
+    DATA_DIR,
+    "logs",
+)
+
+QUEUE_DIR = os.path.join(
+    DATA_DIR,
+    "queue",
+)
+
+TELEMETRY_DIR = os.path.join(
+    DATA_DIR,
+    "telemetry",
+)
+
+DIAGNOSTICS_DIR = os.path.join(
+    DATA_DIR,
+    "diagnostics",
+)
+
+HEALTH_DIR = os.path.join(
+    DATA_DIR,
+    "health",
+)
+
 
 STATE_FILE = os.path.join(
     STATE_DIR,
@@ -109,6 +153,7 @@ for directory in (
     DIAGNOSTICS_DIR,
     HEALTH_DIR,
 ):
+
     os.makedirs(
         directory,
         exist_ok=True,
@@ -116,38 +161,30 @@ for directory in (
 
 
 # ================================================================
-# FLASH-WEAR POLICY
-#
-# These are SOFTWARE budgets.
-# They are NOT NAND endurance guarantees.
+# FLASH WRITE BUDGET
 # ================================================================
 
-# Normal application logging ceiling.
 DAILY_LOG_BUDGET_BYTES = (
     10 * 1024 * 1024
 )
 
-# Critical event logging ceiling.
 CRITICAL_LOG_BUDGET_BYTES = (
     2 * 1024 * 1024
 )
 
-# Target is deliberately much lower than the ceiling.
 NORMAL_LOG_TARGET_BYTES = (
     3 * 1024 * 1024
 )
 
-# Protection threshold for measured daily block-device writes.
-#
-# This does NOT mean "the flash is worn out".
-# It means optional writes should be reduced.
+# This is a BLOCK-I/O protection threshold.
+# It is NOT NAND endurance.
 TOTAL_DAILY_PHYSICAL_BUDGET_BYTES = (
     50 * 1024 * 1024
 )
 
 
 # ================================================================
-# STORAGE CAPACITY PRESSURE
+# STORAGE CAPACITY
 # ================================================================
 
 STORAGE_WARNING_PERCENT = 70
@@ -159,27 +196,22 @@ STORAGE_CRITICAL_PERCENT = 98
 
 # ================================================================
 # STORAGE MONITORING
-#
-# These operations are RAM-heavy / read-only.
-# Do NOT write these measurements every minute.
 # ================================================================
 
 STORAGE_METRICS_INTERVAL_S = 60
 
-# Persist accumulated storage statistics only hourly.
+# Persist storage counters at most once per hour.
 STORAGE_HEALTH_PERSIST_INTERVAL_S = 3600
 
-# Daily summary.
 STORAGE_DAILY_PERSIST_INTERVAL_S = 86400
 
 
 # ================================================================
-# LOG RETENTION
+# RETENTION
 # ================================================================
 
 NORMAL_LOG_RETENTION_DAYS = 30
 
-# Critical history should be retained considerably longer.
 CRITICAL_LOG_RETENTION_DAYS = 365
 
 TELEMETRY_RETENTION_DAYS = 365
@@ -193,13 +225,10 @@ DIAGNOSTIC_RETENTION_DAYS = 90
 
 MEMORY_SAMPLE_INTERVAL_S = 600
 
-# 24 hours at 10-minute intervals.
 MEMORY_HISTORY_SAMPLES = 144
 
-# Enter memory pressure when MemAvailable is below this percentage.
 MEMORY_AVAILABLE_PRESSURE_PERCENT = 15
 
-# Any sustained swap use above this is suspicious.
 SWAP_WARNING_BYTES = (
     10 * 1024 * 1024
 )
@@ -213,13 +242,13 @@ MEMORY_LEAK_THREAD_GROWTH_PERCENT = 25
 
 
 # ================================================================
-# CLOUD CREDENTIALS
+# CREDENTIALS
 # ================================================================
 
 API_BASE_URL = os.environ.get(
     "EMS_API_URL",
     "https://ems-backend.onrender.com/api",
-)
+).rstrip("/")
 
 DEVICE_ID = os.environ.get(
     "EMS_DEVICE_ID"
