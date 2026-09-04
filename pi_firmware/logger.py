@@ -6,7 +6,6 @@ import time
 from datetime import datetime
 from config import LOG_DIR, DAILY_LOG_BUDGET_BYTES, CRITICAL_LOG_BUDGET_BYTES
 
-# Global storage manager reference to check write budgets
 _storage_mgr = None
 
 def set_storage_manager(storage_mgr):
@@ -49,7 +48,7 @@ class DailyBudgetHandler(logging.Handler):
     def emit(self, record):
         self._rotate_if_new_day()
         
-        # HARD BUDGET STOP: Do not write if USB budget exceeded
+        # HARD BUDGET STOP: Do not write if physical USB budget exceeded
         if _storage_mgr and not _storage_mgr.is_write_allowed():
             return
             
@@ -58,6 +57,8 @@ class DailyBudgetHandler(logging.Handler):
         
         if self.bytes_written + msg_bytes <= self.budget_bytes:
             self.fh.write(msg)
+            # Track logical write for WAF
+            if _storage_mgr: _storage_mgr.io_meter.record_ems_write(msg_bytes)
             self.bytes_written += msg_bytes
 
 def setup_logger():

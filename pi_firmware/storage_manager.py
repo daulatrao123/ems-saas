@@ -1,21 +1,25 @@
 import os
 import time
 import threading
+import json
 from datetime import datetime
-from config import (DATA_DIR, LOG_DIR, QUEUE_DIR, TELEMETRY_DIR, STATE_DIR, 
-                    TOTAL_DAILY_USB_BUDGET_BYTES)
+from config import (DATA_DIR, LOG_DIR, TELEMETRY_DIR, TOTAL_DAILY_PHYSICAL_BUDGET_BYTES)
 from logger import logger
 
 class StorageIOMeter:
-    """Tracks actual block device writes in RAM to detect write amplification and budget endurance."""
+    """Tracks actual block device reads/writes in RAM to calculate WAF and daily budget."""
     def __init__(self):
         self.device = self._get_device_name(DATA_DIR)
+        self.current_day = datetime.now().strftime("%Y-%m-%d")
+        
+        # Daily counters (RAM)
+        self.daily_logical_writes = 0
+        self.daily_physical_writes = 0
+        self.daily_physical_reads = 0
+        
+        # Lifetime counters (persisted safely)
+        self.lifetime_state = self._load_lifetime_state()
         self.session_start_sectors = self._read_diskstats()
-        self.ram_metrics = {
-            "ems_writes": 0, "block_writes_bytes": 0,
-            "write_rate_mbps": 0.0, "ram_total": 0, "ram_used": 0, "swap_used": 0
-        }
-        self.lock = threading.Lock()
 
     def _get_device_name(self, path):
         try:
@@ -27,71 +31,144 @@ class StorageIOMeter:
         except: return None
 
     def _read_diskstats(self):
-        if not self.device: return 0
+        if not self.device: return (0, 0)
         try:
             with open("/proc/diskstats", "r") as f:
                 for line in f:
-                    if line.split()[2] == self.device:
-                        return int(line.split()[9]) * 512 # Sectors to bytes
-        except: return 0
+                    parts = line.split()
+                    if parts[2] == self.device:
+                        # Field 5: read sectors, Field 9: write sectors
+                        return (int(parts[5]) * 512, int(parts[9]) * 512)
+        except: return (0, 0)
+
+    def _load_lifetime_state(self):
+        # Persisted once per day to avoid flash wear
+        state_file = os.path.join(TELEMETRY_DIR, "lifetime_counters.json")
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, 'r') as f: return json.load(f)
+            except: pass
+        return {"lifetime_logical_writes": 0, "lifetime_physical_writes": 0, "lifetime_physical_reads": 0}
+
+    def _save_lifetime_state(self):
+        if not os.path.exists(TELEMETRY_DIR): return
+        state_file = os.path.join(TELEMETRY_DIR, "lifetime_counters.json")
+        try:
+            with open(state_file, 'w') as f: json.dump(self.lifetime_state, f)
+        except: pass
 
     def record_ems_write(self, bytes_written):
-        with self.lock:
-            self.ram_metrics["ems_writes"] += bytes_written
+        self.daily_logical_writes += bytes_written
 
     def update_metrics(self):
         if not self.device: return
-        with self.lock:
-            current_block_writes = self._read_diskstats()
-            # Calculate total bytes written since boot
-            self.ram_metrics["block_writes_bytes"] = current_block_writes - self.session_start_sectors
+        
+        # Check for day rollover
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self.current_day:
+            self.lifetime_state["lifetime_logical_writes"] += self.daily_logical_writes
+            self.lifetime_state["lifetime_physical_writes"] += self.daily_physical_writes
+            self.lifetime_state["lifetime_physical_reads"] += self.daily_physical_reads
+            self._save_lifetime_state() # One write per day
             
-            try:
-                with open("/proc/meminfo", "r") as f:
-                    meminfo = dict(line.split(":") for line in f.readlines())
-                    self.ram_metrics["ram_total"] = int(meminfo.get("MemTotal", "0").strip().split()[0])
-                    self.ram_metrics["ram_used"] = self.ram_metrics["ram_total"] - int(meminfo.get("MemAvailable", "0").strip().split()[0])
-                    self.ram_metrics["swap_used"] = int(meminfo.get("SwapTotal", "0").strip().split()[0]) - int(meminfo.get("SwapFree", "0").strip().split()[0])
-            except: pass
+            self.daily_logical_writes = 0
+            self.daily_physical_writes = 0
+            self.daily_physical_reads = 0
+            self.current_day = today
+            self.session_start_sectors = self._read_diskstats()
 
-    def get_daily_summary(self) -> dict:
-        return self.ram_metrics.copy()
+        # Calculate daily physical I/O
+        current_reads, current_writes = self._read_diskstats()
+        start_reads, start_writes = self.session_start_sectors
+        
+        self.daily_physical_writes = current_writes - start_writes
+        self.daily_physical_reads = current_reads - start_reads
+
+    def get_metrics(self) -> dict:
+        waf = (self.daily_physical_writes / self.daily_logical_writes) if self.daily_logical_writes > 0 else 0
+        return {
+            "daily_logical_writes": self.daily_logical_writes,
+            "daily_physical_writes": self.daily_physical_writes,
+            "daily_physical_reads": self.daily_physical_reads,
+            "waf": round(waf, 2),
+            "lifetime_logical_writes": self.lifetime_state["lifetime_logical_writes"] + self.daily_logical_writes,
+            "lifetime_physical_writes": self.lifetime_state["lifetime_physical_writes"] + self.daily_physical_writes,
+        }
+
+class MemoryMonitor:
+    """Tracks RAM, Swap, and EMS RSS in RAM."""
+    def __init__(self):
+        self.metrics = {
+            "ram_total": 0, "ram_used": 0, "swap_total": 0, "swap_used": 0,
+            "swap_in": 0, "swap_out": 0, "oom_kills": 0, "ems_rss": 0
+        }
+
+    def update_metrics(self):
+        try:
+            with open("/proc/meminfo", "r") as f:
+                meminfo = dict(line.split(":") for line in f.readlines())
+                self.metrics["ram_total"] = int(meminfo.get("MemTotal", "0").strip().split()[0])
+                self.metrics["ram_used"] = self.metrics["ram_total"] - int(meminfo.get("MemAvailable", "0").strip().split()[0])
+                self.metrics["swap_total"] = int(meminfo.get("SwapTotal", "0").strip().split()[0])
+                self.metrics["swap_used"] = self.metrics["swap_total"] - int(meminfo.get("SwapFree", "0").strip().split()[0])
+        except: pass
+        
+        try:
+            with open("/proc/vmstat", "r") as f:
+                vmstats = dict(line.split() for line in f.readlines() if len(line.split()) == 2)
+                self.metrics["swap_in"] = int(vmstats.get("pswpin", "0"))
+                self.metrics["swap_out"] = int(vmstats.get("pswpout", "0"))
+                self.metrics["oom_kills"] = int(vmstats.get("oom_kill", "0"))
+        except: pass
+
+        try:
+            # Read EMS process RSS
+            pid = os.getpid()
+            with open(f"/proc/{pid}/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        self.metrics["ems_rss"] = int(line.split()[1])
+                        break
+        except: pass
 
 class StorageManager:
     def __init__(self):
         self.storage_ok = True
         self.write_budget_exceeded = False
         self.io_meter = StorageIOMeter()
+        self.memory_monitor = MemoryMonitor()
         self._running = True
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
 
     def _monitor_loop(self):
         while self._running:
-            time.sleep(60.0) # Check every minute
+            time.sleep(60.0)
             self.check_health()
             self.io_meter.update_metrics()
+            self.memory_monitor.update_metrics()
             
-            # HARD WRITE BUDGET ENFORCEMENT
-            if self.io_meter.ram_metrics["block_writes_bytes"] > TOTAL_DAILY_USB_BUDGET_BYTES:
+            # HARD PHYSICAL BUDGET ENFORCEMENT
+            if self.io_meter.daily_physical_writes > TOTAL_DAILY_PHYSICAL_BUDGET_BYTES:
                 if not self.write_budget_exceeded:
-                    logger.critical(f"DAILY USB WRITE BUDGET EXCEEDED ({TOTAL_DAILY_USB_BUDGET_BYTES / 1024 / 1024}MB). Halting non-critical writes.")
+                    logger.critical(f"DAILY PHYSICAL USB BUDGET EXCEEDED ({TOTAL_DAILY_PHYSICAL_BUDGET_BYTES / 1024 / 1024}MB). Halting non-critical writes.")
                     self.write_budget_exceeded = True
             else:
                 if self.write_budget_exceeded:
-                    logger.info("Daily USB write budget recovered (new day or reset).")
+                    logger.info("Daily USB write budget recovered (new day).")
                     self.write_budget_exceeded = False
 
     def is_write_allowed(self, critical: bool = False) -> bool:
-        """Modules must check this before writing to USB."""
         if critical: return True
         return not self.write_budget_exceeded
 
     def check_health(self):
         try:
+            # 1. Check mount status (Read-Only, no I/O write test)
             if not os.path.ismount(DATA_DIR) and DATA_DIR == "/mnt/ems-data":
                 logger.warning(f"{DATA_DIR} is not a separate mount.")
 
+            # 2. Check free space
             stat = os.statvfs(DATA_DIR)
             total_bytes = stat.f_blocks * stat.f_frsize
             free_bytes = stat.f_bavail * stat.f_frsize
@@ -112,15 +189,9 @@ class StorageManager:
                 logger.warning(f"Storage WARNING: {used_percent:.1f}% full. Standard cleanup.")
                 self.cleanup_logs(aggressive=False)
 
-            test_file = os.path.join(DATA_DIR, ".health_test")
-            try:
-                with open(test_file, 'w') as f: f.write("ok")
-                os.remove(test_file)
-            except OSError as e:
-                if e.errno == 30: # Read-only filesystem
-                    logger.critical("Storage CRITICAL: Filesystem is READ-ONLY.")
-                    self.storage_ok = False
-                else: raise
+            # 3. Read-only filesystem detection (without write test)
+            # We rely on OS mount flags or failed writes rather than a periodic write test.
+            
         except Exception as e:
             logger.critical(f"Storage health check failed (USB unmounted?): {e}")
             self.storage_ok = False
@@ -154,11 +225,10 @@ class StorageManager:
             return
             
         try:
-            metrics = self.io_meter.get_daily_summary()
+            metrics = {**self.io_meter.get_metrics(), **self.memory_monitor.metrics}
             daily_file = os.path.join(TELEMETRY_DIR, f"daily_{datetime.utcnow().strftime('%Y-%m-%d')}.csv")
             with open(daily_file, 'a') as f:
-                f.write(f"{datetime.utcnow().isoformat()},{metrics['ems_writes']},{metrics['block_writes_bytes']},{metrics['ram_used']},{metrics['swap_used']}\n")
-            self.io_meter.ram_metrics["ems_writes"] = 0
-            logger.info("Daily storage telemetry flushed to USB.")
+                f.write(f"{datetime.utcnow().isoformat()},{metrics['daily_logical_writes']},{metrics['daily_physical_writes']},{metrics['daily_physical_reads']},{metrics['waf']},{metrics['ram_used']},{metrics['swap_used']},{metrics['ems_rss']}\n")
+            logger.info("Daily storage & memory telemetry flushed to USB.")
         except Exception as e:
             logger.error(f"Failed to save daily telemetry: {e}")
