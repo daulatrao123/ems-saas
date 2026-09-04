@@ -1,5 +1,4 @@
 import sqlite3
-import json
 from config import DB_FILE, SQLITE_BUSY_TIMEOUT_MS
 from logger import logger
 
@@ -8,20 +7,10 @@ class OfflineQueue:
         self.conn = sqlite3.connect(DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("""CREATE TABLE IF NOT EXISTS commands (
-            id TEXT PRIMARY KEY,
-            slot TEXT,
-            action TEXT,
-            status TEXT DEFAULT 'DELIVERED',
-            created_at TEXT,
-            received_at TEXT,
-            started_at TEXT,
-            completed_at TEXT,
-            expires_at TEXT,
-            attempt_count INT DEFAULT 0,
-            last_error TEXT,
-            config_version TEXT,
-            hardware_verification TEXT,
-            ack_status TEXT DEFAULT 'PENDING'
+            id TEXT PRIMARY KEY, slot TEXT, action TEXT, status TEXT DEFAULT 'DELIVERED',
+            created_at TEXT, received_at TEXT, started_at TEXT, completed_at TEXT,
+            expires_at TEXT, attempt_count INT DEFAULT 0, last_error TEXT,
+            config_version TEXT, hardware_verification TEXT, ack_status TEXT DEFAULT 'PENDING'
         )""")
         self.conn.commit()
 
@@ -32,8 +21,7 @@ class OfflineQueue:
                 VALUES (?, ?, ?, 'DELIVERED', ?, ?, ?)""",
                 (cmd_id, slot, action, created_at, created_at, expires_at))
             self.conn.commit()
-        except sqlite3.IntegrityError:
-            pass # Idempotency
+        except sqlite3.IntegrityError: pass
 
     def get_next(self):
         cur = self.conn.execute("SELECT id, slot, action FROM commands WHERE status='DELIVERED' ORDER BY created_at LIMIT 1")

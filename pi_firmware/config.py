@@ -33,11 +33,10 @@ for d in [DATA_DIR, STATE_DIR, LOG_DIR, QUEUE_DIR, TELEMETRY_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # --- Storage Budgets ---
-DAILY_LOG_BUDGET_BYTES = 10 * 1024 * 1024  # 10 MB hard limit for INFO/WARNING
-CRITICAL_LOG_BUDGET_BYTES = 2 * 1024 * 1024 # 2 MB hard limit for ERROR/CRITICAL
+DAILY_LOG_BUDGET_BYTES = 10 * 1024 * 1024
+CRITICAL_LOG_BUDGET_BYTES = 2 * 1024 * 1024
 
 # --- Cloud API ---
-# In production, this is set via environment variable or hardware provisioning
 API_BASE_URL = os.environ.get("EMS_API_URL", "https://ems-backend.onrender.com/api")
 DEVICE_ID = os.environ.get("EMS_DEVICE_ID", "PI-001")
 API_KEY = os.environ.get("EMS_API_KEY", "dev-secret-key")

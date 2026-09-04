@@ -1,7 +1,7 @@
 import time
 import threading
 from config import SYNC_INTERVAL_S
-from state import PiStateManager, SystemState, CommandedState, VerificationState
+from state import PiStateManager, SystemState, VerificationState
 from gpio_manager import GPIOManager
 from api_client import ApiClient
 from offline_queue import OfflineQueue
@@ -15,7 +15,6 @@ class EmsController:
         self.queue = OfflineQueue()
         self.api = ApiClient()
         self.storage = StorageManager()
-        
         self.device_config = {}
         self.gpio_manager = None
         self._running = True
@@ -75,7 +74,6 @@ class EmsController:
         while self._running:
             time.sleep(SYNC_INTERVAL_S)
             if self.state_manager.system_state == SystemState.READY:
-                # 1. Push State
                 snapshot = {
                     "system_state": self.state_manager.system_state.value,
                     "active_slot": self.state_manager.active_slot,
@@ -83,23 +81,20 @@ class EmsController:
                 }
                 self.api.push_state(snapshot)
                 
-                # 2. Fetch Commands
                 commands = self.api.get_commands()
                 for cmd in commands:
                     self.queue.add_command(cmd["id"], cmd["slot"], cmd["action"], cmd.get("created_at"), cmd.get("expires_at"))
                 
-                # 3. Push ACKs
                 unacked = self.queue.get_unacked()
                 for cmd_id, status, verif in unacked:
                     if self.api.push_ack(cmd_id, status, verif):
                         self.queue.mark_acked(cmd_id)
-                    break # Push one per cycle to avoid spamming
+                    break
 
     def main_loop(self):
         if not self.run_boot_sequence():
             logger.error("Boot sequence failed. Entering safe fault mode.")
-            while self._running:
-                time.sleep(1)
+            while self._running: time.sleep(1)
                 
         logger.info("Entering main operational loop.")
         sync_thread = threading.Thread(target=self.sync_loop, daemon=True)

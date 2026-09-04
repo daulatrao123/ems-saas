@@ -43,33 +43,21 @@ def setup_logger():
     if logger.handlers:
         return logger
 
-    formatter = logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(message)s', 
-        datefmt='%Y-%m-%dT%H:%M:%S%z'
-    )
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%dT%H:%M:%S%z')
     
-    # 1. Bounded daily application log (INFO/WARNING only)
-    app_handler = DailyBudgetHandler(
-        os.path.join(LOG_DIR, "ems_app.log"), 
-        DAILY_LOG_BUDGET_BYTES
-    )
+    app_handler = DailyBudgetHandler(os.path.join(LOG_DIR, "ems_app.log"), DAILY_LOG_BUDGET_BYTES)
     app_handler.setFormatter(formatter)
     app_handler.setLevel(logging.INFO)
-    # Reject ERROR/CRITICAL from this handler
     app_handler.addFilter(lambda record: record.levelno < logging.ERROR)
     logger.addHandler(app_handler)
     
-    # 2. Critical events only (ERROR/CRITICAL) - Bounded 2MB rotating
     crit_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(LOG_DIR, "critical.log"),
-        maxBytes=CRITICAL_LOG_BUDGET_BYTES,
-        backupCount=2
+        os.path.join(LOG_DIR, "critical.log"), maxBytes=CRITICAL_LOG_BUDGET_BYTES, backupCount=2
     )
     crit_handler.setFormatter(formatter)
     crit_handler.setLevel(logging.ERROR)
     logger.addHandler(crit_handler)
 
-    # 3. Stdout for debugging
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)

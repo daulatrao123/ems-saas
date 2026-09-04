@@ -42,11 +42,8 @@ class GPIOManager:
         return first_read and second_read
 
     def verify_slot(self, slot: str, expected_commanded: CommandedState, feedback_configured: bool) -> VerificationState:
-        if not feedback_configured:
-            return VerificationState.NOT_CONFIGURED
-            
+        if not feedback_configured: return VerificationState.NOT_CONFIGURED
         is_closed = self._read_feedback_raw(slot)
-        
         if expected_commanded == CommandedState.ON:
             return VerificationState.VERIFIED_ON if is_closed else VerificationState.MISMATCH_ON_OFF
         elif expected_commanded == CommandedState.OFF:
@@ -58,12 +55,10 @@ class GPIOManager:
         logger.info("Starting Hardware Reconciliation...")
         active_relays = []
         active_feedbacks = []
-        
         fb_slots_config = self.device_config.get("slots", {})
 
         for slot in self.profile["slots"]:
             is_fb_enabled = fb_slots_config.get(slot, {}).get("feedback_enabled", False)
-            
             if self.relays[slot].is_active:
                 active_relays.append(slot)
                 self.state_manager.set_gpio_output(slot, GpioOutputState.ON)
@@ -92,9 +87,7 @@ class GPIOManager:
         elif len(active_relays) == 1:
             slot = active_relays[0]
             is_fb_enabled = fb_slots_config.get(slot, {}).get("feedback_enabled", False)
-            
             if is_fb_enabled:
-                # Relay is ON, but feedback is OFF. This is a MISMATCH, not GPIO_CONFIRMED.
                 logger.critical(f"Slot {slot} Relay ON but Feedback OFF during boot! MISMATCH.")
                 self.state_manager.set_verification(slot, VerificationState.MISMATCH_ON_OFF, immediate=True)
                 self.state_manager.system_state = SystemState.FAULT
@@ -115,9 +108,7 @@ class GPIOManager:
 
     def transition_slot(self, target_slot: str, feedback_configured: bool) -> bool:
         with self._lock:
-            if self.state_manager.system_state == SystemState.FAULT:
-                return False
-                
+            if self.state_manager.system_state == SystemState.FAULT: return False
             current_active = self.state_manager.active_slot
             
             if current_active and current_active != target_slot:
@@ -138,7 +129,6 @@ class GPIOManager:
                         self.state_manager.system_state = SystemState.FAULT
                         return False
                     time.sleep(0.05)
-                    
                 time.sleep(INTERLOCK_DELAY_MS / 1000.0)
 
             self.relays[target_slot].on()
@@ -169,20 +159,18 @@ class GPIOManager:
     def _local_monitor_loop(self):
         while self._running:
             if self.state_manager.system_state == SystemState.READY:
+                # Authoritative configuration from cloud config
                 fb_slots_config = self.device_config.get("slots", {})
                 for slot, state_obj in self.state_manager.slots.items():
                     is_fb_enabled = fb_slots_config.get(slot, {}).get("feedback_enabled", False)
                     if state_obj.commanded_state in [CommandedState.ON, CommandedState.OFF] and is_fb_enabled:
                         v_state = self.verify_slot(slot, state_obj.commanded_state, is_fb_enabled)
-                        
                         if state_obj.commanded_state == CommandedState.ON and v_state == VerificationState.MISMATCH_ON_OFF:
                             logger.critical(f"Slot {slot} physically turned OFF unexpectedly!")
                             self.state_manager.set_verification(slot, v_state, immediate=True)
                             self.state_manager.system_state = SystemState.FAULT
-                            
                         elif state_obj.commanded_state == CommandedState.OFF and v_state == VerificationState.MISMATCH_OFF_ON:
                             logger.critical(f"DANGER: Slot {slot} physically turned ON unexpectedly!")
                             self.state_manager.set_verification(slot, v_state, immediate=True)
                             self.state_manager.system_state = SystemState.FAULT
-                            
             time.sleep(LOCAL_MONITOR_INTERVAL_S)
