@@ -95,7 +95,7 @@ class StorageManager:
             daily_file = os.path.join(TELEMETRY_DIR, f"daily_{datetime.utcnow().strftime('%Y-%m-%d')}.csv")
             
             with open(daily_file, 'a') as f:
-                f.write(f"{datetime.utcnow().isoformat()},{io_metrics['daily_logical_writes']},{io_metrics['daily_physical_writes']},{io_metrics['daily_physical_reads']},{io_metrics['waf']},{mem_metrics['ram_used']},{mem_metrics['swap_used']},{mem_metrics['ems_rss']}\n")
+                f.write(f"{datetime.utcnow().isoformat()},{io_metrics['daily_logical_writes']},{io_metrics['daily_physical_writes']},{io_metrics['daily_physical_reads']},{io_metrics['waf']},{mem_metrics['ram_used']},{mem_metrics['swap_used']},{mem_metrics['ems_rss']},{mem_metrics['memory_state']}\n")
                 
             logger.info("Daily storage & memory telemetry flushed to USB.")
         except Exception as e:

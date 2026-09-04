@@ -7,7 +7,7 @@ class OfflineQueue:
     def __init__(self):
         self.conn = sqlite3.connect(DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, check_same_thread=False)
         
-        # Industrial Flash Optimization: WAL mode + NORMAL sync is safe and reduces write amplification
+        # Industrial Flash Optimization
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;") 
         self.conn.execute("PRAGMA temp_store=MEMORY;")
@@ -64,6 +64,15 @@ class OfflineQueue:
         return cur.fetchall()
 
     def cleanup_acked(self):
-        # Controlled batch deletion to prevent long write locks
+        # Strict bounded queue: Keep max 500 records to prevent database bloat
         self.conn.execute("DELETE FROM commands WHERE ack_status='ACKED' LIMIT 100")
+        
+        # Hard limit total rows
+        cur = self.conn.execute("SELECT COUNT(*) FROM commands")
+        count = cur.fetchone()[0]
+        if count > 500:
+            self.conn.execute("""DELETE FROM commands WHERE id IN (
+                SELECT id FROM commands ORDER BY created_at ASC LIMIT ?
+            )""", (count - 500,))
+            
         self.conn.commit()

@@ -1,6 +1,7 @@
 import os
 import json
 import threading
+import subprocess
 from datetime import datetime
 from config import DATA_DIR, TELEMETRY_DIR, TOTAL_DAILY_PHYSICAL_BUDGET_BYTES
 from logger import logger
@@ -9,21 +10,30 @@ class StorageIOMeter:
     """Tracks actual block device reads/writes in RAM, persisting baseline once per day."""
     def __init__(self):
         self.device = self._get_device_name(DATA_DIR)
+        self.device_serial = self._get_device_serial()
         self.state_file = os.path.join(TELEMETRY_DIR, "io_baseline.json")
+        self.lifetime_file = os.path.join(TELEMETRY_DIR, "lifetime_counters.json")
+        
         self.lock = threading.Lock()
         
         # Load persisted baseline (survives reboots)
         self.state = self._load_state()
-        self.current_day = self.state.get("date", "")
+        self.lifetime_state = self._load_lifetime_state()
         
-        # Get current diskstats
+        today = datetime.now().strftime("%Y-%m-%d")
         current_reads, current_writes = self._read_diskstats()
         
-        # If date changed or device counters reset (USB replaced), reset baseline
-        today = datetime.now().strftime("%Y-%m-%d")
-        if today != self.current_day or current_writes < self.state.get("baseline_phys_writes", 0):
+        # If date changed, device changed, or counters reset (USB replugged), reset baseline
+        if today != self.state.get("date") or \
+           self.device_serial != self.state.get("device_serial") or \
+           current_writes < self.state.get("baseline_phys_writes", 0):
+            
+            if self.device_serial != self.state.get("device_serial") and self.state.get("device_serial"):
+                logger.critical("STORAGE_DEVICE_CHANGED: USB drive replaced! Starting new endurance epoch.")
+                
             self.state = {
                 "date": today,
+                "device_serial": self.device_serial,
                 "baseline_phys_reads": current_reads,
                 "baseline_phys_writes": current_writes,
                 "logical_writes": 0
@@ -38,6 +48,14 @@ class StorageIOMeter:
             if base.startswith("sd"): return base[:3]
             return None
         except: return None
+
+    def _get_device_serial(self):
+        if not self.device: return "UNKNOWN"
+        try:
+            # Use lsblk to get serial number for device replacement detection
+            result = subprocess.run(["lsblk", "-n", "-o", "SERIAL", f"/dev/{self.device}"], capture_output=True, text=True, timeout=5)
+            return result.stdout.strip() or "UNKNOWN"
+        except: return "UNKNOWN"
 
     def _read_diskstats(self):
         if not self.device: return (0, 0)
@@ -56,9 +74,21 @@ class StorageIOMeter:
             except: pass
         return {}
 
+    def _load_lifetime_state(self):
+        if os.path.exists(self.lifetime_file):
+            try:
+                with open(self.lifetime_file, 'r') as f: return json.load(f)
+            except: pass
+        return {"lifetime_logical_writes": 0, "lifetime_physical_writes": 0, "lifetime_physical_reads": 0}
+
     def _save_state(self):
         try:
             with open(self.state_file, 'w') as f: json.dump(self.state, f)
+        except: pass
+
+    def _save_lifetime_state(self):
+        try:
+            with open(self.lifetime_file, 'w') as f: json.dump(self.lifetime_state, f)
         except: pass
 
     def record_ems_write(self, bytes_written):
@@ -70,16 +100,25 @@ class StorageIOMeter:
             today = datetime.now().strftime("%Y-%m-%d")
             if today != self.state["date"]:
                 # Day rollover: save final totals to lifetime, reset baseline
-                self.state["date"] = today
+                self.lifetime_state["lifetime_logical_writes"] += self.state.get("logical_writes", 0)
+                
                 current_reads, current_writes = self._read_diskstats()
+                phys_writes_today = current_writes - self.state.get("baseline_phys_writes", 0)
+                phys_reads_today = current_reads - self.state.get("baseline_phys_reads", 0)
+                
+                self.lifetime_state["lifetime_physical_writes"] += phys_writes_today
+                self.lifetime_state["lifetime_physical_reads"] += phys_reads_today
+                self._save_lifetime_state() # One write per day
+                
+                self.state["date"] = today
                 self.state["baseline_phys_reads"] = current_reads
                 self.state["baseline_phys_writes"] = current_writes
                 self.state["logical_writes"] = 0
-                self._save_state() # One write per day
+                self._save_state()
             
             current_reads, current_writes = self._read_diskstats()
             
-            # Detect counter reset (USB replugged)
+            # Detect counter reset (USB replugged without date change)
             if current_writes < self.state["baseline_phys_writes"]:
                 self.state["baseline_phys_writes"] = current_writes
                 self.state["baseline_phys_reads"] = current_reads
@@ -100,5 +139,8 @@ class StorageIOMeter:
                 "daily_physical_writes": phys_writes,
                 "daily_physical_reads": phys_reads,
                 "waf": round(waf, 2),
-                "budget_exceeded": budget_exceeded
+                "budget_exceeded": budget_exceeded,
+                "lifetime_logical_writes": self.lifetime_state["lifetime_logical_writes"] + logical_writes,
+                "lifetime_physical_writes": self.lifetime_state["lifetime_physical_writes"] + phys_writes,
+                "device_serial": self.device_serial
             }
