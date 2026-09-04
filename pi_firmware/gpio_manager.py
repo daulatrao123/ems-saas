@@ -34,6 +34,10 @@ class GPIOManager:
         self.monitor_thread = threading.Thread(target=self._local_monitor_loop, daemon=True)
         self.monitor_thread.start()
 
+    def _is_feedback_enabled(self, slot: str) -> bool:
+        # Authoritative internal check
+        return self.device_config.get("slots", {}).get(slot, {}).get("feedback_enabled", False)
+
     def _read_feedback_raw(self, slot: str) -> bool:
         btn = self.feedback_inputs[slot]
         first_read = btn.is_pressed()
@@ -41,8 +45,10 @@ class GPIOManager:
         second_read = btn.is_pressed()
         return first_read and second_read
 
-    def verify_slot(self, slot: str, expected_commanded: CommandedState, feedback_configured: bool) -> VerificationState:
-        if not feedback_configured: return VerificationState.NOT_CONFIGURED
+    def verify_slot(self, slot: str, expected_commanded: CommandedState) -> VerificationState:
+        is_fb_enabled = self._is_feedback_enabled(slot)
+        if not is_fb_enabled: return VerificationState.NOT_CONFIGURED
+        
         is_closed = self._read_feedback_raw(slot)
         if expected_commanded == CommandedState.ON:
             return VerificationState.VERIFIED_ON if is_closed else VerificationState.MISMATCH_ON_OFF
@@ -55,10 +61,9 @@ class GPIOManager:
         logger.info("Starting Hardware Reconciliation...")
         active_relays = []
         active_feedbacks = []
-        fb_slots_config = self.device_config.get("slots", {})
 
         for slot in self.profile["slots"]:
-            is_fb_enabled = fb_slots_config.get(slot, {}).get("feedback_enabled", False)
+            is_fb_enabled = self._is_feedback_enabled(slot)
             if self.relays[slot].is_active:
                 active_relays.append(slot)
                 self.state_manager.set_gpio_output(slot, GpioOutputState.ON)
@@ -86,8 +91,7 @@ class GPIOManager:
             self.state_manager.set_verification(slot, VerificationState.VERIFIED_ON, immediate=True)
         elif len(active_relays) == 1:
             slot = active_relays[0]
-            is_fb_enabled = fb_slots_config.get(slot, {}).get("feedback_enabled", False)
-            if is_fb_enabled:
+            if self._is_feedback_enabled(slot):
                 logger.critical(f"Slot {slot} Relay ON but Feedback OFF during boot! MISMATCH.")
                 self.state_manager.set_verification(slot, VerificationState.MISMATCH_ON_OFF, immediate=True)
                 self.state_manager.system_state = SystemState.FAULT
@@ -99,17 +103,18 @@ class GPIOManager:
         else:
             for slot in self.profile["slots"]:
                 self.state_manager.set_commanded(slot, CommandedState.OFF)
-                self.state_manager.set_verification(slot, VerificationState.VERIFIED_OFF if fb_slots_config.get(slot, {}).get("feedback_enabled") else VerificationState.NOT_CONFIGURED)
+                self.state_manager.set_verification(slot, VerificationState.VERIFIED_OFF if self._is_feedback_enabled(slot) else VerificationState.NOT_CONFIGURED)
             self.state_manager.active_slot = None
             
         self.state_manager.system_state = SystemState.READY
         logger.info("Hardware Reconciliation Complete. System READY.")
         return True
 
-    def transition_slot(self, target_slot: str, feedback_configured: bool) -> bool:
+    def transition_slot(self, target_slot: str) -> bool:
         with self._lock:
             if self.state_manager.system_state == SystemState.FAULT: return False
             current_active = self.state_manager.active_slot
+            is_fb_enabled = self._is_feedback_enabled(target_slot)
             
             if current_active and current_active != target_slot:
                 self.relays[current_active].off()
@@ -117,8 +122,8 @@ class GPIOManager:
                 self.state_manager.set_commanded(current_active, CommandedState.OFF)
                 
                 start_time = time.time()
-                while feedback_configured:
-                    v_state = self.verify_slot(current_active, CommandedState.OFF, feedback_configured)
+                while is_fb_enabled:
+                    v_state = self.verify_slot(current_active, CommandedState.OFF)
                     if v_state == VerificationState.VERIFIED_OFF: break
                     if v_state == VerificationState.MISMATCH_OFF_ON:
                         logger.critical(f"Slot {current_active} WELDED! Failed to open.")
@@ -137,12 +142,12 @@ class GPIOManager:
             
             start_time = time.time()
             while True:
-                v_state = self.verify_slot(target_slot, CommandedState.ON, feedback_configured)
-                if feedback_configured and v_state == VerificationState.VERIFIED_ON:
+                v_state = self.verify_slot(target_slot, CommandedState.ON)
+                if is_fb_enabled and v_state == VerificationState.VERIFIED_ON:
                     self.state_manager.active_slot = target_slot
                     self.state_manager.set_verification(target_slot, VerificationState.VERIFIED_ON, immediate=True)
                     return True
-                elif not feedback_configured:
+                elif not is_fb_enabled:
                     self.state_manager.active_slot = target_slot
                     self.state_manager.set_verification(target_slot, VerificationState.GPIO_CONFIRMED, immediate=True)
                     return True
@@ -159,12 +164,9 @@ class GPIOManager:
     def _local_monitor_loop(self):
         while self._running:
             if self.state_manager.system_state == SystemState.READY:
-                # Authoritative configuration from cloud config
-                fb_slots_config = self.device_config.get("slots", {})
                 for slot, state_obj in self.state_manager.slots.items():
-                    is_fb_enabled = fb_slots_config.get(slot, {}).get("feedback_enabled", False)
-                    if state_obj.commanded_state in [CommandedState.ON, CommandedState.OFF] and is_fb_enabled:
-                        v_state = self.verify_slot(slot, state_obj.commanded_state, is_fb_enabled)
+                    if state_obj.commanded_state in [CommandedState.ON, CommandedState.OFF] and self._is_feedback_enabled(slot):
+                        v_state = self.verify_slot(slot, state_obj.commanded_state)
                         if state_obj.commanded_state == CommandedState.ON and v_state == VerificationState.MISMATCH_ON_OFF:
                             logger.critical(f"Slot {slot} physically turned OFF unexpectedly!")
                             self.state_manager.set_verification(slot, v_state, immediate=True)

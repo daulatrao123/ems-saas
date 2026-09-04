@@ -17,6 +17,7 @@ INTERLOCK_DELAY_MS = 500
 LOCAL_MONITOR_INTERVAL_S = 2.0
 SYNC_INTERVAL_S = 60.0
 SQLITE_BUSY_TIMEOUT_MS = 5000
+STATE_VERSION = 1
 
 # --- Storage Architecture ---
 DATA_DIR = "/mnt/ems-data"
@@ -36,10 +37,13 @@ for d in [DATA_DIR, STATE_DIR, LOG_DIR, QUEUE_DIR, TELEMETRY_DIR]:
 DAILY_LOG_BUDGET_BYTES = 10 * 1024 * 1024
 CRITICAL_LOG_BUDGET_BYTES = 2 * 1024 * 1024
 
-# --- Cloud API ---
+# --- Cloud API (Fail-Closed) ---
 API_BASE_URL = os.environ.get("EMS_API_URL", "https://ems-backend.onrender.com/api")
-DEVICE_ID = os.environ.get("EMS_DEVICE_ID", "PI-001")
-API_KEY = os.environ.get("EMS_API_KEY", "dev-secret-key")
+DEVICE_ID = os.environ.get("EMS_DEVICE_ID")
+API_KEY = os.environ.get("EMS_API_KEY")
+
+if not DEVICE_ID or not API_KEY:
+    raise RuntimeError("FATAL: EMS_DEVICE_ID and EMS_API_KEY environment variables are required.")
 
 def get_hardware_profile(profile_name: str = "EMS-4CH-v1") -> dict:
     profile = HARDWARE_PROFILES.get(profile_name)

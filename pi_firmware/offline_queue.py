@@ -27,6 +27,10 @@ class OfflineQueue:
         cur = self.conn.execute("SELECT id, slot, action FROM commands WHERE status='DELIVERED' ORDER BY created_at LIMIT 1")
         return cur.fetchone()
 
+    def get_interrupted(self):
+        cur = self.conn.execute("SELECT id, slot, action FROM commands WHERE status='EXECUTING'")
+        return cur.fetchall()
+
     def update_status(self, cmd_id, status, verification=None, error=None):
         self.conn.execute("""UPDATE commands SET status=?, hardware_verification=?, last_error=? WHERE id=?""",
                            (status, verification, error, cmd_id))

@@ -4,7 +4,7 @@ import threading
 import time
 from enum import Enum
 from datetime import datetime
-from config import STATE_FILE, BACKUP_STATE_FILE
+from config import STATE_FILE, BACKUP_STATE_FILE, STATE_VERSION
 from logger import logger
 
 class CommandedState(str, Enum):
@@ -100,6 +100,7 @@ class PiStateManager:
     def _flush_to_disk(self):
         with self._save_lock:
             data = {
+                "version": STATE_VERSION,
                 "system_state": self.system_state.value, "active_slot": self.active_slot,
                 "slots": {code: s.to_dict() for code, s in self.slots.items()}
             }
@@ -113,7 +114,6 @@ class PiStateManager:
                 if os.path.exists(STATE_FILE): os.replace(STATE_FILE, BACKUP_STATE_FILE)
                 os.replace(tmp_file, STATE_FILE)
                 
-                # Directory fsync for absolute durability
                 dir_fd = os.open(os.path.dirname(STATE_FILE), os.O_DIRECTORY)
                 try: os.fsync(dir_fd)
                 finally: os.close(dir_fd)
