@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v6.2.0 — Industrial Production (Strict Multi-Pi & 4-Slot Contract)
+EMS SaaS Backend v6.2.1 — Industrial Production (Strict Multi-Pi & 4-Slot Contract)
 """
 
 import os
@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.2.0-prod")
+app = FastAPI(title="EMS SaaS API", version="6.2.1-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -97,16 +97,39 @@ def ensure_db_schema():
                 );
             """)
             
-            # PRODUCTION v6.2: Rename legacy wing_* tables to slot_*
+            # PRODUCTION v6.2: Safe Rename of legacy wing_* tables and columns
             cur.execute("""
                 DO $$ BEGIN
+                    -- 1. Rename tables if they exist
                     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs') THEN
                         ALTER TABLE wing_configs RENAME TO slot_configs;
-                        ALTER TABLE slot_configs RENAME COLUMN wing_code TO slot_code;
                     END IF;
                     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state') THEN
                         ALTER TABLE wing_state RENAME TO slot_state;
-                        ALTER TABLE slot_state RENAME COLUMN wing_code TO slot_code;
+                    END IF;
+
+                    -- 2. Normalize column names to 'slot' in slot_configs
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='wing_code') THEN
+                        ALTER TABLE slot_configs RENAME COLUMN wing_code TO slot;
+                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='slot_code') THEN
+                        ALTER TABLE slot_configs RENAME COLUMN slot_code TO slot;
+                    END IF;
+
+                    -- 3. Normalize column names to 'slot' in slot_state
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='wing_code') THEN
+                        ALTER TABLE slot_state RENAME COLUMN wing_code TO slot;
+                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='slot_code') THEN
+                        ALTER TABLE slot_state RENAME COLUMN slot_code TO slot;
+                    END IF;
+
+                    -- 4. Normalize column names in pi_commands
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
+                        ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
+                    END IF;
+
+                    -- 5. Normalize column names in pi_state
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
+                        ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
                     END IF;
                 END $$;
             """)
@@ -183,22 +206,10 @@ def ensure_db_schema():
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS hardware_profile TEXT DEFAULT 'EMS-4CH-v1'")
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS feedback_hardware_installed BOOLEAN DEFAULT FALSE")
-            cur.execute("ALTER TABLE slot_configs ADD COLUMN IF NOT EXISTS feedback_enabled BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE slot_configs ADD COLUMN IF NOT EXISTS feedback_enabled BOOL DEFAULT FALSE")
             
             # Drop the unique constraint from v5.6 if it exists
             cur.execute("DROP INDEX IF EXISTS uq_pi_devices_society_id")
-            
-            # Safely rename active_wing to active_slot in pi_state
-            cur.execute("""
-                DO $$ BEGIN
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
-                        ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
-                    END IF;
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
-                        ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
-                    END IF;
-                END $$;
-            """)
 
             cur.execute("""
                 DO $$ BEGIN
@@ -212,7 +223,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v6.2 Strict Slot Migration)")
+        print("DB schema verified OK (Relational v6.2.1 Strict Slot Migration)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -747,6 +758,88 @@ def delete_user(data: dict, user: dict = Depends(require_role("super_admin"))):
         conn.close()
     return {"message": "Deleted"}
 
+@app.get("/api/super-admin/firmware/versions")
+def get_firmware_versions(user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT version, changelog, forced, created_at, updated_at FROM firmware_versions ORDER BY created_at DESC")
+            versions = cur.fetchall()
+            return versions
+    finally:
+        conn.close()
+
+@app.post("/api/super-admin/firmware/save")
+def save_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            version = data.get("version", "").strip()
+            code = data.get("code", "")
+            changelog = data.get("changelog", "")
+            forced = data.get("forced", False)
+            if not version or not code:
+                raise HTTPException(400, "Version and code required")
+                
+            if forced:
+                cur.execute("UPDATE firmware_versions SET forced = FALSE")
+                
+            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at) 
+                           VALUES (%s, %s, %s, %s, %s, %s) 
+                           ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s""",
+                        (version, code, changelog, forced, datetime.now(timezone.utc), datetime.now(timezone.utc), code, changelog, forced, datetime.now(timezone.utc)))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+    return {"message": "Saved"}
+
+@app.post("/api/super-admin/firmware/delete")
+def delete_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM firmware_versions WHERE version = %s", (data.get("version"),))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+    return {"message": "Deleted"}
+
+@app.post("/api/super-admin/firmware/force")
+def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE firmware_versions SET forced = FALSE")
+            cur.execute("UPDATE firmware_versions SET forced = TRUE WHERE version = %s", (data.get("version"),))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+    return {"message": "Force flag updated"}
+
+@app.get("/api/pi/firmware-download")
+def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-Key")):
+    if not x_api_key:
+        raise HTTPException(403, "API key required in X-Api-Key header")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT code FROM firmware_versions WHERE version = %s", (version,))
+            fv = cur.fetchone()
+            if not fv:
+                raise HTTPException(404, "Version not found")
+            return PlainTextResponse(fv["code"], media_type="text/plain")
+    finally:
+        conn.close()
+
 # ================================================================
 # PI SYNC (Returns canonical config for THIS specific Pi)
 # ================================================================
@@ -764,9 +857,10 @@ def pi_sync(request: Request, payload: dict):
                         (now, payload.get("firmwareVersion", "unknown"), device_id))
                         
             # v6.2: Accept slots instead of wings
-            for slot_code, w in payload.get("slots", {}).items():
+            slots_payload = payload.get("slots", payload.get("wings", {}))
+            for slot_code, w in slots_payload.items():
                 if slot_code not in SLOTS: continue
-                physical_toggle = w.get("physical_toggle", "UNKNOWN")
+                physical_toggle = w.get("physical_toggle", w.get("physicalToggle", "UNKNOWN"))
                 if isinstance(physical_toggle, bool): physical_toggle = "ON" if physical_toggle else "OFF"
                 physical_toggle = str(physical_toggle).upper()
                 if physical_toggle not in ("ON", "OFF", "UNKNOWN"): physical_toggle = "UNKNOWN"
@@ -775,7 +869,7 @@ def pi_sync(request: Request, payload: dict):
                                VALUES (%s, %s, %s, %s, %s) 
                                ON CONFLICT (device_id, slot) DO UPDATE SET 
                                physical_toggle=EXCLUDED.physical_toggle, used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks""",
-                            (device_id, slot_code, physical_toggle, int(w.get("used_days", 0)), int(w.get("clicks", 0))))
+                            (device_id, slot_code, physical_toggle, int(w.get("used_days", w.get("usedDays", 0))), int(w.get("clicks", 0))))
 
             cur.execute("SELECT config_version FROM societies WHERE id = %s", (society_id,))
             soc = cur.fetchone()
@@ -801,7 +895,7 @@ def pi_sync(request: Request, payload: dict):
                            uptime_seconds=EXCLUDED.uptime_seconds, cpu_temp=EXCLUDED.cpu_temp, disk_free_mb=EXCLUDED.disk_free_mb, 
                            last_sync=EXCLUDED.last_sync, boot_count=EXCLUDED.boot_count, last_shutdown_reason=EXCLUDED.last_shutdown_reason, 
                            clock_source=EXCLUDED.clock_source, watchdog_enabled=EXCLUDED.watchdog_enabled, last_reboot_reason=EXCLUDED.last_reboot_reason""",
-                        (device_id, payload.get("active_slot"), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
+                        (device_id, payload.get("active_slot", payload.get("activeWing")), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
                          bool(payload.get("emergencyStop", False)), int(payload.get("uptimeSeconds", 0)),
                          float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
