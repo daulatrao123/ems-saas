@@ -1,218 +1,571 @@
-import os
 import json
-import threading
+import os
 import subprocess
-from datetime import datetime
-from config import DATA_DIR, TELEMETRY_DIR, TOTAL_DAILY_PHYSICAL_BUDGET_BYTES
+import threading
+from datetime import datetime, timezone
+
+from config import (
+    DATA_DIR,
+    TELEMETRY_DIR,
+    HEALTH_DIR,
+    TOTAL_DAILY_PHYSICAL_BUDGET_BYTES,
+)
 from logger import logger
 
+
 class StorageIOMeter:
-    """Single authoritative storage accounting component."""
+    """
+    Measures block-device I/O.
+
+    IMPORTANT:
+    /proc/diskstats does NOT expose NAND P/E cycles.
+    Therefore this class reports block I/O and an estimated ratio,
+    not true NAND wear.
+    """
+
     def __init__(self):
+        self.lock = threading.Lock()
+
         self.device = self._get_device_name(DATA_DIR)
         self.device_serial = self._get_device_serial()
-        self.epoch_file = os.path.join(TELEMETRY_DIR, "storage_epoch.json")
-        self.lifetime_file = os.path.join(TELEMETRY_DIR, "lifetime_counters.json")
-        self.history_file = os.path.join(TELEMETRY_DIR, "epoch_history.json")
-        
-        self.lock = threading.Lock()
-        self.state = self._load_state()
-        self.lifetime_state = self._load_lifetime_state()
-        self.last_wal_size = 0
-        
-        today = datetime.now().strftime("%Y-%m-%d")
+
+        self.epoch_file = os.path.join(
+            TELEMETRY_DIR,
+            "storage_epoch.json",
+        )
+
+        self.lifetime_file = os.path.join(
+            HEALTH_DIR,
+            "storage_lifetime.json",
+        )
+
+        self.history_file = os.path.join(
+            HEALTH_DIR,
+            "storage_device_history.json",
+        )
+
+        self.state = self._load_json(self.epoch_file)
+        self.lifetime_state = self._load_json(
+            self.lifetime_file
+        )
+
+        self.lifetime_state.setdefault(
+            "lifetime_logical_ems_writes",
+            0,
+        )
+        self.lifetime_state.setdefault(
+            "lifetime_block_writes",
+            0,
+        )
+        self.lifetime_state.setdefault(
+            "lifetime_block_reads",
+            0,
+        )
+
         current_reads, current_writes = self._read_diskstats()
-        
-        # If date changed, device changed, or counters reset
-        if today != self.state.get("date") or \
-           self.device_serial != self.state.get("device_serial") or \
-           current_writes < self.state.get("baseline_phys_writes", 0):
-            
-            if self.device_serial != self.state.get("device_serial") and self.state.get("device_serial"):
-                logger.critical("STORAGE_DEVICE_CHANGED: USB drive replaced! Archiving epoch.")
-                self._archive_epoch()
-                self.lifetime_state = {"lifetime_logical_writes": 0, "lifetime_physical_writes": 0, "lifetime_physical_reads": 0}
-                self._save_lifetime_state()
-                
+
+        today = datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%d")
+
+        stored_date = self.state.get("date")
+        stored_serial = self.state.get("device_serial")
+
+        device_changed = (
+            stored_serial
+            and stored_serial != self.device_serial
+        )
+
+        counter_reset = (
+            current_writes
+            < self.state.get("baseline_block_writes", 0)
+        )
+
+        if device_changed:
+            self._archive_previous_device()
+
+        if (
+            stored_date != today
+            or device_changed
+            or counter_reset
+        ):
             self.state = {
                 "date": today,
+                "device": self.device,
                 "device_serial": self.device_serial,
-                "baseline_phys_reads": current_reads,
-                "baseline_phys_writes": current_writes,
-                "logical_writes": {
-                    "normal_log": 0, "critical_log": 0, "state": 0, 
-                    "queue_db": 0, "telemetry": 0, "other": 0
-                }
-            }
-            self._save_state()
 
-    def _get_device_name(self, path):
+                "baseline_block_reads": current_reads,
+                "baseline_block_writes": current_writes,
+
+                "logical_writes": {
+                    "normal_log": 0,
+                    "critical_log": 0,
+                    "state": 0,
+                    "queue_db": 0,
+                    "telemetry": 0,
+                    "diagnostics": 0,
+                    "other": 0,
+                },
+            }
+
+            self._atomic_write_json(
+                self.epoch_file,
+                self.state,
+            )
+
+    # ------------------------------------------------------------
+    # DEVICE IDENTIFICATION
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _get_device_name(path):
         try:
-            result = os.popen(f"df {path}").read().split('\n')[1].split()[0]
-            base = os.path.basename(result)
-            if base.startswith("mmcblk"): return base.replace("p2", "").replace("p1", "")
-            if base.startswith("sd"): return base[:3]
+            result = subprocess.run(
+                ["df", "-P", path],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+
+            lines = result.stdout.strip().splitlines()
+
+            if len(lines) < 2:
+                return None
+
+            filesystem = lines[1].split()[0]
+
+            base = os.path.basename(filesystem)
+
+            if base.startswith("mmcblk"):
+                if "p" in base:
+                    return base.rsplit("p", 1)[0]
+                return base
+
+            if base.startswith("nvme"):
+                # nvme0n1p2 -> nvme0n1
+                if "p" in base:
+                    return base.rsplit("p", 1)[0]
+                return base
+
+            if base.startswith("sd"):
+                # sda1 -> sda
+                return base.rstrip("0123456789")
+
+            return base
+
+        except Exception:
             return None
-        except: return None
 
     def _get_device_serial(self):
-        if not self.device: return "UNKNOWN"
+        if not self.device:
+            return "UNKNOWN"
+
         try:
-            result = subprocess.run(["lsblk", "-n", "-o", "SERIAL", f"/dev/{self.device}"], capture_output=True, text=True, timeout=5)
-            return result.stdout.strip() or "UNKNOWN"
-        except: return "UNKNOWN"
+            result = subprocess.run(
+                [
+                    "lsblk",
+                    "-n",
+                    "-o",
+                    "SERIAL",
+                    f"/dev/{self.device}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            serial = result.stdout.strip()
+
+            return serial or "UNKNOWN"
+
+        except Exception:
+            return "UNKNOWN"
+
+    # ------------------------------------------------------------
+    # DISKSTATS
+    # ------------------------------------------------------------
 
     def _read_diskstats(self):
-        if not self.device: return (0, 0)
+        if not self.device:
+            return 0, 0
+
         try:
-            with open("/proc/diskstats", "r") as f:
-                for line in f:
+            with open(
+                "/proc/diskstats",
+                "r",
+                encoding="utf-8",
+            ) as fh:
+                for line in fh:
                     parts = line.split()
-                    if parts[2] == self.device:
-                        return (int(parts[5]) * 512, int(parts[9]) * 512)
-        except: return (0, 0)
 
-    def _load_state(self):
-        if os.path.exists(self.epoch_file):
-            try:
-                with open(self.epoch_file, 'r') as f: return json.load(f)
-            except: pass
-        return {}
+                    if len(parts) < 10:
+                        continue
 
-    def _load_lifetime_state(self):
-        if os.path.exists(self.lifetime_file):
-            try:
-                with open(self.lifetime_file, 'r') as f: return json.load(f)
-            except: pass
-        return {"lifetime_logical_writes": 0, "lifetime_physical_writes": 0, "lifetime_physical_reads": 0}
+                    if parts[2] != self.device:
+                        continue
 
-    def _save_state(self):
+                    # Linux diskstats:
+                    # field 6 = sectors read
+                    # field 10 = sectors written
+                    sectors_read = int(parts[5])
+                    sectors_written = int(parts[9])
+
+                    return (
+                        sectors_read * 512,
+                        sectors_written * 512,
+                    )
+
+        except (OSError, ValueError):
+            pass
+
+        return 0, 0
+
+    # ------------------------------------------------------------
+    # JSON
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _load_json(path):
         try:
-            with open(self.epoch_file, 'w') as f: json.dump(self.state, f)
-        except: pass
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
 
-    def _save_lifetime_state(self):
-        try:
-            with open(self.lifetime_file, 'w') as f: json.dump(self.lifetime_state, f)
-        except: pass
+    @staticmethod
+    def _atomic_write_json(path, data):
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
 
-    def _archive_epoch(self):
-        """Preserve history of old USB drives before resetting."""
+        temp_path = path + ".tmp"
+
+        payload = json.dumps(
+            data,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+        with open(
+            temp_path,
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        os.replace(temp_path, path)
+
+        dir_fd = os.open(
+            directory,
+            os.O_DIRECTORY,
+        )
+
         try:
-            history = []
-            if os.path.exists(self.history_file):
-                with open(self.history_file, 'r') as f:
-                    history = json.load(f)
-            
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    # ------------------------------------------------------------
+    # DEVICE REPLACEMENT
+    # ------------------------------------------------------------
+
+    def _archive_previous_device(self):
+        try:
+            history = self._load_json(
+                self.history_file
+            )
+
+            if not isinstance(history, list):
+                history = []
+
             history.append({
-                "serial": self.state.get("device_serial"),
-                "archived_at": datetime.utcnow().isoformat(),
-                "lifetime_logical_writes": self.lifetime_state.get("lifetime_logical_writes", 0),
-                "lifetime_physical_writes": self.lifetime_state.get("lifetime_physical_writes", 0),
-                "lifetime_physical_reads": self.lifetime_state.get("lifetime_physical_reads", 0)
+                "serial": self.state.get(
+                    "device_serial"
+                ),
+                "device": self.state.get(
+                    "device"
+                ),
+                "archived_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                "lifetime_logical_ems_writes": (
+                    self.lifetime_state.get(
+                        "lifetime_logical_ems_writes",
+                        0,
+                    )
+                ),
+                "lifetime_block_writes": (
+                    self.lifetime_state.get(
+                        "lifetime_block_writes",
+                        0,
+                    )
+                ),
+                "lifetime_block_reads": (
+                    self.lifetime_state.get(
+                        "lifetime_block_reads",
+                        0,
+                    )
+                ),
             })
-            
-            with open(self.history_file, 'w') as f:
-                json.dump(history, f, indent=4)
-        except Exception as e:
-            logger.error(f"Failed to archive storage epoch: {e}")
 
-    def record_ems_write(self, category: str, bytes_written: int):
-        """Centralized write attribution."""
+            self._atomic_write_json(
+                self.history_file,
+                history[-20:],
+            )
+
+            logger.critical(
+                "STORAGE_DEVICE_CHANGED: "
+                "storage identity changed."
+            )
+
+        except Exception as exc:
+            logger.critical(
+                "Failed to archive storage device: %s",
+                exc,
+            )
+
+    # ------------------------------------------------------------
+    # LOGICAL WRITE ACCOUNTING
+    # ------------------------------------------------------------
+
+    def record_ems_write(
+        self,
+        category: str,
+        bytes_written: int,
+    ):
+        if bytes_written <= 0:
+            return
+
         with self.lock:
-            if category not in self.state["logical_writes"]:
-                category = "other"
-            self.state["logical_writes"][category] += bytes_written
+            logical = self.state.setdefault(
+                "logical_writes",
+                {},
+            )
 
-    def get_sqlite_stats(self):
-        """Measure SQLite DB and WAL contribution."""
-        db_file = os.path.join(DATA_DIR, "queue", "ems_queue.sqlite")
-        wal_file = db_file + "-wal"
-        db_size = 0
-        wal_size = 0
-        try:
-            if os.path.exists(db_file): db_size = os.path.getsize(db_file)
-            if os.path.exists(wal_file): wal_size = os.path.getsize(wal_file)
-        except: pass
-        
-        # Track WAL delta to estimate SQLite physical write contribution
-        wal_delta = max(0, wal_size - self.last_wal_size)
-        self.last_wal_size = wal_size
-        
-        return {"db_size": db_size, "wal_size": wal_size, "wal_delta": wal_delta}
+            if category not in logical:
+                category = "other"
+
+            logical[category] = (
+                logical.get(category, 0)
+                + int(bytes_written)
+            )
+
+    # ------------------------------------------------------------
+    # METRICS
+    # ------------------------------------------------------------
 
     def update_metrics(self):
         with self.lock:
-            today = datetime.now().strftime("%Y-%m-%d")
-            if today != self.state["date"]:
-                # Day rollover
-                total_logical = sum(self.state.get("logical_writes", {}).values())
-                self.lifetime_state["lifetime_logical_writes"] += total_logical
-                
-                current_reads, current_writes = self._read_diskstats()
-                phys_writes_today = current_writes - self.state.get("baseline_phys_writes", 0)
-                phys_reads_today = current_reads - self.state.get("baseline_phys_reads", 0)
-                
-                self.lifetime_state["lifetime_physical_writes"] += phys_writes_today
-                self.lifetime_state["lifetime_physical_reads"] += phys_reads_today
-                self._save_lifetime_state()
-                
-                self.state["date"] = today
-                self.state["baseline_phys_reads"] = current_reads
-                self.state["baseline_phys_writes"] = current_writes
-                self.state["logical_writes"] = {k: 0 for k in self.state["logical_writes"]}
-                self._save_state()
-            
-            current_reads, current_writes = self._read_diskstats()
-            
-            if current_writes < self.state["baseline_phys_writes"]:
-                self.state["baseline_phys_writes"] = current_writes
-                self.state["baseline_phys_reads"] = current_reads
-                self._save_state()
+            current_reads, current_writes = (
+                self._read_diskstats()
+            )
 
-    def get_metrics(self) -> dict:
+            baseline_reads = self.state.get(
+                "baseline_block_reads",
+                current_reads,
+            )
+
+            baseline_writes = self.state.get(
+                "baseline_block_writes",
+                current_writes,
+            )
+
+            daily_reads = max(
+                0,
+                current_reads - baseline_reads,
+            )
+
+            daily_writes = max(
+                0,
+                current_writes - baseline_writes,
+            )
+
+            if (
+                current_writes
+                < baseline_writes
+            ):
+                self.state[
+                    "baseline_block_writes"
+                ] = current_writes
+
+                self.state[
+                    "baseline_block_reads"
+                ] = current_reads
+
+                daily_writes = 0
+                daily_reads = 0
+
+            return {
+                "daily_physical_reads": daily_reads,
+                "daily_physical_writes": daily_writes,
+            }
+
+    def get_metrics(self):
         with self.lock:
-            current_reads, current_writes = self._read_diskstats()
-            phys_writes = current_writes - self.state.get("baseline_phys_writes", 0)
-            phys_reads = current_reads - self.state.get("baseline_phys_reads", 0)
-            logical_writes_dict = self.state.get("logical_writes", {})
-            app_logical_writes = sum(logical_writes_dict.values())
-            
-            sqlite_stats = self.get_sqlite_stats()
-            
-            # System logical = App logical + SQLite WAL delta (estimates OS/DB overhead)
-            system_logical_writes = app_logical_writes + sqlite_stats["wal_delta"]
-            
-            # Calculate WAFs separately
-            app_waf = (phys_writes / app_logical_writes) if app_logical_writes > 0 else 0
-            system_waf = (phys_writes / system_logical_writes) if system_logical_writes > 0 else 0
-            
-            # Capacity check
-            used_percent = 0
-            storage_ok = True
+            current_reads, current_writes = (
+                self._read_diskstats()
+            )
+
+            baseline_reads = self.state.get(
+                "baseline_block_reads",
+                current_reads,
+            )
+
+            baseline_writes = self.state.get(
+                "baseline_block_writes",
+                current_writes,
+            )
+
+            daily_reads = max(
+                0,
+                current_reads - baseline_reads,
+            )
+
+            daily_writes = max(
+                0,
+                current_writes - baseline_writes,
+            )
+
+            logical = dict(
+                self.state.get(
+                    "logical_writes",
+                    {},
+                )
+            )
+
+            logical_total = sum(
+                logical.values()
+            )
+
+            estimated_ratio = (
+                daily_writes / logical_total
+                if logical_total > 0
+                else 0.0
+            )
+
             try:
                 stat = os.statvfs(DATA_DIR)
-                total = stat.f_blocks * stat.f_frsize
-                free = stat.f_bavail * stat.f_frsize
-                used_percent = ((total - free) / total) * 100 if total > 0 else 100
-            except:
+
+                total_bytes = (
+                    stat.f_blocks
+                    * stat.f_frsize
+                )
+
+                free_bytes = (
+                    stat.f_bavail
+                    * stat.f_frsize
+                )
+
+                used_percent = (
+                    ((total_bytes - free_bytes)
+                     / total_bytes)
+                    * 100.0
+                    if total_bytes > 0
+                    else 100.0
+                )
+
+                storage_ok = True
+
+            except OSError:
+                total_bytes = 0
+                free_bytes = 0
+                used_percent = 100.0
                 storage_ok = False
-                
-            budget_exceeded = phys_writes > TOTAL_DAILY_PHYSICAL_BUDGET_BYTES
-            
+
+            budget_exceeded = (
+                daily_writes
+                >= TOTAL_DAILY_PHYSICAL_BUDGET_BYTES
+            )
+
             return {
-                "daily_app_logical_writes": app_logical_writes,
-                "daily_system_logical_writes": system_logical_writes,
-                "daily_logical_breakdown": logical_writes_dict,
-                "daily_physical_writes": phys_writes,
-                "daily_physical_reads": phys_reads,
-                "sqlite_stats": sqlite_stats,
-                "app_waf": round(app_waf, 2),
-                "system_waf": round(system_waf, 2),
-                "budget_exceeded": budget_exceeded,
-                "used_percent": used_percent,
+                "device": self.device,
+                "device_serial": self.device_serial,
+
+                "daily_logical_writes": logical,
+                "daily_logical_total": logical_total,
+
+                "daily_physical_reads": daily_reads,
+                "daily_physical_writes": daily_writes,
+
+                # Deliberately NOT called true WAF.
+                "estimated_block_io_ratio": round(
+                    estimated_ratio,
+                    3,
+                ),
+
+                "storage_total_bytes": total_bytes,
+                "storage_free_bytes": free_bytes,
+                "used_percent": round(
+                    used_percent,
+                    2,
+                ),
+
                 "storage_ok": storage_ok,
-                "lifetime_logical_writes": self.lifetime_state["lifetime_logical_writes"] + app_logical_writes,
-                "lifetime_physical_writes": self.lifetime_state["lifetime_physical_writes"] + phys_writes,
-                "device_serial": self.device_serial
+                "budget_exceeded": budget_exceeded,
+
+                "lifetime_logical_ems_writes": (
+                    self.lifetime_state.get(
+                        "lifetime_logical_ems_writes",
+                        0,
+                    )
+                    + logical_total
+                ),
+
+                "lifetime_block_writes": (
+                    self.lifetime_state.get(
+                        "lifetime_block_writes",
+                        0,
+                    )
+                    + daily_writes
+                ),
+
+                "lifetime_block_reads": (
+                    self.lifetime_state.get(
+                        "lifetime_block_reads",
+                        0,
+                    )
+                    + daily_reads
+                ),
             }
+
+    # ------------------------------------------------------------
+    # PERSIST LOW-FREQUENCY COUNTERS
+    # ------------------------------------------------------------
+
+    def persist_counters(self):
+        with self.lock:
+            metrics = self.get_metrics()
+
+            self.lifetime_state[
+                "lifetime_logical_ems_writes"
+            ] = metrics[
+                "lifetime_logical_ems_writes"
+            ]
+
+            self.lifetime_state[
+                "lifetime_block_writes"
+            ] = metrics[
+                "lifetime_block_writes"
+            ]
+
+            self.lifetime_state[
+                "lifetime_block_reads"
+            ] = metrics[
+                "lifetime_block_reads"
+            ]
+
+            self._atomic_write_json(
+                self.lifetime_file,
+                self.lifetime_state,
+            )
+
+            self._atomic_write_json(
+                self.epoch_file,
+                self.state,
+            )
