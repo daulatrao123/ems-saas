@@ -711,14 +711,16 @@ def delete_device(data: dict, user: dict = Depends(require_role("super_admin")))
     try:
         with conn.cursor() as cur:
             device_id = data.get("id")
-            cur.execute("DELETE FROM pi_devices WHERE id = %s", (device_id,))
+            # RED 3 Fix: Do not DELETE. Retire to preserve history & audit logs.
+            cur.execute("UPDATE pi_devices SET status='RETIRED', society_id=NULL WHERE id = %s", (device_id,))
+            log_audit(cur, user, 0, "RETIRE_DEVICE", {"device_id": device_id})
         conn.commit()
     except Exception as e:
         conn.rollback()
         raise e
     finally:
         conn.close()
-    return {"message": "Deleted"}
+    return {"message": "Device retired successfully"}
 
 # ================================================================
 # SUPER-ADMIN — USERS & FIRMWARE

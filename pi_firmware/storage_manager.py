@@ -1,6 +1,5 @@
 import os
 import time
-import shutil
 import threading
 from datetime import datetime
 from config import DATA_DIR, LOG_DIR, QUEUE_DIR, TELEMETRY_DIR, STATE_DIR

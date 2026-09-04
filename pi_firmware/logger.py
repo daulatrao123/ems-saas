@@ -1,6 +1,8 @@
 import os
 import logging
 import logging.handlers
+import threading
+import time
 from datetime import datetime
 from config import LOG_DIR, DAILY_LOG_BUDGET_BYTES, CRITICAL_LOG_BUDGET_BYTES
 
@@ -17,10 +19,21 @@ class DailyBudgetHandler(logging.Handler):
             self.bytes_written = os.path.getsize(self.current_filename)
         except FileNotFoundError:
             self.bytes_written = 0
+            
+        # Start background flusher for RAM-buffered normal logs
+        self._running = True
+        self.flush_thread = threading.Thread(target=self._periodic_flush, daemon=True)
+        self.flush_thread.start()
+
+    def _periodic_flush(self):
+        while self._running:
+            time.sleep(60.0)
+            self.fh.flush()
 
     def _rotate_if_new_day(self):
         today = datetime.now().strftime("%Y-%m-%d")
         if today != self.current_date:
+            self.fh.flush()
             self.fh.close()
             self.current_date = today
             self.current_filename = f"{self.base_filename}.{self.current_date}"
@@ -34,7 +47,7 @@ class DailyBudgetHandler(logging.Handler):
         
         if self.bytes_written + msg_bytes <= self.budget_bytes:
             self.fh.write(msg)
-            self.fh.flush()
+            # DO NOT flush here. Let OS buffer it to reduce flash writes.
             self.bytes_written += msg_bytes
 
 def setup_logger():
