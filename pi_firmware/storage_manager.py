@@ -2,16 +2,17 @@ import os
 import time
 import threading
 from datetime import datetime
-from config import DATA_DIR, LOG_DIR, QUEUE_DIR, TELEMETRY_DIR, STATE_DIR
+from config import (DATA_DIR, LOG_DIR, QUEUE_DIR, TELEMETRY_DIR, STATE_DIR, 
+                    TOTAL_DAILY_USB_BUDGET_BYTES)
 from logger import logger
 
 class StorageIOMeter:
     """Tracks actual block device writes in RAM to detect write amplification and budget endurance."""
     def __init__(self):
         self.device = self._get_device_name(DATA_DIR)
-        self.last_sectors_written = self._read_diskstats()
+        self.session_start_sectors = self._read_diskstats()
         self.ram_metrics = {
-            "ems_writes": 0, "ems_read_ops": 0, "block_writes_bytes": 0,
+            "ems_writes": 0, "block_writes_bytes": 0,
             "write_rate_mbps": 0.0, "ram_total": 0, "ram_used": 0, "swap_used": 0
         }
         self.lock = threading.Lock()
@@ -42,9 +43,9 @@ class StorageIOMeter:
         if not self.device: return
         with self.lock:
             current_block_writes = self._read_diskstats()
-            self.ram_metrics["block_writes_bytes"] = current_block_writes
+            # Calculate total bytes written since boot
+            self.ram_metrics["block_writes_bytes"] = current_block_writes - self.session_start_sectors
             
-            # Read RAM/Swap from /proc/meminfo
             try:
                 with open("/proc/meminfo", "r") as f:
                     meminfo = dict(line.split(":") for line in f.readlines())
@@ -59,6 +60,7 @@ class StorageIOMeter:
 class StorageManager:
     def __init__(self):
         self.storage_ok = True
+        self.write_budget_exceeded = False
         self.io_meter = StorageIOMeter()
         self._running = True
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -70,11 +72,20 @@ class StorageManager:
             self.check_health()
             self.io_meter.update_metrics()
             
-            # Write-rate protection (Alert if > 50MB/hour average)
-            # 50MB * 60min = 3000MB. In bytes: 3000 * 1024 * 1024
-            if self.io_meter.ram_metrics["block_writes_bytes"] > 3000 * 1024 * 1024:
-                logger.critical("STORAGE WRITE RATE EXCEEDED! Possible runaway process or write amplification.")
-                self.storage_ok = False
+            # HARD WRITE BUDGET ENFORCEMENT
+            if self.io_meter.ram_metrics["block_writes_bytes"] > TOTAL_DAILY_USB_BUDGET_BYTES:
+                if not self.write_budget_exceeded:
+                    logger.critical(f"DAILY USB WRITE BUDGET EXCEEDED ({TOTAL_DAILY_USB_BUDGET_BYTES / 1024 / 1024}MB). Halting non-critical writes.")
+                    self.write_budget_exceeded = True
+            else:
+                if self.write_budget_exceeded:
+                    logger.info("Daily USB write budget recovered (new day or reset).")
+                    self.write_budget_exceeded = False
+
+    def is_write_allowed(self, critical: bool = False) -> bool:
+        """Modules must check this before writing to USB."""
+        if critical: return True
+        return not self.write_budget_exceeded
 
     def check_health(self):
         try:
@@ -139,12 +150,14 @@ class StorageManager:
 
     def save_daily_telemetry(self):
         """Flushes RAM telemetry to USB exactly once per day."""
+        if not self.is_write_allowed():
+            return
+            
         try:
             metrics = self.io_meter.get_daily_summary()
             daily_file = os.path.join(TELEMETRY_DIR, f"daily_{datetime.utcnow().strftime('%Y-%m-%d')}.csv")
             with open(daily_file, 'a') as f:
                 f.write(f"{datetime.utcnow().isoformat()},{metrics['ems_writes']},{metrics['block_writes_bytes']},{metrics['ram_used']},{metrics['swap_used']}\n")
-            # Reset RAM counters for the next day
             self.io_meter.ram_metrics["ems_writes"] = 0
             logger.info("Daily storage telemetry flushed to USB.")
         except Exception as e:

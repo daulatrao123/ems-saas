@@ -6,12 +6,15 @@ from gpio_manager import GPIOManager
 from api_client import ApiClient
 from offline_queue import OfflineQueue
 from storage_manager import StorageManager
+import logger as logger_module
 from logger import logger
 
 class EmsController:
     def __init__(self):
         logger.info("Initializing EMS Controller...")
         self.storage = StorageManager()
+        logger_module.set_storage_manager(self.storage) # Allow logger to check write budget
+        
         self.state_manager = PiStateManager(self.storage)
         self.queue = OfflineQueue()
         self.api = ApiClient()
@@ -19,7 +22,6 @@ class EmsController:
         self.gpio_manager = None
         self._running = True
         
-        # Track last day for daily telemetry flush
         self.last_telemetry_day = time.strftime("%Y-%m-%d")
 
     def validate_config(self, config: dict) -> bool:
@@ -139,7 +141,6 @@ class EmsController:
         while self._running:
             time.sleep(SYNC_INTERVAL_S)
             
-            # Daily Telemetry Flush (Exactly once per day)
             current_day = time.strftime("%Y-%m-%d")
             if current_day != self.last_telemetry_day:
                 self.storage.save_daily_telemetry()

@@ -33,9 +33,11 @@ DB_FILE = os.path.join(QUEUE_DIR, "ems_queue.sqlite")
 for d in [DATA_DIR, STATE_DIR, LOG_DIR, QUEUE_DIR, TELEMETRY_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# --- Storage Budgets ---
-DAILY_LOG_BUDGET_BYTES = 10 * 1024 * 1024
-CRITICAL_LOG_BUDGET_BYTES = 2 * 1024 * 1024
+# --- Storage Budgets (10-year design) ---
+DAILY_LOG_BUDGET_BYTES = 10 * 1024 * 1024  # 10 MB hard limit for app logs
+CRITICAL_LOG_BUDGET_BYTES = 2 * 1024 * 1024 # 2 MB hard limit for critical logs
+# Total EMS USB write budget per day (Logs + State + SQLite + Telemetry)
+TOTAL_DAILY_USB_BUDGET_BYTES = 50 * 1024 * 1024 # 50 MB/day hard cap
 
 # --- Cloud API (Fail-Closed) ---
 API_BASE_URL = os.environ.get("EMS_API_URL", "https://ems-backend.onrender.com/api")

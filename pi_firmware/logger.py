@@ -6,6 +6,13 @@ import time
 from datetime import datetime
 from config import LOG_DIR, DAILY_LOG_BUDGET_BYTES, CRITICAL_LOG_BUDGET_BYTES
 
+# Global storage manager reference to check write budgets
+_storage_mgr = None
+
+def set_storage_manager(storage_mgr):
+    global _storage_mgr
+    _storage_mgr = storage_mgr
+
 class DailyBudgetHandler(logging.Handler):
     def __init__(self, filename, budget_bytes):
         super().__init__()
@@ -20,7 +27,6 @@ class DailyBudgetHandler(logging.Handler):
         except FileNotFoundError:
             self.bytes_written = 0
             
-        # Start background flusher for RAM-buffered normal logs
         self._running = True
         self.flush_thread = threading.Thread(target=self._periodic_flush, daemon=True)
         self.flush_thread.start()
@@ -42,12 +48,16 @@ class DailyBudgetHandler(logging.Handler):
 
     def emit(self, record):
         self._rotate_if_new_day()
+        
+        # HARD BUDGET STOP: Do not write if USB budget exceeded
+        if _storage_mgr and not _storage_mgr.is_write_allowed():
+            return
+            
         msg = self.format(record) + "\n"
         msg_bytes = len(msg.encode('utf-8'))
         
         if self.bytes_written + msg_bytes <= self.budget_bytes:
             self.fh.write(msg)
-            # DO NOT flush here. Let OS buffer it to reduce flash writes.
             self.bytes_written += msg_bytes
 
 def setup_logger():
