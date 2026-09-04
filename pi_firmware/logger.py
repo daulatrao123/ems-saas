@@ -14,24 +14,22 @@ _storage_mgr = None
 _storage_lock = threading.Lock()
 
 
-def set_storage_manager(storage_mgr):
+def set_storage_manager(
+    storage_mgr,
+):
+
     global _storage_mgr
 
     with _storage_lock:
-        _storage_mgr = storage_mgr
+
+        _storage_mgr = (
+            storage_mgr
+        )
 
 
-class DailyBudgetHandler(logging.Handler):
-    """
-    One file per day.
-
-    No backup-count rotation.
-    No hourly rewriting.
-    No periodic fsync for normal logs.
-
-    Normal logs are intentionally lower durability than
-    critical safety/audit events.
-    """
+class DailyBudgetHandler(
+    logging.Handler
+):
 
     def __init__(
         self,
@@ -40,17 +38,31 @@ class DailyBudgetHandler(logging.Handler):
         category,
         fsync_each_write=False,
     ):
+
         super().__init__()
 
-        self.filename_prefix = filename_prefix
-        self.budget_bytes = budget_bytes
-        self.category = category
-        self.fsync_each_write = fsync_each_write
+        self.filename_prefix = (
+            filename_prefix
+        )
+
+        self.budget_bytes = (
+            budget_bytes
+        )
+
+        self.category = (
+            category
+        )
+
+        self.fsync_each_write = (
+            fsync_each_write
+        )
 
         self.lock = threading.RLock()
 
         self.current_date = (
-            datetime.now().strftime("%Y-%m-%d")
+            datetime.now().strftime(
+                "%Y-%m-%d"
+            )
         )
 
         self.current_filename = (
@@ -58,8 +70,12 @@ class DailyBudgetHandler(logging.Handler):
             f"{self.current_date}"
         )
 
+        directory = os.path.dirname(
+            self.current_filename
+        )
+
         os.makedirs(
-            os.path.dirname(self.current_filename),
+            directory,
             exist_ok=True,
         )
 
@@ -71,22 +87,37 @@ class DailyBudgetHandler(logging.Handler):
         )
 
         try:
-            self.bytes_written = os.path.getsize(
-                self.current_filename
+
+            self.bytes_written = (
+                os.path.getsize(
+                    self.current_filename
+                )
             )
+
         except OSError:
+
             self.bytes_written = 0
 
     def _rotate_if_needed(self):
-        today = datetime.now().strftime(
-            "%Y-%m-%d"
+
+        today = (
+            datetime.now().strftime(
+                "%Y-%m-%d"
+            )
         )
 
         if today == self.current_date:
             return
 
-        self.fh.flush()
-        self.fh.close()
+        try:
+            self.fh.flush()
+        except Exception:
+            pass
+
+        try:
+            self.fh.close()
+        except Exception:
+            pass
 
         self.current_date = today
 
@@ -102,71 +133,128 @@ class DailyBudgetHandler(logging.Handler):
             buffering=1,
         )
 
-        self.bytes_written = 0
-
-    def emit(self, record):
         try:
+
+            self.bytes_written = (
+                os.path.getsize(
+                    self.current_filename
+                )
+            )
+
+        except OSError:
+
+            self.bytes_written = 0
+
+    def emit(
+        self,
+        record,
+    ):
+
+        try:
+
             with self.lock:
+
                 self._rotate_if_needed()
 
                 with _storage_lock:
-                    storage_mgr = _storage_mgr
+                    storage_mgr = (
+                        _storage_mgr
+                    )
 
                 if (
                     storage_mgr
-                    and not storage_mgr.is_write_allowed(
+                    and not
+                    storage_mgr
+                    .is_write_allowed(
                         self.category
                     )
                 ):
+
                     return
 
                 message = (
-                    self.format(record)
+                    self.format(
+                        record
+                    )
                     + "\n"
                 )
 
-                encoded = message.encode(
-                    "utf-8"
+                encoded = (
+                    message.encode(
+                        "utf-8"
+                    )
                 )
 
-                size = len(encoded)
+                size = len(
+                    encoded
+                )
 
                 if (
-                    self.bytes_written + size
-                    > self.budget_bytes
+                    self.bytes_written
+                    + size
+                    >
+                    self.budget_bytes
                 ):
+
+                    # Budget exhausted.
+                    # Deliberately do not keep
+                    # writing this category.
                     return
 
-                self.fh.write(message)
+                self.fh.write(
+                    message
+                )
 
                 if self.fsync_each_write:
+
                     self.fh.flush()
+
                     os.fsync(
                         self.fh.fileno()
                     )
 
-                self.bytes_written += size
+                self.bytes_written += (
+                    size
+                )
 
                 if storage_mgr:
+
                     storage_mgr.io_meter.record_ems_write(
                         self.category,
                         size,
                     )
 
         except Exception:
-            self.handleError(record)
+
+            self.handleError(
+                record
+            )
 
     def close(self):
+
         try:
+
             with self.lock:
+
                 if self.fh:
-                    self.fh.flush()
-                    self.fh.close()
+
+                    try:
+                        self.fh.flush()
+                    except Exception:
+                        pass
+
+                    try:
+                        self.fh.close()
+                    except Exception:
+                        pass
+
         finally:
+
             super().close()
 
 
 def setup_logger():
+
     ems_logger = logging.getLogger(
         "EMS"
     )
@@ -178,21 +266,28 @@ def setup_logger():
     ems_logger.propagate = False
 
     if ems_logger.handlers:
+
         return ems_logger
 
     formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
+        "%(asctime)s "
+        "[%(levelname)s] "
+        "%(message)s",
+        datefmt=(
+            "%Y-%m-%dT%H:%M:%S%z"
+        ),
     )
 
-    normal_handler = DailyBudgetHandler(
-        os.path.join(
-            LOG_DIR,
-            "ems_app.log",
-        ),
-        DAILY_LOG_BUDGET_BYTES,
-        "normal_log",
-        fsync_each_write=False,
+    normal_handler = (
+        DailyBudgetHandler(
+            os.path.join(
+                LOG_DIR,
+                "ems_app.log",
+            ),
+            DAILY_LOG_BUDGET_BYTES,
+            "normal_log",
+            fsync_each_write=False,
+        )
     )
 
     normal_handler.setFormatter(
@@ -203,22 +298,34 @@ def setup_logger():
         logging.INFO
     )
 
-    class NormalFilter(logging.Filter):
-        def filter(self, record):
-            return record.levelno < logging.ERROR
+    class NormalFilter(
+        logging.Filter
+    ):
+
+        def filter(
+            self,
+            record,
+        ):
+
+            return (
+                record.levelno
+                < logging.ERROR
+            )
 
     normal_handler.addFilter(
         NormalFilter()
     )
 
-    critical_handler = DailyBudgetHandler(
-        os.path.join(
-            LOG_DIR,
-            "critical.log",
-        ),
-        CRITICAL_LOG_BUDGET_BYTES,
-        "critical_log",
-        fsync_each_write=True,
+    critical_handler = (
+        DailyBudgetHandler(
+            os.path.join(
+                LOG_DIR,
+                "critical.log",
+            ),
+            CRITICAL_LOG_BUDGET_BYTES,
+            "critical_log",
+            fsync_each_write=True,
+        )
     )
 
     critical_handler.setFormatter(
@@ -237,8 +344,11 @@ def setup_logger():
         critical_handler
     )
 
-    # Console output has NO flash cost.
-    stream_handler = logging.StreamHandler()
+    # Console logging has no flash write.
+    stream_handler = (
+        logging.StreamHandler()
+    )
+
     stream_handler.setFormatter(
         formatter
     )

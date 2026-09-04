@@ -74,7 +74,7 @@ class OfflineQueue:
         )
 
         self.conn.execute(
-            "PRAGMA synchronous=NORMAL;"
+           "PRAGMA wal_checkpoint(PASSIVE);"
         )
 
         self.conn.execute(

@@ -1,5 +1,6 @@
 import os
 
+
 # ================================================================
 # HARDWARE
 # ================================================================
@@ -8,7 +9,6 @@ HARDWARE_PROFILES = {
     "EMS-4CH-v1": {
         "slots": ["A", "B", "C", "D"],
 
-        # Relay outputs
         "relay_gpio": {
             "A": 17,
             "B": 27,
@@ -16,7 +16,6 @@ HARDWARE_PROFILES = {
             "D": 23,
         },
 
-        # Physical contactor feedback inputs
         "feedback_gpio": {
             "A": 5,
             "B": 6,
@@ -39,22 +38,36 @@ FEEDBACK_TIMEOUT_MS = 2000
 FEEDBACK_DEBOUNCE_MS = 50
 INTERLOCK_DELAY_MS = 500
 
-# RAM-only physical monitoring.
+# Physical contactor monitoring is RAM-only.
 LOCAL_MONITOR_INTERVAL_S = 2.0
 
-# Cloud synchronization.
+
+# ================================================================
+# CLOUD
+# ================================================================
+
 SYNC_INTERVAL_S = 60.0
 
-# SQLite.
-SQLITE_BUSY_TIMEOUT_MS = 5000
-SQLITE_WAL_AUTOCHECKPOINT_PAGES = 1000
 
-# State schema.
+# ================================================================
+# SQLITE
+# ================================================================
+
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+# Smaller WAL checkpoint keeps WAL bounded.
+SQLITE_WAL_AUTOCHECKPOINT_PAGES = 512
+
+
+# ================================================================
+# STATE
+# ================================================================
+
 STATE_VERSION = 2
 
 
 # ================================================================
-# STORAGE
+# LOCAL STORAGE
 # ================================================================
 
 DATA_DIR = "/mnt/ems-data"
@@ -66,11 +79,25 @@ TELEMETRY_DIR = os.path.join(DATA_DIR, "telemetry")
 DIAGNOSTICS_DIR = os.path.join(DATA_DIR, "diagnostics")
 HEALTH_DIR = os.path.join(DATA_DIR, "health")
 
-STATE_FILE = os.path.join(STATE_DIR, "current_state.json")
-BACKUP_STATE_FILE = os.path.join(STATE_DIR, "backup_state.json")
-RECOVERY_STATE_FILE = os.path.join(STATE_DIR, "recovery_state.json")
+STATE_FILE = os.path.join(
+    STATE_DIR,
+    "current_state.json",
+)
 
-DB_FILE = os.path.join(QUEUE_DIR, "ems_queue.sqlite")
+BACKUP_STATE_FILE = os.path.join(
+    STATE_DIR,
+    "backup_state.json",
+)
+
+RECOVERY_STATE_FILE = os.path.join(
+    STATE_DIR,
+    "recovery_state.json",
+)
+
+DB_FILE = os.path.join(
+    QUEUE_DIR,
+    "ems_queue.sqlite",
+)
 
 
 for directory in (
@@ -82,31 +109,45 @@ for directory in (
     DIAGNOSTICS_DIR,
     HEALTH_DIR,
 ):
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(
+        directory,
+        exist_ok=True,
+    )
 
 
 # ================================================================
 # FLASH-WEAR POLICY
 #
-# These are SOFTWARE write budgets.
+# These are SOFTWARE budgets.
 # They are NOT NAND endurance guarantees.
 # ================================================================
 
-# Normal application logs.
-DAILY_LOG_BUDGET_BYTES = 10 * 1024 * 1024
+# Normal application logging ceiling.
+DAILY_LOG_BUDGET_BYTES = (
+    10 * 1024 * 1024
+)
 
-# Critical fault/audit logs.
-CRITICAL_LOG_BUDGET_BYTES = 2 * 1024 * 1024
+# Critical event logging ceiling.
+CRITICAL_LOG_BUDGET_BYTES = (
+    2 * 1024 * 1024
+)
 
-# Physical block-device write protection threshold.
-TOTAL_DAILY_PHYSICAL_BUDGET_BYTES = 50 * 1024 * 1024
+# Target is deliberately much lower than the ceiling.
+NORMAL_LOG_TARGET_BYTES = (
+    3 * 1024 * 1024
+)
 
-# Normal operating target.
-NORMAL_LOG_TARGET_BYTES = 3 * 1024 * 1024
+# Protection threshold for measured daily block-device writes.
+#
+# This does NOT mean "the flash is worn out".
+# It means optional writes should be reduced.
+TOTAL_DAILY_PHYSICAL_BUDGET_BYTES = (
+    50 * 1024 * 1024
+)
 
 
 # ================================================================
-# STORAGE PRESSURE
+# STORAGE CAPACITY PRESSURE
 # ================================================================
 
 STORAGE_WARNING_PERCENT = 70
@@ -115,29 +156,56 @@ STORAGE_REDUCED_PERCENT = 90
 STORAGE_PROTECTED_PERCENT = 95
 STORAGE_CRITICAL_PERCENT = 98
 
-# Monitoring remains RAM-heavy.
+
+# ================================================================
+# STORAGE MONITORING
+#
+# These operations are RAM-heavy / read-only.
+# Do NOT write these measurements every minute.
+# ================================================================
+
 STORAGE_METRICS_INTERVAL_S = 60
 
-# Persistent storage statistics.
+# Persist accumulated storage statistics only hourly.
 STORAGE_HEALTH_PERSIST_INTERVAL_S = 3600
+
+# Daily summary.
 STORAGE_DAILY_PERSIST_INTERVAL_S = 86400
 
 
 # ================================================================
-# MEMORY POLICY
+# LOG RETENTION
+# ================================================================
+
+NORMAL_LOG_RETENTION_DAYS = 30
+
+# Critical history should be retained considerably longer.
+CRITICAL_LOG_RETENTION_DAYS = 365
+
+TELEMETRY_RETENTION_DAYS = 365
+
+DIAGNOSTIC_RETENTION_DAYS = 90
+
+
+# ================================================================
+# MEMORY
 # ================================================================
 
 MEMORY_SAMPLE_INTERVAL_S = 600
-MEMORY_HISTORY_SAMPLES = 144       # 24 hours
 
-# Enter pressure when MemAvailable falls below this percentage.
+# 24 hours at 10-minute intervals.
+MEMORY_HISTORY_SAMPLES = 144
+
+# Enter memory pressure when MemAvailable is below this percentage.
 MEMORY_AVAILABLE_PRESSURE_PERCENT = 15
 
-# Persistent swap is undesirable for this product.
-SWAP_WARNING_BYTES = 10 * 1024 * 1024
+# Any sustained swap use above this is suspicious.
+SWAP_WARNING_BYTES = (
+    10 * 1024 * 1024
+)
 
-# Leak detection is intentionally conservative.
-MEMORY_LEAK_MIN_SAMPLES = 72       # 12 hours at 10 min/sample
+MEMORY_LEAK_MIN_SAMPLES = 72
+
 MEMORY_LEAK_RSS_GROWTH_PERCENT = 20
 MEMORY_LEAK_VMS_GROWTH_PERCENT = 20
 MEMORY_LEAK_FD_GROWTH_PERCENT = 25
@@ -145,7 +213,7 @@ MEMORY_LEAK_THREAD_GROWTH_PERCENT = 25
 
 
 # ================================================================
-# CLOUD
+# CLOUD CREDENTIALS
 # ================================================================
 
 API_BASE_URL = os.environ.get(
@@ -153,19 +221,32 @@ API_BASE_URL = os.environ.get(
     "https://ems-backend.onrender.com/api",
 )
 
-DEVICE_ID = os.environ.get("EMS_DEVICE_ID")
-API_KEY = os.environ.get("EMS_API_KEY")
+DEVICE_ID = os.environ.get(
+    "EMS_DEVICE_ID"
+)
+
+API_KEY = os.environ.get(
+    "EMS_API_KEY"
+)
 
 if not DEVICE_ID or not API_KEY:
     raise RuntimeError(
-        "FATAL: EMS_DEVICE_ID and EMS_API_KEY environment variables are required."
+        "FATAL: EMS_DEVICE_ID and EMS_API_KEY "
+        "environment variables are required."
     )
 
 
-def get_hardware_profile(profile_name: str = "EMS-4CH-v1") -> dict:
-    profile = HARDWARE_PROFILES.get(profile_name)
+def get_hardware_profile(
+    profile_name: str = "EMS-4CH-v1",
+) -> dict:
+
+    profile = HARDWARE_PROFILES.get(
+        profile_name
+    )
 
     if profile is None:
-        raise ValueError(f"Unknown hardware profile: {profile_name}")
+        raise ValueError(
+            f"Unknown hardware profile: {profile_name}"
+        )
 
     return profile
