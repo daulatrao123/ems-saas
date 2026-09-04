@@ -1,6 +1,7 @@
+# pi_firmware/commands.py
 import subprocess
 
-VALID_WINGS = ("A", "B", "G")
+VALID_SLOTS = ("A", "B", "C", "D")
 
 class CommandHandler:
     def __init__(self, config, state, gpio, lcd, logger, api_client, offline_queue):
@@ -15,7 +16,7 @@ class CommandHandler:
     def execute(self, cmd):
         cid = cmd.get("command_id")
         ctype = cmd.get("command")
-        wing = cmd.get("wing")
+        slot = cmd.get("slot") # Changed from wing to slot
         params = cmd.get("params") or {}
         
         # 1. IDEMPOTENCY CHECK
@@ -28,37 +29,31 @@ class CommandHandler:
                 self.log.warning(f"Command {cid} was interrupted mid-execution. Aborting to prevent duplicate physical action.")
                 return cid, False, None, "Interrupted mid-execution"
 
-        # 2. LOG START (Before physical side effect)
+        # 2. LOG START
         self.db.log_command_start(cid)
         
         try:
-            # 3. EXECUTE PHYSICAL ACTION
-            success, result = self._dispatch(ctype, wing, params, cid)
-            
-            # 4. VERIFY HARDWARE STATE
-            if success and ctype in ["set_active_wing", "off_wing", "off_all"]:
-                if not self._verify_hardware(ctype, wing):
-                    self.log.error(f"Hardware verification failed for command {cid}")
-                    self.db.update_command_status(cid, "FAILED", "Hardware verification failed")
-                    return cid, False, None, "Hardware verification failed"
-            
-            # 5. LOG SUCCESS
-            self.db.update_command_status(cid, "SUCCESS", result)
-            return cid, True, result, None
-            
+            # 3. EXECUTE & VERIFY
+            success, result = self._dispatch(ctype, slot, params, cid)
+            self.db.update_command_status(cid, "SUCCESS" if success else "FAILED", result)
+            return cid, success, result, None if success else "Execution Failed"
         except Exception as e:
             self.log.exception(f"command {ctype} crashed: {e}")
             self.db.update_command_status(cid, "FAILED", str(e))
             return cid, False, None, str(e)
 
-    def _dispatch(self, ctype, wing, p, cid):
-        if ctype == "set_active_wing":
-            w = (wing or "").upper()
-            if w not in VALID_WINGS: return False, "invalid wing"
-            if not self._wing_visible(w): return False, "wing not visible"
-            if not self.state.set_active_wing(w): return False, "emergency stop active"
-            self.gpio.set_active_wing(w)
-            self.state.add_event("CMD", f"Wing {w} activated")
+    def _dispatch(self, ctype, slot, p, cid):
+        if ctype == "set_active_slot":
+            s = (slot or "").upper()
+            if s not in VALID_SLOTS: return False, "invalid slot"
+            if not self._slot_visible(s): return False, "slot not visible"
+            if not self.state.set_active_slot(s): return False, "emergency stop active"
+            
+            if not self.gpio.set_active_slot(s):
+                self.state.off_slot(s) # Revert state since hardware failed
+                return False, "hardware verification failed"
+                
+            self.state.add_event("CMD", f"Slot {s} activated")
             return True, "active"
 
         if ctype == "set_days":
@@ -70,12 +65,12 @@ class CommandHandler:
             self.state.set_reset_day(d)
             return True, f"reset_day={d}"
 
-        if ctype == "off_wing":
-            w = (wing or "").upper()
-            if w not in VALID_WINGS: return False, "invalid wing"
-            self.state.off_wing(w)
-            self.gpio.off_wing(w)
-            return True, f"{w} off"
+        if ctype == "off_slot":
+            s = (slot or "").upper()
+            if s not in VALID_SLOTS: return False, "invalid slot"
+            self.state.off_slot(s)
+            self.gpio.off_slot(s)
+            return True, f"{s} off"
 
         if ctype == "off_all":
             self.state.off_all()
@@ -111,16 +106,6 @@ class CommandHandler:
 
         return False, f"unknown command {ctype}"
 
-    def _verify_hardware(self, ctype, wing):
-        """Reads back the actual GPIO state to verify the physical side effect."""
-        if ctype == "set_active_wing":
-            return self.gpio.verify_relay_state(wing)
-        elif ctype == "off_wing":
-            return not self.gpio.verify_relay_state(wing)
-        elif ctype == "off_all":
-            return not any(self.gpio.verify_relay_state(w) for w in VALID_WINGS)
-        return True
-
-    def _wing_visible(self, w):
-        wing = self.state.data["wings"][w]
-        return wing["targetDays"] > 0 and wing["physicalToggle"] == "ON" and not wing["disabled"]
+    def _slot_visible(self, s):
+        slot = self.state.data["slots"][s]
+        return slot["targetDays"] > 0 and slot["physicalToggle"] == "ON" and not slot["disabled"]

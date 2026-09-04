@@ -1,3 +1,4 @@
+# pi_firmware/config.py
 import json, os
 
 class Config:
@@ -9,7 +10,7 @@ class Config:
         self.deviceId = data["deviceId"]
         self.apiKey = data["apiKey"]
         self.backendUrl = data["backendUrl"].rstrip("/")
-        self.firmwareVersion = data.get("firmwareVersion", "unknown")
+        self.firmwareVersion = data.get("firmwareVersion", "6.0.0-pi")
         self.syncIntervalSec = int(data.get("syncIntervalSec", 60))
         self.pendingCommandIntervalSec = int(data.get("pendingCommandIntervalSec", 5))
         self.statePersistIntervalSec = int(data.get("statePersistIntervalSec", 300))
@@ -19,15 +20,16 @@ class Config:
         self.stateFile = data.get("stateFile", "/var/lib/ems/state.json")
         self.offlineDbPath = data.get("offlineDbPath", "/var/lib/ems/offline.db")
         
-        # PRODUCTION FIX: 8-Wing Hardware Profile
-        # A, B, G are enabled and mapped to old wiring. C-H are unmapped.
-        self.wings = {
+        # PRODUCTION v6.0: 4-Slot Hardware Profile (A, B, C, D)
+        # TODO: VERIFY AND UPDATE GPIO PINS FOR C AND D TO MATCH YOUR PHYSICAL WIRING
+        self.slots = {
             "A": {"relay": 17, "toggle": 5},
             "B": {"relay": 27, "toggle": 6},
-            "G": {"relay": 23, "toggle": 13}
+            "C": {"relay": 24, "toggle": 25}, # Example pins - UPDATE THESE
+            "D": {"relay": 22, "toggle": 12}  # Example pins - UPDATE THESE
         }
         self.lcd = data.get("lcd", {"i2cBus": 1, "address": "0x27", "cols": 16, "rows": 2})
 
     @property
-    def wing_codes(self):
-        return list(self.wings.keys())
+    def slot_codes(self):
+        return list(self.slots.keys())

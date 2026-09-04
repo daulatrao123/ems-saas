@@ -1,11 +1,11 @@
 """
-EMS SaaS Backend v6.0.0 — Industrial Production (Multi-Pi & 4-Slot Architecture)
+EMS SaaS Backend v6.1.0 — Industrial Production (Safe Multi-Pi & 4-Slot Migration)
 ====================================
 - 1 Society can have Multiple Pis.
 - 1 Pi has 4 physical slots (A, B, C, D).
 - Wing configurations are mapped to (device_id, slot).
 - Commands target specific devices and slots.
-- Auto-fixes database schema on startup.
+- Safe DB migration: Renames old tables instead of dropping them.
 """
 
 import os
@@ -46,7 +46,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.0.0-prod")
+app = FastAPI(title="EMS SaaS API", version="6.1.0-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -58,8 +58,8 @@ COMMAND_EXPIRY_SECONDS = 300
 VALID_ROLES = {"super_admin", "society_admin", "member"}
 
 VALID_COMMANDS = {
-    "set_active_wing", "set_days", "set_reset_day", "restart",
-    "reboot", "reset_days", "off_wing", "off_all", "lcd_display",
+    "set_active_slot", "set_days", "set_reset_day", "restart",
+    "reboot", "reset_days", "off_slot", "off_all", "lcd_display",
 }
 
 # ================================================================
@@ -102,9 +102,20 @@ def ensure_db_schema():
                 );
             """)
             
-            # PRODUCTION v6.0: Drop old tables to enforce new schema cleanly (Use with caution in prod, safe for pilot)
-            cur.execute("DROP TABLE IF EXISTS wing_configs CASCADE")
-            cur.execute("DROP TABLE IF EXISTS wing_state CASCADE")
+            # PRODUCTION v6.1: Safe migration from old schema to new schema
+            # If the old `wing_configs` table exists and has `society_id`, it's the v5.x schema.
+            # We rename it to _old to preserve data, then create the clean v6.0 table.
+            cur.execute("""
+                DO $$ BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='wing_configs' AND column_name='society_id'
+                    ) THEN
+                        ALTER TABLE wing_configs RENAME TO wing_configs_old;
+                        ALTER TABLE wing_state RENAME TO wing_state_old;
+                    END IF;
+                END $$;
+            """)
             
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS wing_configs (
@@ -170,18 +181,33 @@ def ensure_db_schema():
                 );
             """)
             
-            # Auto-add missing columns
+            # Auto-add missing columns safely
             cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
             cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
             cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
             
-            # PRODUCTION v6.0: Drop the unique constraint if it exists from v5.6
+            # Drop the unique constraint from v5.6 if it exists
             cur.execute("DROP INDEX IF EXISTS uq_pi_devices_society_id")
             
-            # Rename active_wing to active_slot in pi_state if it hasn't been already
-            cur.execute("ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot")
+            # Safely rename active_wing to active_slot in pi_state
+            cur.execute("""
+                DO $$ BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
+                        ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
+                    END IF;
+                END $$;
+            """)
             
+            # Safely rename wing to slot in pi_commands
+            cur.execute("""
+                DO $$ BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
+                        ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
+                    END IF;
+                END $$;
+            """)
+
             cur.execute("""
                 DO $$ BEGIN
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_society') THEN
@@ -194,7 +220,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (Relational v6.0.0 Multi-Pi Hardened)")
+        print("DB schema verified OK (Relational v6.1 Safe Migration)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -272,7 +298,7 @@ def wing_is_visible(config: dict, state: dict) -> bool:
 def validate_command(command: str, params: dict, slot: str = "") -> None:
     if command not in VALID_COMMANDS:
         raise HTTPException(400, f"Unsupported command: {command}")
-    if command in ("set_active_wing", "set_days", "off_wing"):
+    if command in ("set_active_slot", "set_days", "off_slot"):
         if slot not in WING_SLOTS:
             raise HTTPException(400, f"Valid slot ({', '.join(WING_SLOTS)}) is required")
     if command == "set_days":

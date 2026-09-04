@@ -1,3 +1,4 @@
+# pi_firmware/gpio_manager.py
 from gpiozero import OutputDevice, Button
 
 class GpioManager:
@@ -6,43 +7,50 @@ class GpioManager:
         self.relays = {}
         self.toggles = {}
 
-        # PRODUCTION FIX: Centralized hardware mapping
-        wing_pins = {
-            "A": {"relay": 17, "toggle": 5},
-            "B": {"relay": 27, "toggle": 6},
-            "G": {"relay": 23, "toggle": 13}
-        }
-
-        for wing, pins in wing_pins.items():
+        # PRODUCTION v6.0: Initialize 4 slots
+        slot_pins = config.slots
+        for slot_code, pins in slot_pins.items():
             try:
-                self.relays[wing] = OutputDevice(pins["relay"], active_high=True, initial_value=False)
-                self.toggles[wing] = Button(pins["toggle"], pull_up=True, bounce_time=0.05)
+                self.relays[slot_code] = OutputDevice(pins["relay"], active_high=True, initial_value=False)
+                self.toggles[slot_code] = Button(pins["toggle"], pull_up=True, bounce_time=0.05)
             except Exception as e:
-                self.log.error(f"GPIO init failed for wing {wing}: {e}")
+                self.log.error(f"GPIO init failed for slot {slot_code}: {e}")
 
-    def get_physical_toggle(self, wing):
-        if wing not in self.toggles: return "UNKNOWN"
+    def get_physical_toggle(self, slot_code):
+        if slot_code not in self.toggles: return "UNKNOWN"
         try:
-            return "ON" if self.toggles[wing].is_active else "OFF"
+            return "ON" if self.toggles[slot_code].is_active else "OFF"
         except:
             return "UNKNOWN"
 
-    # PRODUCTION FIX: Read back actual GPIO state to verify physical side effect
-    def verify_relay_state(self, wing):
-        if wing not in self.relays: return False
+    def verify_relay_state(self, slot_code):
+        if slot_code not in self.relays: return False
         try:
-            return self.relays[wing].is_active
+            return self.relays[slot_code].is_active
         except:
             return False
 
-    def set_active_wing(self, wing):
-        for w, r in self.relays.items():
-            if r.is_active: r.off()
-        if wing and wing in self.relays:
-            self.relays[wing].on()
+    def set_active_slot(self, slot_code):
+        # PRODUCTION FIX: Safe Break-Before-Make
+        if slot_code not in self.relays:
+            self.log.error(f"Cannot activate {slot_code}: relay not initialized")
+            return False
+            
+        self.relays[slot_code].on()
+        
+        if not self.verify_relay_state(slot_code):
+            self.log.error(f"Hardware verification failed: {slot_code} did not turn ON")
+            self.relays[slot_code].off() 
+            return False
+            
+        for sc, r in self.relays.items():
+            if sc != slot_code and r.is_active:
+                r.off()
+                
+        return True
 
-    def off_wing(self, wing):
-        if wing in self.relays: self.relays[wing].off()
+    def off_slot(self, slot_code):
+        if slot_code in self.relays: self.relays[slot_code].off()
 
     def off_all(self):
         for r in self.relays.values(): r.off()
