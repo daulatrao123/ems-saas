@@ -1,6 +1,5 @@
 import os
 import threading
-import time
 from collections import deque
 
 class MemoryManager:
@@ -9,6 +8,7 @@ class MemoryManager:
         self.metrics = {
             "ram_total": 0, "ram_used": 0, "swap_total": 0, "swap_used": 0,
             "swap_in": 0, "swap_out": 0, "oom_kills": 0, "ems_rss": 0,
+            "ems_vms": 0, "ems_threads": 0, "ems_fds": 0,
             "memory_state": "MEMORY_NORMAL"
         }
         # Store 24 hours of RSS history (144 samples @ 10 min interval)
@@ -38,15 +38,17 @@ class MemoryManager:
                 pid = os.getpid()
                 with open(f"/proc/{pid}/status", "r") as f:
                     for line in f:
-                        if line.startswith("VmRSS:"):
-                            self.metrics["ems_rss"] = int(line.split()[1])
-                            break
+                        if line.startswith("VmRSS:"): self.metrics["ems_rss"] = int(line.split()[1])
+                        elif line.startswith("VmSize:"): self.metrics["ems_vms"] = int(line.split()[1])
+                        elif line.startswith("Threads:"): self.metrics["ems_threads"] = int(line.split()[1])
+                
+                # Count FDs
+                self.metrics["ems_fds"] = len(os.listdir(f"/proc/{pid}/fd"))
             except: pass
 
             # Memory Leak Detection (Simple linear trend)
             self.rss_history.append(self.metrics["ems_rss"])
             if len(self.rss_history) >= 100:
-                # Compare recent half to older half
                 older_half = list(self.rss_history)[:50]
                 recent_half = list(self.rss_history)[50:]
                 avg_older = sum(older_half) / len(older_half)

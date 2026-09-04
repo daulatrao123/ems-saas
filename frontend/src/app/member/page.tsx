@@ -1,91 +1,83 @@
 "use client";
-
-import { useState, useEffect, useCallback } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import api from "@/lib/api";
 
 export default function MemberDashboard() {
-  const [piState, setPiState] = useState<any>(null);
-  const [events, setEvents] = useState<any[]>([]);
-  const [lastEventId, setLastEventId] = useState<number>(0);
+  const router = useRouter();
+  const [devices, setDevices] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const fetchPiState = useCallback(async () => {
-    try {
-      const res = await api.get("/api/member/dashboard");
-      setPiState(res.data);
-    } catch (error) {
-      setPiState((prev: any) => (prev ? { ...prev, connected: false } : null));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const fetchEvents = useCallback(async () => {
-    try {
-      const res = await api.get(`/api/member/events?last_id=${lastEventId}`);
-      if (res.data.events.length > 0) {
-        setEvents((prev) => {
-          const existingIds = new Set(prev.map((e: any) => e.id));
-          const newEvents = res.data.events.filter((ne: any) => !existingIds.has(ne.id));
-          return [...prev, ...newEvents].slice(-50);
-        });
-        setLastEventId(res.data.last_id);
-      }
-    } catch (error) { console.error("Failed to fetch events", error); }
-  }, [lastEventId]);
-
   useEffect(() => {
-    fetchPiState();
-    fetchEvents();
-    const interval = setInterval(() => {
-      fetchPiState();
-      fetchEvents();
-    }, 10000);
-    return () => clearInterval(interval);
-  }, [fetchPiState, fetchEvents]);
+    const role = localStorage.getItem("role");
+    const token = localStorage.getItem("token");
+    if (!token || role !== "member") {
+      router.push("/login");
+      return;
+    }
+    fetchDashboard();
+  }, [router]);
 
-  if (loading) return <div>Loading Dashboard...</div>;
-  if (!piState) return <div>No Pi data available.</div>;
+  const fetchDashboard = async () => {
+    try {
+      const res = await api.get(`/api/member/dashboard`);
+      setDevices(res.data.devices || []);
+    } catch (err) {
+      console.error("Failed to load dashboard");
+    }
+    setLoading(false);
+  };
 
-  const isOnline = Boolean(piState?.connected);
+  if (loading) return <div className="flex h-screen items-center justify-center text-gray-500">Loading Dashboard...</div>;
 
   return (
-    <div className="p-6">
-      <h1 className="text-2xl font-bold mb-4">Member Dashboard</h1>
-      
-      <div className={`p-4 rounded-lg shadow mb-6 ${isOnline ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}`}>
-        <h2 className="text-xl font-semibold">Pi Status: {isOnline ? "Online" : "Offline"}</h2>
-        {piState.last_sync && (
-          <p className="text-sm">Last Sync: {new Date(piState.last_sync).toLocaleString()}</p>
-        )}
-      </div>
+    <div className="flex h-screen overflow-hidden bg-[#0a0e17]">
+      <main className="flex-1 overflow-y-auto p-6 pt-20">
+        <div className="mb-6">
+          <h1 className="text-2xl font-bold text-white">Member Dashboard</h1>
+          <p className="text-xs text-gray-500">Energy Distribution Status</p>
+        </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-        {piState.wings && Object.entries(piState.wings).map(([wingId, wing]: [string, any]) => (
-          <div key={wingId} className="p-4 border rounded-lg shadow-sm bg-white">
-            <h3 className="text-lg font-bold mb-2">{wing.name || `Wing ${wingId}`}</h3>
-            <p>Target Days: {wing.target_days}</p>
-            <p>Used Days: {wing.used_days}</p>
-            <p>Physical Toggle: {wing.physical_toggle}</p>
-            {piState.active_wing === wingId && (
-              <span className="inline-block mt-2 px-2 py-1 text-xs font-semibold bg-blue-100 text-blue-800 rounded">ACTIVE</span>
-            )}
+        {devices.length === 0 && (
+          <div className="bg-gray-900/80 border border-gray-800 rounded-xl p-8 text-center text-gray-500">
+            No devices available.
+          </div>
+        )}
+
+        {devices.map((dev: any) => (
+          <div key={dev.id} className="bg-gray-900/80 border border-gray-800 rounded-xl p-6 mb-6">
+            <div className="flex justify-between items-center mb-4 border-b border-gray-800 pb-3">
+              <h2 className="text-lg font-bold text-white">{dev.name}</h2>
+              <div className={`px-3 py-1 rounded-full text-[10px] font-bold ${dev.connected ? "bg-emerald-500/15 text-emerald-400" : "bg-red-500/15 text-red-400"}`}>
+                {dev.connected ? "ONLINE" : "OFFLINE"}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              {["A", "B", "C", "D"].map(slotCode => {
+                const slot = dev.slots[slotCode];
+                if (!slot) return null;
+                const isActive = dev.active_slot === slotCode;
+                
+                return (
+                  <div key={slotCode} className={`border p-4 rounded-lg ${isActive ? "border-cyan-500 bg-cyan-500/5" : "border-gray-800 bg-gray-800/30"}`}>
+                    <div className="flex justify-between items-center mb-2">
+                      <h3 className="text-sm font-bold text-white">{slot.display_name || `Slot ${slotCode}`}</h3>
+                      <span className="text-[9px] font-mono bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded">{slotCode}</span>
+                    </div>
+                    
+                    <div className="text-[10px] text-gray-400 space-y-1">
+                        <div>Target: <span className="text-gray-200 font-mono">{slot.target_days} days</span></div>
+                        <div>Used: <span className="text-gray-200 font-mono">{slot.used_days} days</span></div>
+                        <div>Status: <span className={`font-mono ${slot.physical_toggle === "ON" ? "text-emerald-400" : "text-gray-500"}`}>{slot.physical_toggle}</span></div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         ))}
-      </div>
-
-      <div className="mt-6">
-        <h3 className="text-lg font-bold mb-2">Pi Events</h3>
-        <div className="bg-gray-100 p-4 rounded h-64 overflow-y-auto">
-          {events.map((ev: any, i: number) => (
-            <div key={`${ev.id}-${i}`} className="text-sm border-b py-1">
-              <span className="font-mono text-gray-500">{new Date(ev.ts).toLocaleTimeString()}</span> 
-              <span className="ml-2 font-bold text-blue-600">[{ev.level}]</span> 
-              <span className="ml-2">{ev.msg}</span>
-            </div>
-          ))}
-        </div>
-      </div>
+      </main>
     </div>
   );
 }

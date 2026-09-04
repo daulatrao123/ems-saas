@@ -52,7 +52,6 @@ class StorageIOMeter:
     def _get_device_serial(self):
         if not self.device: return "UNKNOWN"
         try:
-            # Use lsblk to get serial number for device replacement detection
             result = subprocess.run(["lsblk", "-n", "-o", "SERIAL", f"/dev/{self.device}"], capture_output=True, text=True, timeout=5)
             return result.stdout.strip() or "UNKNOWN"
         except: return "UNKNOWN"

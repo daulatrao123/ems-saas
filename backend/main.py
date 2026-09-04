@@ -446,7 +446,6 @@ def bootstrap(request: Request):
             cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
                         ("admin@ems.com", "Super Admin", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "super_admin", None))
             
-            # Initialize 4 slots (A-D) for the bootstrap Pi. A and B enabled with feedback.
             for slot_code in SLOTS:
                 is_disabled = slot_code not in ["A", "B"]
                 cur.execute("""INSERT INTO slot_configs (device_id, slot, display_name, target_days, disabled, feedback_enabled) 
@@ -576,7 +575,6 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 new_sid = cur.fetchone()["id"]
                 log_audit(cur, user, new_sid, "CREATE_SOCIETY", society)
                 
-            # Handle Multiple Pi Assignments and Slot Configs
             devices = data.get("devices", [])
             assigned_ids = [d["device_id"] for d in devices if d.get("device_id")]
             
@@ -589,13 +587,11 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 dev_id = dev["device_id"]
                 if not dev_id: continue
                 
-                # Update device-level hardware config
                 cur.execute(
                     "UPDATE pi_devices SET society_id=%s, status='ASSIGNED', hardware_profile=%s, feedback_hardware_installed=%s WHERE id=%s",
                     (new_sid, dev.get("hardware_profile", "EMS-4CH-v1"), bool(dev.get("feedback_hardware_installed", False)), dev_id)
                 )
                 
-                # Upsert slot configurations
                 slots = dev.get("slots", {})
                 for slot_code in SLOTS:
                     slot_data = slots.get(slot_code, {})
@@ -888,7 +884,6 @@ def pi_sync(request: Request, payload: dict):
             cur.execute("UPDATE pi_devices SET last_seen = %s, firmware_version = %s WHERE id = %s",
                         (now, payload.get("firmwareVersion", "unknown"), device_id))
                         
-            # v6.2: Accept slots instead of wings
             slots_payload = payload.get("slots", payload.get("wings", {}))
             for slot_code, w in slots_payload.items():
                 if slot_code not in SLOTS: continue
@@ -907,7 +902,6 @@ def pi_sync(request: Request, payload: dict):
             soc = cur.fetchone()
             cloud_config_version = soc["config_version"] if soc else 0
             
-            # Build Canonical Pi Config payload
             cur.execute("SELECT hardware_profile, feedback_hardware_installed FROM pi_devices WHERE id = %s", (device_id,))
             dev_info = cur.fetchone()
             
@@ -984,7 +978,6 @@ def pi_command_ack(payload: dict):
     if not command_id:
         raise HTTPException(400, "command_id required")
 
-    # Unified payload from Pi: status, verification_state, error
     status = str(payload.get("status", "FAILED")).upper()
     verification = str(payload.get("verification_state", "UNKNOWN"))
     error = payload.get("error")
@@ -997,7 +990,6 @@ def pi_command_ack(payload: dict):
             if not cmd:
                 return {"success": True, "status": "unknown"}
 
-            # If the Pi confirms the hardware physically verified, update server result
             if status == "COMPLETED":
                 if cmd["command"] == "set_days":
                     slot = cmd["slot"]
