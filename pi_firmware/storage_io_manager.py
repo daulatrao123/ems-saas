@@ -36,7 +36,10 @@ class StorageIOMeter:
                 "device_serial": self.device_serial,
                 "baseline_phys_reads": current_reads,
                 "baseline_phys_writes": current_writes,
-                "logical_writes": 0
+                "logical_writes": {
+                    "normal_log": 0, "critical_log": 0, "state": 0, 
+                    "queue_db": 0, "telemetry": 0, "other": 0
+                }
             }
             self._save_state()
 
@@ -90,16 +93,28 @@ class StorageIOMeter:
             with open(self.lifetime_file, 'w') as f: json.dump(self.lifetime_state, f)
         except: pass
 
-    def record_ems_write(self, bytes_written):
+    def record_ems_write(self, category: str, bytes_written: int):
+        """Centralized write attribution."""
         with self.lock:
-            self.state["logical_writes"] += bytes_written
+            if category not in self.state["logical_writes"]:
+                category = "other"
+            self.state["logical_writes"][category] += bytes_written
+
+    def get_sqlite_wal_size(self):
+        """Measure SQLite WAL contribution to account for DB write amplification."""
+        wal_file = os.path.join(TELEMETRY_DIR, "..", "queue", "ems_queue.sqlite-wal")
+        try:
+            return os.path.getsize(wal_file)
+        except OSError:
+            return 0
 
     def update_metrics(self):
         with self.lock:
             today = datetime.now().strftime("%Y-%m-%d")
             if today != self.state["date"]:
                 # Day rollover: save final totals to lifetime, reset baseline
-                self.lifetime_state["lifetime_logical_writes"] += self.state.get("logical_writes", 0)
+                total_logical = sum(self.state.get("logical_writes", {}).values())
+                self.lifetime_state["lifetime_logical_writes"] += total_logical
                 
                 current_reads, current_writes = self._read_diskstats()
                 phys_writes_today = current_writes - self.state.get("baseline_phys_writes", 0)
@@ -112,7 +127,7 @@ class StorageIOMeter:
                 self.state["date"] = today
                 self.state["baseline_phys_reads"] = current_reads
                 self.state["baseline_phys_writes"] = current_writes
-                self.state["logical_writes"] = 0
+                self.state["logical_writes"] = {k: 0 for k in self.state["logical_writes"]}
                 self._save_state()
             
             current_reads, current_writes = self._read_diskstats()
@@ -128,15 +143,18 @@ class StorageIOMeter:
             current_reads, current_writes = self._read_diskstats()
             phys_writes = current_writes - self.state.get("baseline_phys_writes", 0)
             phys_reads = current_reads - self.state.get("baseline_phys_reads", 0)
-            logical_writes = self.state.get("logical_writes", 0)
+            logical_writes_dict = self.state.get("logical_writes", {})
+            logical_writes = sum(logical_writes_dict.values())
             
             waf = (phys_writes / logical_writes) if logical_writes > 0 else 0
             budget_exceeded = phys_writes > TOTAL_DAILY_PHYSICAL_BUDGET_BYTES
             
             return {
                 "daily_logical_writes": logical_writes,
+                "daily_logical_breakdown": logical_writes_dict,
                 "daily_physical_writes": phys_writes,
                 "daily_physical_reads": phys_reads,
+                "sqlite_wal_size": self.get_sqlite_wal_size(),
                 "waf": round(waf, 2),
                 "budget_exceeded": budget_exceeded,
                 "lifetime_logical_writes": self.lifetime_state["lifetime_logical_writes"] + logical_writes,

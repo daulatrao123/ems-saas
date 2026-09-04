@@ -13,10 +13,11 @@ def set_storage_manager(storage_mgr):
     _storage_mgr = storage_mgr
 
 class DailyBudgetHandler(logging.Handler):
-    def __init__(self, filename, budget_bytes):
+    def __init__(self, filename, budget_bytes, category="normal_log"):
         super().__init__()
         self.base_filename = filename
         self.budget_bytes = budget_bytes
+        self.category = category
         self.current_date = datetime.now().strftime("%Y-%m-%d")
         self.current_filename = f"{self.base_filename}.{self.current_date}"
         self.bytes_written = 0
@@ -48,8 +49,8 @@ class DailyBudgetHandler(logging.Handler):
     def emit(self, record):
         self._rotate_if_new_day()
         
-        # HARD BUDGET STOP: Do not write if physical USB budget exceeded
-        if _storage_mgr and not _storage_mgr.is_write_allowed():
+        # Check storage policy
+        if _storage_mgr and not _storage_mgr.is_write_allowed(self.category):
             return
             
         msg = self.format(record) + "\n"
@@ -57,8 +58,8 @@ class DailyBudgetHandler(logging.Handler):
         
         if self.bytes_written + msg_bytes <= self.budget_bytes:
             self.fh.write(msg)
-            # Track logical write for WAF
-            if _storage_mgr: _storage_mgr.io_meter.record_ems_write(msg_bytes)
+            # Track logical write for WAF Attribution
+            if _storage_mgr: _storage_mgr.io_meter.record_ems_write(self.category, msg_bytes)
             self.bytes_written += msg_bytes
 
 def setup_logger():
@@ -69,15 +70,13 @@ def setup_logger():
 
     formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%dT%H:%M:%S%z')
     
-    app_handler = DailyBudgetHandler(os.path.join(LOG_DIR, "ems_app.log"), DAILY_LOG_BUDGET_BYTES)
+    app_handler = DailyBudgetHandler(os.path.join(LOG_DIR, "ems_app.log"), DAILY_LOG_BUDGET_BYTES, "normal_log")
     app_handler.setFormatter(formatter)
     app_handler.setLevel(logging.INFO)
     app_handler.addFilter(lambda record: record.levelno < logging.ERROR)
     logger.addHandler(app_handler)
     
-    crit_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(LOG_DIR, "critical.log"), maxBytes=CRITICAL_LOG_BUDGET_BYTES, backupCount=2
-    )
+    crit_handler = DailyBudgetHandler(os.path.join(LOG_DIR, "critical.log"), CRITICAL_LOG_BUDGET_BYTES, "critical_log")
     crit_handler.setFormatter(formatter)
     crit_handler.setLevel(logging.ERROR)
     logger.addHandler(crit_handler)

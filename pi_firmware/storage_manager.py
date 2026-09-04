@@ -2,7 +2,7 @@ import os
 import time
 import threading
 from datetime import datetime
-from config import DATA_DIR, LOG_DIR, TELEMETRY_DIR
+from config import DATA_DIR, LOG_DIR, TELEMETRY_DIR, TOTAL_DAILY_PHYSICAL_BUDGET_BYTES
 from logger import logger
 from storage_io_manager import StorageIOMeter
 from memory_manager import MemoryManager
@@ -10,6 +10,7 @@ from memory_manager import MemoryManager
 class StorageManager:
     def __init__(self):
         self.storage_ok = True
+        self.storage_state = "STORAGE_NORMAL"
         self.io_meter = StorageIOMeter()
         self.memory_monitor = MemoryManager()
         self._running = True
@@ -22,15 +23,50 @@ class StorageManager:
             self.check_health()
             self.io_meter.update_metrics()
             self.memory_monitor.update_metrics()
-            
-            metrics = self.io_meter.get_metrics()
-            if metrics["budget_exceeded"]:
-                logger.critical(f"DAILY PHYSICAL USB BUDGET EXCEEDED. Halting non-critical writes.")
+            self._evaluate_degradation()
 
-    def is_write_allowed(self, critical: bool = False) -> bool:
-        if critical: return True
+    def _evaluate_degradation(self):
+        """Two-way protection: Storage protects memory, Memory protects storage."""
         metrics = self.io_meter.get_metrics()
-        return not metrics["budget_exceeded"]
+        mem_pressure = self.memory_monitor.is_memory_pressure()
+        
+        used_percent = 0
+        try:
+            stat = os.statvfs(DATA_DIR)
+            total = stat.f_blocks * stat.f_frsize
+            free = stat.f_bavail * stat.f_frsize
+            used_percent = ((total - free) / total) * 100 if total > 0 else 100
+        except: pass
+
+        # Determine highest severity state
+        new_state = "STORAGE_NORMAL"
+        if not self.storage_ok:
+            new_state = "STORAGE_FAILED"
+        elif used_percent >= 98 or metrics["budget_exceeded"]:
+            new_state = "STORAGE_CRITICAL"
+        elif used_percent >= 95 or mem_pressure:
+            new_state = "WRITE_PROTECTED"
+        elif used_percent >= 90:
+            new_state = "WRITE_REDUCED"
+            
+        if new_state != self.storage_state:
+            logger.critical(f"Storage state transitioned: {self.storage_state} -> {new_state}")
+            self.storage_state = new_state
+
+    def is_write_allowed(self, category: str = "other") -> bool:
+        """Centralized write policy enforcement."""
+        if self.storage_state == "STORAGE_FAILED":
+            return False
+        elif self.storage_state == "STORAGE_CRITICAL":
+            # Only critical events and state changes allowed
+            return category in ["critical_log", "state"]
+        elif self.storage_state == "WRITE_PROTECTED":
+            # No telemetry, no normal logs
+            return category in ["critical_log", "state", "queue_db"]
+        elif self.storage_state == "WRITE_REDUCED":
+            # No normal logs
+            return category != "normal_log"
+        return True
 
     def check_health(self):
         try:
@@ -56,6 +92,8 @@ class StorageManager:
             elif used_percent >= 80:
                 logger.warning(f"Storage WARNING: {used_percent:.1f}% full. Standard cleanup.")
                 self.cleanup_logs(aggressive=False)
+            else:
+                self.storage_ok = True
 
         except Exception as e:
             logger.critical(f"Storage health check failed (USB unmounted?): {e}")
@@ -86,7 +124,7 @@ class StorageManager:
 
     def save_daily_telemetry(self):
         """Flushes RAM telemetry to USB exactly once per day."""
-        if not self.is_write_allowed():
+        if not self.is_write_allowed("telemetry"):
             return
             
         try:

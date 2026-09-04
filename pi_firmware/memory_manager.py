@@ -63,6 +63,11 @@ class MemoryManager:
                 else:
                     self.metrics["memory_state"] = "MEMORY_NORMAL"
 
+    def is_memory_pressure(self) -> bool:
+        """Returns True if system is under memory pressure (triggers storage degradation)."""
+        with self.lock:
+            return self.metrics["memory_state"] in ["SWAP_ACTIVE", "MEMORY_LEAK_SUSPECTED", "OOM_DETECTED"]
+
     def get_metrics(self) -> dict:
         with self.lock:
             return self.metrics.copy()
