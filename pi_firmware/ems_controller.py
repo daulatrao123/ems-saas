@@ -1,132 +1,99 @@
 import time
-import json
-import sqlite3
 import threading
-from config import DB_FILE, SYNC_INTERVAL_S, SQLITE_BUSY_TIMEOUT_MS
-from state import PiStateManager, SystemState, CommandedState
+from config import SYNC_INTERVAL_S
+from state import PiStateManager, SystemState, CommandedState, VerificationState
 from gpio_manager import GPIOManager
-from storage_telemetry import StorageTelemetry
+from api_client import ApiClient
+from offline_queue import OfflineQueue
+from storage_manager import StorageManager
 from logger import logger
-
-class OfflineQueue:
-    def __init__(self):
-        self.conn = sqlite3.connect(DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("""CREATE TABLE IF NOT EXISTS commands (
-            id TEXT PRIMARY KEY,
-            slot TEXT,
-            action TEXT,
-            status TEXT DEFAULT 'QUEUED',
-            created_at TEXT
-        )""")
-        self.conn.commit()
-
-    def add_command(self, cmd_id, slot, action):
-        try:
-            self.conn.execute("INSERT INTO commands (id, slot, action, status, created_at) VALUES (?, ?, ?, ?, ?)",
-                              (cmd_id, slot, action, "QUEUED", time.strftime("%Y-%m-%dT%H:%M:%S")))
-            self.conn.commit()
-        except sqlite3.IntegrityError:
-            pass # Idempotency: duplicate command ignored
-
-    def get_next(self):
-        cur = self.conn.execute("SELECT id, slot, action FROM commands WHERE status='QUEUED' ORDER BY created_at LIMIT 1")
-        return cur.fetchone()
-
-    def mark_status(self, cmd_id, status):
-        self.conn.execute("UPDATE commands SET status=? WHERE id=?", (status, cmd_id))
-        self.conn.commit()
-
-class CloudSyncManager:
-    def __init__(self, controller):
-        self.controller = controller
-        self._running = True
-        self.thread = threading.Thread(target=self._sync_loop, daemon=True)
-        self.thread.start()
-
-    def _sync_loop(self):
-        while self._running:
-            time.sleep(SYNC_INTERVAL_S)
-            self.fetch_commands()
-            self.push_state()
-
-    def fetch_commands(self):
-        # MOCK: In production, this is an HTTP GET to the backend
-        # Simulating reception of a command
-        # mock_cmd = {"id": "cmd-123", "slot": "B", "action": "ACTIVATE"}
-        # self.controller.queue.add_command(mock_cmd["id"], mock_cmd["slot"], mock_cmd["action"])
-        pass
-
-    def push_state(self):
-        # MOCK: In production, this is an HTTP POST with self.controller.state_manager.get_state_snapshot()
-        pass
 
 class EmsController:
     def __init__(self):
         logger.info("Initializing EMS Controller...")
         self.state_manager = PiStateManager()
         self.queue = OfflineQueue()
-        self.telemetry = StorageTelemetry()
+        self.api = ApiClient()
+        self.storage = StorageManager()
         
-        # Initial device config (In production, fetched from cloud)
-        self.device_config = {
-            "device_id": "PI-001",
-            "hardware_profile": "EMS-4CH-v1",
-            "feedback_hardware_installed": True,
-            "slots": {
-                "A": {"feedback_enabled": True, "display_name": "Solar Main"},
-                "B": {"feedback_enabled": True, "display_name": "Generator"},
-                "C": {"feedback_enabled": False, "display_name": "Grid"},
-                "D": {"feedback_enabled": False, "display_name": "Backup"}
-            }
-        }
-        
-        self.gpio_manager = GPIOManager(self.state_manager, self.device_config)
-        self.cloud_sync = CloudSyncManager(self)
+        self.device_config = {}
+        self.gpio_manager = None
         self._running = True
-
+        
     def run_boot_sequence(self):
         self.state_manager.system_state = SystemState.BOOT
-        logger.info("System State: BOOT")
-        
         self.state_manager.system_state = SystemState.SELF_TEST
-        logger.info("System State: SELF_TEST")
-        # Add RTC, Storage health checks here
-        time.sleep(1)
+        
+        self.storage.check_health()
+        if not self.storage.storage_ok:
+            logger.critical("Self-test failed: Storage unavailable.")
+            self.state_manager.system_state = SystemState.FAULT
+            return False
+            
+        logger.info("Fetching cloud configuration...")
+        self.device_config = self.api.get_config()
+        
+        if not self.device_config:
+            logger.error("Cloud offline. Cannot fetch config. Entering CLOUD_OFFLINE state.")
+            self.state_manager.system_state = SystemState.CLOUD_OFFLINE
+            return False
+            
+        self.gpio_manager = GPIOManager(self.state_manager, self.device_config)
         
         logger.info("System State: HARDWARE_RECONCILIATION")
-        success = self.gpio_manager.reconcile_hardware_state(self.device_config)
+        success = self.gpio_manager.reconcile_hardware_state()
         
         if not success:
-            logger.critical("System State: FAULT (Interlock or Hardware Mismatch)")
+            logger.critical("System State: FAULT (Hardware Mismatch)")
             return False
             
         logger.info("System State: READY")
         return True
 
-    def handle_cloud_command(self, command: tuple):
+    def handle_command(self, command: tuple):
         cmd_id, target_slot, action = command
-        
-        if self.state_manager.system_state != SystemState.READY:
-            logger.warning(f"Command {cmd_id} rejected. System state is {self.state_manager.system_state.value}")
-            return
-            
         logger.info(f"Executing command {cmd_id}: {action} slot {target_slot}")
-        self.queue.mark_status(cmd_id, "EXECUTING")
         
-        is_fb_enabled = self.device_config["slots"][target_slot]["feedback_enabled"]
+        self.queue.update_status(cmd_id, "EXECUTING")
+        self.state_manager.system_state = SystemState.EXECUTING
+        
+        is_fb_enabled = self.device_config.get("slots", {}).get(target_slot, {}).get("feedback_enabled", False)
         success = False
+        verification = VerificationState.NOT_CONFIGURED
         
         if action == "ACTIVATE":
             success = self.gpio_manager.transition_slot(target_slot, is_fb_enabled)
+            if success: verification = VerificationState.VERIFIED_ON if is_fb_enabled else VerificationState.GPIO_CONFIRMED
         elif action == "DEACTIVATE":
             success = self.gpio_manager.deactivate_slot(target_slot, is_fb_enabled)
+            if success: verification = VerificationState.VERIFIED_OFF if is_fb_enabled else VerificationState.GPIO_CONFIRMED
             
-        self.queue.mark_status(cmd_id, "COMPLETED" if success else "FAILED")
-        
-        if success:
-            # TODO: Push ACK to cloud
-            pass
+        self.queue.update_status(cmd_id, "COMPLETED" if success else "FAILED", verification.value)
+        self.state_manager.system_state = SystemState.READY
+
+    def sync_loop(self):
+        while self._running:
+            time.sleep(SYNC_INTERVAL_S)
+            if self.state_manager.system_state == SystemState.READY:
+                # 1. Push State
+                snapshot = {
+                    "system_state": self.state_manager.system_state.value,
+                    "active_slot": self.state_manager.active_slot,
+                    "slots": {c: s.to_dict() for c, s in self.state_manager.slots.items()}
+                }
+                self.api.push_state(snapshot)
+                
+                # 2. Fetch Commands
+                commands = self.api.get_commands()
+                for cmd in commands:
+                    self.queue.add_command(cmd["id"], cmd["slot"], cmd["action"], cmd.get("created_at"), cmd.get("expires_at"))
+                
+                # 3. Push ACKs
+                unacked = self.queue.get_unacked()
+                for cmd_id, status, verif in unacked:
+                    if self.api.push_ack(cmd_id, status, verif):
+                        self.queue.mark_acked(cmd_id)
+                    break # Push one per cycle to avoid spamming
 
     def main_loop(self):
         if not self.run_boot_sequence():
@@ -135,14 +102,15 @@ class EmsController:
                 time.sleep(1)
                 
         logger.info("Entering main operational loop.")
+        sync_thread = threading.Thread(target=self.sync_loop, daemon=True)
+        sync_thread.start()
         
         while self._running:
-            # 1. Check for pending commands
             cmd = self.queue.get_next()
             if cmd:
-                self.handle_cloud_command(cmd)
+                self.handle_command(cmd)
             else:
-                time.sleep(1) # Idle throttle
+                time.sleep(1)
 
 if __name__ == "__main__":
     controller = EmsController()

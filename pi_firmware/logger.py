@@ -2,13 +2,9 @@ import os
 import logging
 import logging.handlers
 from datetime import datetime
-from config import LOG_DIR, DAILY_LOG_BUDGET_BYTES
+from config import LOG_DIR, DAILY_LOG_BUDGET_BYTES, CRITICAL_LOG_BUDGET_BYTES
 
 class DailyBudgetHandler(logging.Handler):
-    """
-    Enforces a true daily write budget (≤10 MB/day).
-    Drops INFO/WARNING if budget is exceeded. CRITICAL/ERROR always logged.
-    """
     def __init__(self, filename, budget_bytes):
         super().__init__()
         self.base_filename = filename
@@ -17,8 +13,6 @@ class DailyBudgetHandler(logging.Handler):
         self.current_filename = f"{self.base_filename}.{self.current_date}"
         self.bytes_written = 0
         self.fh = open(self.current_filename, 'a')
-        
-        # Get current file size for initialization
         try:
             self.bytes_written = os.path.getsize(self.current_filename)
         except FileNotFoundError:
@@ -38,14 +32,6 @@ class DailyBudgetHandler(logging.Handler):
         msg = self.format(record) + "\n"
         msg_bytes = len(msg.encode('utf-8'))
         
-        # Always allow CRITICAL and ERROR
-        if record.levelno >= logging.ERROR:
-            self.fh.write(msg)
-            self.fh.flush()
-            self.bytes_written += msg_bytes
-            return
-            
-        # Check budget for INFO/WARNING
         if self.bytes_written + msg_bytes <= self.budget_bytes:
             self.fh.write(msg)
             self.fh.flush()
@@ -62,19 +48,21 @@ def setup_logger():
         datefmt='%Y-%m-%dT%H:%M:%S%z'
     )
     
-    # 1. Bounded daily application log
+    # 1. Bounded daily application log (INFO/WARNING only)
     app_handler = DailyBudgetHandler(
         os.path.join(LOG_DIR, "ems_app.log"), 
         DAILY_LOG_BUDGET_BYTES
     )
     app_handler.setFormatter(formatter)
     app_handler.setLevel(logging.INFO)
+    # Reject ERROR/CRITICAL from this handler
+    app_handler.addFilter(lambda record: record.levelno < logging.ERROR)
     logger.addHandler(app_handler)
     
-    # 2. Critical events only (bounded 1 MB rotating)
+    # 2. Critical events only (ERROR/CRITICAL) - Bounded 2MB rotating
     crit_handler = logging.handlers.RotatingFileHandler(
         os.path.join(LOG_DIR, "critical.log"),
-        maxBytes=1*1024*1024,
+        maxBytes=CRITICAL_LOG_BUDGET_BYTES,
         backupCount=2
     )
     crit_handler.setFormatter(formatter)

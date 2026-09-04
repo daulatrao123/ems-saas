@@ -1,38 +1,53 @@
 import requests
+import os
+from config import API_BASE_URL, DEVICE_ID, API_KEY
+from logger import logger
 
 class ApiClient:
-    def __init__(self, config, logger):
-        self.cfg = config
-        self.log = logger
-        self.session = requests.Session()
+    def __init__(self):
+        self.base_url = API_BASE_URL
+        self.device_id = DEVICE_ID
+        self.headers = {
+            "X-Device-ID": self.device_id,
+            "X-API-Key": API_KEY,
+            "Content-Type": "application/json"
+        }
 
-    def _url(self, path):
-        return f"{self.cfg.backendUrl}{path}"
-
-    def sync(self, payload):
+    def get_config(self) -> dict:
+        """Downloads the canonical device configuration from the cloud."""
         try:
-            r = self.session.post(self._url("/api/pi/sync"), json=payload, timeout=15)
+            r = requests.get(f"{self.base_url}/pi/{self.device_id}/config", headers=self.headers, timeout=10)
             if r.status_code == 200:
                 return r.json()
-            self.log.error(f"Sync failed {r.status_code}: {r.text[:200]}")
+            logger.error(f"Config fetch failed: HTTP {r.status_code}")
+            return None
         except Exception as e:
-            self.log.error(f"Sync exception: {e}")
-        return None
+            logger.error(f"Config fetch network error: {e}")
+            return None
 
-    def ack_command(self, command_id, success, result=None, error=None):
-        payload = {
-            "deviceId": self.cfg.deviceId,
-            "key": self.cfg.apiKey,
-            "command_id": command_id,
-            "success": bool(success),
-            "error": error,
-            "result": result
-        }
+    def get_commands(self) -> list:
+        """Fetches pending commands from the cloud."""
         try:
-            r = self.session.post(self._url("/api/pi/command-ack"), json=payload, timeout=10)
+            r = requests.get(f"{self.base_url}/pi/{self.device_id}/commands", headers=self.headers, timeout=10)
             if r.status_code == 200:
-                return True
-            self.log.error(f"ACK failed {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            self.log.error(f"ACK exception: {e}")
-        return False
+                return r.json().get("commands", [])
+            return []
+        except Exception:
+            return []
+
+    def push_state(self, state_snapshot: dict) -> bool:
+        """Pushes the current physical and commanded state to the cloud."""
+        try:
+            r = requests.post(f"{self.base_url}/pi/{self.device_id}/state", json=state_snapshot, headers=self.headers, timeout=10)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def push_ack(self, command_id: str, status: str, verification: str) -> bool:
+        """Pushes the terminal status of a command to the cloud."""
+        try:
+            payload = {"command_id": command_id, "status": status, "verification_state": verification}
+            r = requests.post(f"{self.base_url}/pi/{self.device_id}/ack", json=payload, headers=self.headers, timeout=10)
+            return r.status_code == 200
+        except Exception:
+            return False

@@ -1,101 +1,57 @@
-import sqlite3, json, os, time
+import sqlite3
+import json
+from config import DB_FILE, SQLITE_BUSY_TIMEOUT_MS
+from logger import logger
 
 class OfflineQueue:
-    def __init__(self, config, logger):
-        self.db_path = config.offlineDbPath
-        self.log = logger
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._init_db()
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_FILE, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS commands (
+            id TEXT PRIMARY KEY,
+            slot TEXT,
+            action TEXT,
+            status TEXT DEFAULT 'DELIVERED',
+            created_at TEXT,
+            received_at TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            expires_at TEXT,
+            attempt_count INT DEFAULT 0,
+            last_error TEXT,
+            config_version TEXT,
+            hardware_verification TEXT,
+            ack_status TEXT DEFAULT 'PENDING'
+        )""")
+        self.conn.commit()
 
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS pending_acks (
-                command_id TEXT PRIMARY KEY, success INTEGER, result TEXT, error TEXT
-            )""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS executed_commands (
-                command_id TEXT PRIMARY KEY, 
-                status TEXT DEFAULT 'STARTED', 
-                result TEXT, 
-                started_at INTEGER,
-                completed_at INTEGER
-            )""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE, payload TEXT, created_at INTEGER
-            )""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS state_vars (
-                key TEXT PRIMARY KEY, value TEXT
-            )""")
+    def add_command(self, cmd_id, slot, action, created_at, expires_at):
+        try:
+            self.conn.execute("""INSERT INTO commands 
+                (id, slot, action, status, created_at, received_at, expires_at) 
+                VALUES (?, ?, ?, 'DELIVERED', ?, ?, ?)""",
+                (cmd_id, slot, action, created_at, created_at, expires_at))
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            pass # Idempotency
 
-    def save_ack(self, cid, success, result, error):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO pending_acks VALUES (?, ?, ?, ?)",
-                         (cid, 1 if success else 0, result, error))
+    def get_next(self):
+        cur = self.conn.execute("SELECT id, slot, action FROM commands WHERE status='DELIVERED' ORDER BY created_at LIMIT 1")
+        return cur.fetchone()
 
-    def load_acks(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT command_id, success, result, error FROM pending_acks")
-            return [{"command_id": r[0], "success": bool(r[1]), "result": r[2], "error": r[3]} for r in cur]
+    def update_status(self, cmd_id, status, verification=None, error=None):
+        self.conn.execute("""UPDATE commands SET status=?, hardware_verification=?, last_error=? WHERE id=?""",
+                           (status, verification, error, cmd_id))
+        self.conn.commit()
 
-    def delete_ack(self, cid):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM pending_acks WHERE command_id=?", (cid,))
+    def mark_acked(self, cmd_id):
+        self.conn.execute("UPDATE commands SET ack_status='ACKED' WHERE id=?", (cmd_id,))
+        self.conn.commit()
 
-    def check_command_executed(self, cid):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT status, result FROM executed_commands WHERE command_id=?", (cid,))
-            row = cur.fetchone()
-            return {"status": row[0], "result": row[1]} if row else None
+    def get_unacked(self):
+        cur = self.conn.execute("SELECT id, status, hardware_verification FROM commands WHERE ack_status='PENDING' AND status IN ('COMPLETED', 'FAILED', 'EXPIRED')")
+        return cur.fetchall()
 
-    def log_command_start(self, cid):
-        # PRODUCTION FIX: Use INSERT OR IGNORE to prevent overwriting history
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""INSERT OR IGNORE INTO executed_commands 
-                             (command_id, status, result, started_at, completed_at) 
-                             VALUES (?, 'STARTED', NULL, ?, NULL)""",
-                         (cid, int(time.time())))
-
-    def update_command_status(self, cid, status, result=None):
-        # PRODUCTION FIX: Enforce strict state transitions (never allow SUCCESS -> STARTED)
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT status FROM executed_commands WHERE command_id=?", (cid,))
-            row = cur.fetchone()
-            if not row: return
-            
-            current_status = row[0]
-            if current_status in ["SUCCESS", "FAILED", "RECONCILED", "EXPIRED"]:
-                self.log.warning(f"Attempted to change terminal command {cid} from {current_status} to {status}. Rejected.")
-                return
-                
-            conn.execute("""UPDATE executed_commands 
-                            SET status=?, result=?, completed_at=? 
-                            WHERE command_id=?""",
-                         (status, result, int(time.time()), cid))
-
-    def get_interrupted_commands(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT command_id FROM executed_commands WHERE status = 'STARTED'")
-            return [row[0] for row in cur.fetchall()]
-
-    def push_event(self, event_id, payload):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR IGNORE INTO events (event_id, payload, created_at) VALUES (?, ?, ?)",
-                         (event_id, json.dumps(payload), int(time.time())))
-
-    def load_events(self, limit=50):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT id, event_id, payload FROM events ORDER BY created_at ASC LIMIT ?", (limit,))
-            return cur.fetchall()
-
-    def delete_event(self, db_id):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM events WHERE id=?", (db_id,))
-
-    def set_state(self, key, value):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO state_vars (key, value) VALUES (?, ?)", (key, str(value)))
-
-    def get_state(self, key):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT value FROM state_vars WHERE key=?", (key,))
-            row = cur.fetchone()
-            return row[0] if row else None
+    def cleanup_acked(self):
+        self.conn.execute("DELETE FROM commands WHERE ack_status='ACKED'")
+        self.conn.commit()
