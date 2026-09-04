@@ -41,6 +41,7 @@ class OfflineQueue:
         self.conn.commit()
 
     def get_unacked(self):
+        # Only fetch commands that reached a terminal state
         cur = self.conn.execute("SELECT id, status, hardware_verification FROM commands WHERE ack_status='PENDING' AND status IN ('COMPLETED', 'FAILED', 'EXPIRED')")
         return cur.fetchall()
 

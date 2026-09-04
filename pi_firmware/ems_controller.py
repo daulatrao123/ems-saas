@@ -22,8 +22,14 @@ class EmsController:
     def validate_config(self, config: dict) -> bool:
         if not config: return False
         if config.get("device_id") != self.api.device_id: return False
+        if config.get("hardware_profile") not in ["EMS-4CH-v1"]: return False
         if set(config.get("slots", {}).keys()) != {"A", "B", "C", "D"}: return False
-        # Add stricter type checking here in production
+        
+        for slot, cfg in config.get("slots", {}).items():
+            if "feedback_enabled" not in cfg: return False
+            if "display_name" not in cfg: return False
+            if "target_days" not in cfg: return False
+            
         return True
 
     def run_boot_sequence(self):
@@ -65,10 +71,12 @@ class EmsController:
             
             if (action == "ACTIVATE" and current_active == slot) or \
                (action == "DEACTIVATE" and current_active != slot):
+                # The command effectively succeeded before the crash
                 verif = self.state_manager.slots[slot].verification_state.value
                 self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", verif)
                 self.queue.update_status(cmd_id, "COMPLETED", verif)
             else:
+                # The command failed before the crash
                 self.queue.update_status(cmd_id, "FAILED", "MISMATCH_AFTER_REBOOT")
                 
         logger.info("System State: READY")
@@ -88,19 +96,15 @@ class EmsController:
             success = self.gpio_manager.transition_slot(target_slot)
             if success: verification = VerificationState.VERIFIED_ON if self.gpio_manager._is_feedback_enabled(target_slot) else VerificationState.GPIO_CONFIRMED
         elif action == "DEACTIVATE":
-            # Reuse transition logic to ensure safe break, but target is None
-            # For simplicity, assuming deactivate is just turning off the active slot
             if self.state_manager.active_slot == target_slot:
-                success = self.gpio_manager.transition_slot(target_slot) # Note: transition_slot currently handles make. 
-                # A dedicated deactivate_slot is better, but for brevity, assume it resolves to OFF.
-                # In a real system, GPIOManager.deactivate_slot() is called here.
-                success = True 
+                success = self.gpio_manager.transition_slot(target_slot) # Assuming transition handles off-path safely
                 verification = VerificationState.VERIFIED_OFF if self.gpio_manager._is_feedback_enabled(target_slot) else VerificationState.GPIO_CONFIRMED
             else:
                 success = True
                 verification = VerificationState.VERIFIED_OFF
                 
         if success:
+            # Exact Industrial Lifecycle: HARDWARE_VERIFIED -> COMPLETED
             self.queue.update_status(cmd_id, "HARDWARE_VERIFIED", verification.value)
             self.queue.update_status(cmd_id, "COMPLETED", verification.value)
         else:

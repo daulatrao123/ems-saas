@@ -51,7 +51,7 @@ class StorageManager:
             files.sort(key=lambda x: os.path.getmtime(os.path.join(LOG_DIR, x)))
             
             if emergency:
-                # Keep only critical.log, wipe app logs
+                # Keep only critical.log, wipe all app logs
                 for f in files:
                     if 'critical' not in f:
                         os.remove(os.path.join(LOG_DIR, f))
@@ -68,6 +68,6 @@ class StorageManager:
                 if file_age > (7 * 86400) or (aggressive and len(files) > 2):
                     os.remove(filepath)
                     logger.info(f"Cleaned up log file: {f}")
-                    break
+                    # Do not break; clean up all eligible files in aggressive mode
         except Exception as e:
             logger.error(f"Log cleanup failed: {e}")
