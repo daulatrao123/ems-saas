@@ -445,10 +445,11 @@ class OfflineQueue:
                 SELECT
                     id,
                     slot,
-                    action
+                    action,
+                    status
                 FROM commands
-                WHERE status='EXECUTING'
-                ORDER BY started_at ASC
+                WHERE status IN ('EXECUTING', 'HARDWARE_VERIFIED', 'UNKNOWN_AFTER_REBOOT')
+                ORDER BY COALESCE(started_at, hardware_verified_at, created_at) ASC
                 """
             )
 

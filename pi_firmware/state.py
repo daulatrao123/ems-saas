@@ -79,6 +79,16 @@ class SlotState:
 
         self.last_command_at = None
 
+        # Monthly usage accounting. These fields are optional in legacy
+        # STATE_VERSION=4 documents and therefore remain backward-compatible.
+        self.used_days = 0
+        self.clicks = 0
+
+        # Monthly usage accounting. These fields are optional in legacy
+        # STATE_VERSION=4 documents and therefore remain backward-compatible.
+        self.used_days = 0
+        self.clicks = 0
+
     def to_dict(self):
         return {
             "slot": self.slot_code,
@@ -96,6 +106,10 @@ class SlotState:
                     if self.last_command_at
                     else None
                 ),
+            "used_days": int(self.used_days),
+            "clicks": int(self.clicks),
+            "used_days": int(self.used_days),
+            "clicks": int(self.clicks),
         }
 
     def from_dict(self, data):
@@ -138,6 +152,9 @@ class SlotState:
                 else None
             )
 
+            self.used_days = max(0, int(data.get("used_days", 0)))
+            self.clicks = max(0, int(data.get("clicks", 0)))
+
             return True
 
         except Exception as exc:
@@ -172,6 +189,8 @@ class PiStateManager:
 
         self.system_state = SystemState.BOOT
         self.active_slot = None
+        self.last_usage_date = None
+        self.last_reset_period = None
 
         self.slots = {
             code: SlotState(code)
@@ -204,6 +223,9 @@ class PiStateManager:
 
             "active_slot":
                 self.active_slot,
+
+            "last_usage_date": self.last_usage_date,
+            "last_reset_period": self.last_reset_period,
 
             "slots": {
                 code: state.to_dict()
@@ -283,6 +305,8 @@ class PiStateManager:
                 self.active_slot = data.get(
                     "active_slot"
                 )
+                self.last_usage_date = data.get("last_usage_date")
+                self.last_reset_period = data.get("last_reset_period")
 
                 system = data.get(
                     "system_state",
@@ -443,6 +467,31 @@ class PiStateManager:
             return self._flush_to_disk()
 
         return True
+
+    def set_last_usage_date(self, value, immediate=False):
+        self.last_usage_date = str(value) if value else None
+        self.save_state(immediate=immediate)
+
+    def set_last_reset_period(self, value, immediate=False):
+        self.last_reset_period = str(value) if value else None
+        self.save_state(immediate=immediate)
+
+    def increment_used_day(self, slot_code, immediate=False):
+        if slot_code not in self.slots:
+            return
+        self.slots[slot_code].used_days = max(0, int(self.slots[slot_code].used_days)) + 1
+        self.save_state(immediate=immediate)
+
+    def increment_clicks(self, slot_code, immediate=False):
+        if slot_code not in self.slots:
+            return
+        self.slots[slot_code].clicks = max(0, int(self.slots[slot_code].clicks)) + 1
+        self.save_state(immediate=immediate)
+
+    def reset_days(self, immediate=False):
+        for slot in self.slots.values():
+            slot.used_days = 0
+        self.save_state(immediate=immediate)
 
     def set_commanded(
         self,

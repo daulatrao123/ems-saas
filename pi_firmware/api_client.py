@@ -60,7 +60,6 @@ class ApiClient:
         payload = dict(snapshot)
 
         payload["deviceId"] = self.device_id
-        payload["key"] = self.api_key
 
         try:
             response = self.session.post(
@@ -127,13 +126,11 @@ class ApiClient:
         """
         Acknowledge a command.
 
-        Authentication is intentionally included in the body because
-        the current backend authentication contract requires it.
+        Authentication is carried by X-Device-ID / X-Api-Key headers.
+        Credentials are not duplicated in the JSON body.
         """
 
         payload = {
-            "deviceId": self.device_id,
-            "key": self.api_key,
             "command_id": str(command_id),
             "status": str(status).upper(),
             "verification_state": (

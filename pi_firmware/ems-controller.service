@@ -1,0 +1,34 @@
+[Unit]
+Description=EMS Industrial Controller
+After=local-fs.target network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/ems-data
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=gpio i2c
+WorkingDirectory=/opt/ems/pi_firmware
+EnvironmentFile=-/etc/ems/ems-controller.env
+ExecStart=/usr/bin/python3 /opt/ems/pi_firmware/ems_controller.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+ReadWritePaths=/mnt/ems-data
+DeviceAllow=/dev/gpiomem rw
+DeviceAllow=/dev/gpiochip* rw
+DeviceAllow=/dev/i2c-* rw
+
+[Install]
+WantedBy=multi-user.target

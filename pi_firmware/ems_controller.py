@@ -57,6 +57,7 @@ class EMSController:
         self.device_config = {
             "hardware_profile": "EMS-4CH-v1",
             "feedback_hardware_installed": False,
+            "reset_day": 15,
             "slots": {
                 slot: {
                     "target_days": 0,
@@ -78,6 +79,8 @@ class EMSController:
         )
 
         self._last_sync = 0.0
+        self._last_usage_day = self.state.last_usage_date
+        self._last_usage_day = self.state.last_usage_date
         self._last_telemetry = 0.0
         self._last_queue_cleanup = 0.0
 
@@ -175,6 +178,24 @@ class EMSController:
                 "hardware_profile"
             ] = profile
 
+        reset_day = response.get("resetDay")
+        if reset_day is not None:
+            try:
+                reset_day = int(reset_day)
+                if 1 <= reset_day <= 28:
+                    self.device_config["reset_day"] = reset_day
+            except (TypeError, ValueError):
+                logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
+
+        reset_day = response.get("resetDay")
+        if reset_day is not None:
+            try:
+                reset_day = int(reset_day)
+                if 1 <= reset_day <= 28:
+                    self.device_config["reset_day"] = reset_day
+            except (TypeError, ValueError):
+                logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
+
         self.device_config[
             "feedback_hardware_installed"
         ] = bool(
@@ -261,8 +282,8 @@ class EMSController:
 
             slots[slot] = {
                 "physical_toggle": physical,
-                "used_days": 0,
-                "clicks": 0,
+                "used_days": int(slot_state.used_days),
+                "clicks": int(slot_state.clicks),
             }
 
         resource_status = (
@@ -283,7 +304,7 @@ class EMSController:
             "deviceId": DEVICE_ID,
             "firmwareVersion": "7.0.0",
             "active_slot": self.state.active_slot,
-            "resetDay": 15,
+            "resetDay": int(self.device_config.get("reset_day", 15)),
             "emergencyStop": (
                 self.state.system_state
                 == SystemState.FAULT
@@ -304,6 +325,51 @@ class EMSController:
             "slots": slots,
             "memory": memory,
         }
+
+    # ============================================================
+    # DAILY USAGE / MONTHLY RESET
+    # ============================================================
+
+    def _slot_visible(self, slot):
+        if slot not in self.device_config.get("slots", {}):
+            return False
+        cfg = self.device_config["slots"][slot]
+        physical = self.state.slots[slot].feedback_state.value
+        return (
+            int(cfg.get("target_days", 0)) > 0
+            and physical == "ON"
+            and not bool(cfg.get("disabled", False))
+        )
+
+    def _update_daily_usage(self):
+        now = datetime.now().astimezone()
+        marker = now.date().isoformat()
+        if self._last_usage_day == marker:
+            return
+
+        reset_day = max(1, min(28, int(self.device_config.get("reset_day", 15))))
+        current_period = f"{now.year:04d}-{now.month:02d}"
+        last_reset_period = self.state.last_reset_period
+
+        if now.day >= reset_day and last_reset_period != current_period:
+            legacy_has_usage = any(slot.used_days > 0 for slot in self.state.slots.values())
+            legacy_period = str(self.state.last_usage_date)[:7] if self.state.last_usage_date else None
+            should_reset = (
+                last_reset_period is not None
+                or not legacy_has_usage
+                or (legacy_period is not None and legacy_period < current_period)
+            )
+            if should_reset:
+                self.state.reset_days(immediate=False)
+            self.state.set_last_reset_period(current_period, immediate=False)
+
+        active = self.state.active_slot
+        if active and self._slot_visible(active):
+            self.state.increment_used_day(active, immediate=False)
+
+        self.state.set_last_usage_date(marker, immediate=False)
+        if self.state.save_state(immediate=True):
+            self._last_usage_day = marker
 
     # ============================================================
     # CLOUD SYNC
@@ -389,6 +455,9 @@ class EMSController:
                 "Rejected command with invalid slot: %s",
                 slot,
             )
+            self.api.push_ack(
+                command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"
+            )
             return
 
         normalized = {
@@ -415,11 +484,12 @@ class EMSController:
                 "reset_days",
                 "lcd_display",
             }:
-                self.api.push_ack(
-                    command_id,
-                    "COMPLETED",
-                    "NOT_AVAILABLE",
-                )
+                if self.api.push_ack(
+                    command_id, "COMPLETED", "NOT_AVAILABLE"
+                ):
+                    self.api.push_ack(
+                        command_id, "ACKED", "NOT_AVAILABLE"
+                    )
 
             return
 
@@ -480,6 +550,10 @@ class EMSController:
         )
         error = None
 
+        # Best-effort cloud lifecycle notification. Local durable state remains
+        # authoritative when the cloud is unavailable.
+        self.api.push_ack(command_id, "EXECUTING", "PENDING")
+
         try:
             if action == "ACTIVATE":
                 success = (
@@ -506,6 +580,9 @@ class EMSController:
                 )
 
             if success:
+                if slot and slot in self.state.slots:
+                    self.state.increment_clicks(slot, immediate=False)
+
                 slot_obj = (
                     self.state.slots.get(slot)
                     if slot
@@ -629,11 +706,9 @@ class EMSController:
             )
             return
 
-        for command_id, slot, action in interrupted:
+        for command_id, slot, action, prior_status in interrupted:
             try:
-                hardware_active = (
-                    self.state.active_slot
-                )
+                hardware_active = self.state.active_slot
 
                 if action == "ACTIVATE":
                     if hardware_active == slot:
@@ -643,11 +718,12 @@ class EMSController:
                             .value
                         )
 
-                        self.queue.update_status(
-                            command_id,
-                            "HARDWARE_VERIFIED",
-                            verification,
-                        )
+                        if prior_status != "HARDWARE_VERIFIED":
+                            self.queue.update_status(
+                                command_id,
+                                "HARDWARE_VERIFIED",
+                                verification,
+                            )
 
                         self.queue.update_status(
                             command_id,
@@ -667,20 +743,17 @@ class EMSController:
                     "DEACTIVATE_ALL",
                 }:
                     if hardware_active is None:
-                        self.queue.update_status(
-                            command_id,
-                            "HARDWARE_VERIFIED",
-                            VerificationState
-                            .VERIFIED_OFF
-                            .value,
-                        )
+                        if prior_status != "HARDWARE_VERIFIED":
+                            self.queue.update_status(
+                                command_id,
+                                "HARDWARE_VERIFIED",
+                                VerificationState.VERIFIED_OFF.value,
+                            )
 
                         self.queue.update_status(
                             command_id,
                             "COMPLETED",
-                            VerificationState
-                            .VERIFIED_OFF
-                            .value,
+                            VerificationState.VERIFIED_OFF.value,
                         )
                     else:
                         self.queue.update_status(
@@ -712,15 +785,19 @@ class EMSController:
             error,
         ) in rows:
             try:
-                if self.api.push_ack(
+                terminal_sent = self.api.push_ack(
                     command_id,
                     status,
                     verification or "UNKNOWN",
                     error,
+                )
+                if terminal_sent and self.api.push_ack(
+                    command_id,
+                    "ACKED",
+                    verification or "UNKNOWN",
+                    error,
                 ):
-                    self.queue.mark_acked(
-                        command_id
-                    )
+                    self.queue.mark_acked(command_id)
             except Exception as exc:
                 logger.warning(
                     "ACK retry failed: %s",
@@ -747,6 +824,7 @@ class EMSController:
                 ):
                     self.sync_cloud()
 
+                self._update_daily_usage()
                 self.process_one_command()
 
                 self.flush_acks()

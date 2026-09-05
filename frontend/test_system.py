@@ -1,6 +1,18 @@
+import os
 import requests, json, sys, time
 
-BASE = "https://ems-saass.onrender.com"
+BASE = os.environ.get("EMS_TEST_BASE_URL", "http://localhost:8000")
+TEST_USERS = {
+    "super_admin": (os.environ.get("EMS_TEST_SUPER_ADMIN_EMAIL", ""), os.environ.get("EMS_TEST_SUPER_ADMIN_PASSWORD", "")),
+    "society_admin": (os.environ.get("EMS_TEST_SOCIETY_ADMIN_EMAIL", ""), os.environ.get("EMS_TEST_SOCIETY_ADMIN_PASSWORD", "")),
+    "member": (os.environ.get("EMS_TEST_MEMBER_EMAIL", ""), os.environ.get("EMS_TEST_MEMBER_PASSWORD", "")),
+}
+
+def require_test_user(role):
+    email, password = TEST_USERS[role]
+    if not email or not password:
+        raise RuntimeError(f"Set EMS_TEST_{role.upper()}_EMAIL and EMS_TEST_{role.upper()}_PASSWORD before running integration tests")
+    return email, password
 results = {"pass": 0, "fail": 0, "tests": []}
 
 def test(name, func):
@@ -44,7 +56,7 @@ member_token = None
 
 def t1():
     global sa_token
-    r = requests.post(f"{BASE}/api/auth/login", json={"email": "admin@ems.com", "password": "admin123"}, timeout=15)
+    r = requests.post(f"{BASE}/api/auth/login", json={"email": require_test_user("super_admin")[0], "password": require_test_user("super_admin")[1]}, timeout=15)
     d = r.json()
     sa_token = d.get("token", "")
     ok = r.status_code == 200 and d.get("role") == "super_admin" and len(sa_token) > 10
@@ -53,7 +65,7 @@ test("Super Admin Login", t1)
 
 def t2():
     global admin_token
-    r = requests.post(f"{BASE}/api/auth/login", json={"email": "admin@prestine.com", "password": "admin123"}, timeout=15)
+    r = requests.post(f"{BASE}/api/auth/login", json={"email": require_test_user("society_admin")[0], "password": require_test_user("society_admin")[1]}, timeout=15)
     d = r.json()
     admin_token = d.get("token", "")
     ok = r.status_code == 200 and d.get("role") == "society_admin" and len(admin_token) > 10
@@ -62,7 +74,7 @@ test("Society Admin Login", t2)
 
 def t3():
     global member_token
-    r = requests.post(f"{BASE}/api/auth/login", json={"email": "member@prestine.com", "password": "admin123"}, timeout=15)
+    r = requests.post(f"{BASE}/api/auth/login", json={"email": require_test_user("member")[0], "password": require_test_user("member")[1]}, timeout=15)
     d = r.json()
     member_token = d.get("token", "")
     ok = r.status_code == 200 and d.get("role") == "member" and len(member_token) > 10
@@ -70,7 +82,7 @@ def t3():
 test("Member Login", t3)
 
 def t4():
-    r = requests.post(f"{BASE}/api/auth/login", json={"email": "admin@ems.com", "password": "wrongpass"}, timeout=15)
+    r = requests.post(f"{BASE}/api/auth/login", json={"email": require_test_user("super_admin")[0], "password": "__WRONG_PASSWORD_FOR_TEST__"}, timeout=15)
     ok = r.status_code == 401
     return ok, f"HTTP {r.status_code} (expected 401)"
 test("Wrong Password Rejected", t4)
@@ -325,7 +337,7 @@ print("\n===== RENDER BACKEND HEALTH =====")
 def t32():
     t0 = time.time()
     try:
-        r = requests.get(f"{BASE}/api/auth/login", json={"email": "admin@ems.com", "password": "admin123"}, timeout=30)
+        r = requests.get(f"{BASE}/api/auth/login", json={"email": require_test_user("super_admin")[0], "password": require_test_user("super_admin")[1]}, timeout=30)
         latency = (time.time() - t0) * 1000
         ok = r.status_code == 200 and latency < 3000
         return ok, f"latency={latency:.0f}ms"
