@@ -242,7 +242,7 @@ def ensure_db_schema():
             cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
             cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS reset_day INT")
             cur.execute("UPDATE societies SET reset_day=%s WHERE reset_day IS NULL OR reset_day < 1 OR reset_day > 28", (DEFAULT_RESET_DAY,))
-            cur.execute("ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT %s", (DEFAULT_RESET_DAY,))
+            cur.execute(f"ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT {DEFAULT_RESET_DAY}")
             cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
             cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
