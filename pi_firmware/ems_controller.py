@@ -187,6 +187,15 @@ class EMSController:
             except (TypeError, ValueError):
                 logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
 
+        reset_day = response.get("resetDay")
+        if reset_day is not None:
+            try:
+                reset_day = int(reset_day)
+                if 1 <= reset_day <= 28:
+                    self.device_config["reset_day"] = reset_day
+            except (TypeError, ValueError):
+                logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
+
         self.device_config[
             "feedback_hardware_installed"
         ] = bool(
@@ -446,9 +455,11 @@ class EMSController:
                 "Rejected command with invalid slot: %s",
                 slot,
             )
-            self.api.push_ack(
+            self.api.push_ack(command_id, "EXECUTING", "PENDING")
+            if self.api.push_ack(
                 command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"
-            )
+            ):
+                self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE")
             return
 
         normalized = {
@@ -475,8 +486,17 @@ class EMSController:
                 "reset_days",
                 "lcd_display",
             }:
+                self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE")
                 if self.api.push_ack(
                     command_id, "COMPLETED", "NOT_AVAILABLE"
+                ):
+                    self.api.push_ack(
+                        command_id, "ACKED", "NOT_AVAILABLE"
+                    )
+            else:
+                self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE")
+                if self.api.push_ack(
+                    command_id, "FAILED", "NOT_AVAILABLE", "UNSUPPORTED_COMMAND"
                 ):
                     self.api.push_ack(
                         command_id, "ACKED", "NOT_AVAILABLE"
@@ -531,15 +551,15 @@ class EMSController:
             SystemState.EXECUTING
         )
 
-        # Safety invariant: never mutate contactor hardware unless the
-        # command's EXECUTING state has been durably persisted first.
+        # Persist the pre-hardware execution state before mutating any GPIO.
+        # If durable state cannot be written, stop safely and leave the durable
+        # queue item recoverable rather than changing hardware without a record.
         if not self.state.save_state(immediate=True):
-            self.state.system_state = SystemState.FAULT
             logger.critical(
-                "Cannot persist EXECUTING state; hardware command %s was not started.",
+                "Cannot persist EXECUTING state for command %s; hardware mutation aborted.",
                 command_id,
             )
-            return True
+            return False
 
         success = False
         verification = (

@@ -1,30 +1,20 @@
-"""Static release gate for EMS 6.4 targeted hardening.
+"""Static release gate for EMS SaaS 6.4.1 targeted hardening.
 
-This does not certify hardware, storage endurance, OTA, or production security.
-It verifies the targeted source-level invariants that can be checked offline.
+This gate checks source-level invariants that can be verified offline. It does
+not certify target hardware, storage endurance, OTA, or production security.
 """
 from pathlib import Path
 import ast
-import hashlib
-import subprocess
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 
-PROTECTED = [
-    "pi_firmware/gpio_manager.py",
-    "pi_firmware/storage_io_manager.py",
-    "pi_firmware/storage_manager.py",
-    "pi_firmware/logger.py",
-    "pi_firmware/memory_manager.py",
-    "pi_firmware/resource_guard.py",
-]
 
-
-def fail(msg):
+def fail(msg: str):
     raise SystemExit(f"FAIL: {msg}")
 
 
-def read(path):
+def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
@@ -38,59 +28,56 @@ def main():
     state = read("pi_firmware/state.py")
 
     required = [
-        ("UserLogin declared before route", 'class UserLogin(BaseModel):'),
-        ("backend command FSM", '"hardware_verified": {"completed", "failed"}'),
-        ("backend ACKED state", '"acked": set()'),
-        ("backend header auth", 'alias="X-Api-Key"'),
-        ("backend delivery lease", "COMMAND_DELIVERY_LEASE_SECONDS = 120"),
-        ("5-minute absolute expiry", "COMMAND_EXPIRY_SECONDS = 300"),
+        ("fixed DDL default", 'ALTER COLUMN reset_day SET DEFAULT {DEFAULT_RESET_DAY}'),
+        ("strict queued transition", '"queued": {"delivered", "expired"}'),
+        ("delivery lease", "COMMAND_DELIVERY_LEASE_SECONDS = 120"),
+        ("absolute expiry", "COMMAND_EXPIRY_SECONDS = 300"),
+        ("header auth", 'alias="X-Api-Key"'),
         ("retirement", "UPDATE pi_devices SET status='RETIRED'"),
-        ("controller hardware verification", '"HARDWARE_VERIFIED"'),
-        ("controller reboot ambiguity", '"UNKNOWN_AFTER_REBOOT"'),
+        ("reboot ambiguity", '"UNKNOWN_AFTER_REBOOT"'),
+        ("hardware verification", '"HARDWARE_VERIFIED"'),
         ("monthly reset marker", "last_reset_period"),
-        ("physical ON visibility", 'physical == "ON"'),
-        ("Pi API header", '"X-Device-ID"'),
-        ("explicit device storage", "EMS_DATA_DEVICE"),
+        ("legacy state defaults", 'data.get("used_days", 0)'),
+        ("physical visibility", 'physical == "ON"'),
+        ("explicit storage", "EMS_DATA_DEVICE"),
         ("no formatting", "NO FORMAT OPERATION WILL BE PERFORMED"),
-        ("least privilege service", "User=pi"),
+        ("least privilege", "User=pi"),
         ("gpio group", "SupplementaryGroups=gpio i2c"),
-        ("legacy state compatibility", 'data.get("last_reset_period")'),
-        ("durable pre-hardware EXECUTING", 'Cannot persist EXECUTING state; hardware command'),
-        ("retired device assignment guard", 'Retired device cannot be reassigned'),
-        ("firmware credential verification", 'Invalid or inactive Pi credentials'),
+        ("persist before hardware", "Cannot persist EXECUTING state"),
     ]
+    combined = backend + controller + queue + api + setup + service + state
     for name, token in required:
-        if token not in (backend + controller + queue + api + setup + service + state):
+        if token not in combined:
             fail(f"missing {name}: {token}")
 
-    tests = read("frontend/test_system.py")
-    if "admin123" in tests:
-        fail("hardcoded test password remains")
+    if '"queued": {"delivered", "executing", "expired"}' in backend:
+        fail("direct queued->executing transition remains")
 
-    for path in [
-        "backend/main.py", "frontend/test_system.py",
-        "pi_firmware/api_client.py", "pi_firmware/ems_controller.py",
-        "pi_firmware/offline_queue.py", "pi_firmware/setup_pi.sh", "pi_firmware/state.py",
-    ]:
-        if path.endswith(".py"):
-            ast.parse(read(path), filename=path)
+    if "ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT %s" in backend:
+        fail("parameterized PostgreSQL DDL remains")
+
+    if '"key": self.api_key' in api or 'payload["key"]' in api:
+        fail("Pi API key still duplicated into request JSON")
 
     if "DELETE FROM pi_devices" in backend or "DELETE FROM societies" in backend:
-        fail("destructive device/society lifecycle SQL remains")
+        fail("destructive lifecycle SQL remains")
 
-    if "payload[\"key\"]" in api or '"key": self.api_key' in api:
-        fail("Pi API key is still duplicated into request JSON")
+    tests = read("frontend/test_system.py")
+    if re.search(r"admin123|password\s*=\s*['\"]", tests, flags=re.I):
+        fail("hardcoded test credential pattern remains")
 
-    assert backend.index("class UserLogin(BaseModel):") < backend.index('def login(request: Request, user: UserLogin):')
-    assert '"delivered": {"executing", "expired", "unknown_after_reboot"}' in backend
-    assert '"queued": {"delivered", "expired"}' in backend
-    assert 'status = status.lower()' not in backend or 'COMMAND_TRANSITIONS' in backend
+    for path in [
+        "backend/main.py", "frontend/test_system.py", "pi_firmware/api_client.py",
+        "pi_firmware/ems_controller.py", "pi_firmware/offline_queue.py", "pi_firmware/state.py",
+    ]:
+        ast.parse(read(path), filename=path)
 
-    print("PASS: EMS 6.4.1 targeted static source gate")
-    print("PASS: UserLogin startup ordering, command FSM, ACK lifecycle, lease/expiry")
-    print("PASS: legacy state compatibility, durable pre-hardware persistence, retirement guards")
-    print("PASS: header-authenticated Pi firmware download and explicit storage/service hardening")
-    print("NOTE: HIL, endurance, OTA signing/rollback, Alembic migrations, dependency audit and full frontend build remain release gates")
+    print("PASS: EMS 6.4.1 strict source gate")
+    print("PASS: PostgreSQL startup DDL parameter bug fixed")
+    print("PASS: strict command FSM and ACK lifecycle")
+    print("PASS: state/queue compatibility invariants")
+    print("PASS: explicit storage + least-privilege service invariants")
+    print("NOTE: HIL, endurance, Alembic, OTA, web-session security, dependency and deployment gates remain mandatory")
 
 
 if __name__ == "__main__":

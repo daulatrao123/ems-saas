@@ -1,36 +1,19 @@
-# EMS 6.4.1 change manifest
-# base cb15919032596021e732321a4c7c84e60429f5f6
+EMS SaaS Industrial 6.4.1 — Strict Targeted Hardening
 
-PROTECTED SUBSYSTEMS (unchanged)
-- pi_firmware/gpio_manager.py
-- pi_firmware/storage_io_manager.py
-- pi_firmware/storage_manager.py
-- pi_firmware/logger.py
-- pi_firmware/memory_manager.py
-- pi_firmware/resource_guard.py
+Base: cb15919032596021e732321a4c7c84e60429f5f6
 
-TARGETED SOURCE CHANGES
-- backend/main.py
-- frontend/test_system.py
-- pi_firmware/api_client.py
-- pi_firmware/ems_controller.py
-- pi_firmware/offline_queue.py
-- pi_firmware/setup_pi.sh
-- pi_firmware/state.py
+Key changes:
+- Fix PostgreSQL startup crash caused by parameter binding in ALTER TABLE ... SET DEFAULT.
+- Preserve STATE_VERSION=4 compatibility with safe defaults for newly introduced state fields.
+- Harden local command recovery and strict lifecycle handling.
+- Do not allow direct QUEUED -> EXECUTING transitions.
+- Persist EXECUTING state before any GPIO mutation; abort hardware mutation when durable state persistence fails.
+- Use a 120-second delivery lease and 300-second absolute command expiry.
+- Keep terminal completion separate from ACKED confirmation.
+- Prevent reassignment of RETIRED Pi devices.
+- Keep feedback_enabled consistent with device-level feedback hardware capability.
+- Use explicit EMS_DATA_DEVICE provisioning and a least-privilege systemd service.
+- Keep protected GPIO/storage/resource subsystems unchanged from the baseline.
 
-NEW / RELEASE SUPPORT
-- pi_firmware/ems-controller.service
-- qa/strict_6_4_check.py
-- qa/runtime_compatibility_test.py
-- RELEASE_NOTES_6.4.1.md
-
-REMOVED
-- pi_firmware/storage_health.py
-
-6.4.1 DELTA
-- UserLogin declaration moved before login route.
-- Duplicate state/controller reset/usage declarations cleaned.
-- Durable EXECUTING persistence enforced before hardware mutation.
-- Feedback capability constrained in super-admin view.
-- Retired-device reassignment rejected.
-- Firmware download validates device ID + API key.
+Not certified by this ZIP:
+HIL/electrical qualification, endurance/wear qualification, Alembic migration qualification, secure OTA/rollback, browser/session security finalization, dependency vulnerability closure, and full production CI/deployment qualification.

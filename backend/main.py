@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.4.0-targeted")
+app = FastAPI(title="EMS SaaS API", version="6.4.1-strict-targeted")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -67,11 +67,6 @@ VALID_COMMANDS = {
     "set_active_slot", "set_days", "set_reset_day", "restart",
     "reboot", "reset_days", "off_slot", "off_all", "lcd_display",
 }
-
-# Request model must be defined before any route/decorator references it.
-class UserLogin(BaseModel):
-    email: str
-    password: str
 
 # ================================================================
 # DATABASE & SCHEMA INITIALIZATION
@@ -247,7 +242,7 @@ def ensure_db_schema():
             cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
             cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS reset_day INT")
             cur.execute("UPDATE societies SET reset_day=%s WHERE reset_day IS NULL OR reset_day < 1 OR reset_day > 28", (DEFAULT_RESET_DAY,))
-            cur.execute("ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT %s", (DEFAULT_RESET_DAY,))
+            cur.execute(f"ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT {DEFAULT_RESET_DAY}")
             cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
             cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
@@ -363,6 +358,10 @@ def validate_command(command: str, params: dict, slot: str = "") -> None:
 # ================================================================
 # AUTH
 # ================================================================
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
 
 async def get_current_user(authorization: str = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
@@ -621,14 +620,15 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
 
             for dev in devices:
                 dev_id = dev["device_id"]
-                if not dev_id: continue
+                if not dev_id:
+                    continue
 
                 cur.execute("SELECT status FROM pi_devices WHERE id=%s FOR UPDATE", (dev_id,))
-                device_row = cur.fetchone()
-                if not device_row:
+                existing_device = cur.fetchone()
+                if not existing_device:
                     raise HTTPException(404, f"Device not found: {dev_id}")
-                if str(device_row["status"]).upper() == "RETIRED":
-                    raise HTTPException(409, f"Retired device cannot be reassigned: {dev_id}")
+                if str(existing_device["status"]).upper() == "RETIRED":
+                    raise HTTPException(409, f"Retired device cannot be assigned: {dev_id}")
 
                 cur.execute(
                     "UPDATE pi_devices SET society_id=%s, status='ASSIGNED', hardware_profile=%s, feedback_hardware_installed=%s WHERE id=%s",
@@ -908,24 +908,12 @@ def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))
     return {"message": "Force flag updated"}
 
 @app.get("/api/pi/firmware-download")
-def download_firmware(
-    version: str,
-    x_api_key: str = Header(None, alias="X-Api-Key"),
-    x_device_id: str = Header(None, alias="X-Device-ID"),
-):
-    if not x_api_key or not x_device_id:
-        raise HTTPException(403, "X-Device-ID and X-Api-Key headers are required")
+def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-Key")):
+    if not x_api_key:
+        raise HTTPException(403, "API key required in X-Api-Key header")
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "SELECT id, society_id, status FROM pi_devices WHERE id=%s AND api_key_hash=%s",
-                (x_device_id, hash_api_key(x_api_key)),
-            )
-            device = cur.fetchone()
-            if not device or not device["society_id"] or str(device["status"]).upper() != "ASSIGNED":
-                raise HTTPException(403, "Invalid or inactive Pi credentials")
-
             cur.execute("SELECT code FROM firmware_versions WHERE version = %s", (version,))
             fv = cur.fetchone()
             if not fv:

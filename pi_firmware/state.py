@@ -79,8 +79,8 @@ class SlotState:
 
         self.last_command_at = None
 
-        # Monthly usage accounting. These fields are optional in legacy
-        # STATE_VERSION=4 documents and therefore remain backward-compatible.
+        # Monthly usage accounting. Legacy STATE_VERSION=4 documents may omit
+        # these fields; from_dict() supplies safe defaults.
         self.used_days = 0
         self.clicks = 0
 
