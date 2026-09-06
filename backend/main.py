@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v6.5.5 — Industrial Production (Strict Hardened RC)
+EMS SaaS Backend v6.5.6 — Industrial Production (Strict Hardened RC)
 """
 
 import os
@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.5.5-prod")
+app = FastAPI(title="EMS SaaS API", version="6.5.6-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -55,6 +55,7 @@ VALID_COMMANDS = {
     "reboot", "reset_days", "off_slot", "off_all", "lcd_display",
 }
 
+# Strict Command FSM
 VALID_ACK_TRANSITIONS = {
     "QUEUED": ["DELIVERED", "EXPIRED"],
     "DELIVERED": ["EXECUTING", "EXPIRED", "FAILED"],
@@ -213,7 +214,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (v6.5.5 Strict Hardened RC)")
+        print("DB schema verified OK (v6.5.6 Strict Hardened RC)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -331,7 +332,6 @@ async def require_society_access(request: Request, user: dict = Depends(get_curr
         if requested and requested != owned:
             raise HTTPException(status_code=403, detail="Cannot access other society data")
         
-        # FIX: Block access if the society is retired
         if owned and owned != "None":
             conn = get_db()
             try:
@@ -418,7 +418,7 @@ def bootstrap(request: Request):
     return {"message": "Super Admin initialized. Log in and provision your society."}
 
 # ================================================================
-# AUTH LOGIN
+# AUTH LOGIN & PROFILE
 # ================================================================
 
 @app.post("/api/auth/login")
@@ -439,6 +439,26 @@ def login(request: Request, user: UserLogin):
             return {
                 "token": token, "role": db_user["role"],
                 "name": db_user["name"], "society_id": db_user["society_id"],
+            }
+    finally:
+        conn.close()
+
+@app.get("/api/auth/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    """Returns the current authenticated user's profile."""
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id, email, name, role, society_id FROM users WHERE id = %s", (user.get("id"),))
+            db_user = cur.fetchone()
+            if not db_user:
+                raise HTTPException(status_code=404, detail="User not found")
+            return {
+                "id": db_user["id"],
+                "email": db_user["email"],
+                "name": db_user["name"],
+                "role": db_user["role"],
+                "society_id": db_user["society_id"]
             }
     finally:
         conn.close()
@@ -524,7 +544,6 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 if not soc_data:
                     raise HTTPException(404, "Society not found")
                 if soc_data["status"] == 'RETIRED':
-                    # FIX: Added detail= keyword argument
                     raise HTTPException(status_code=403, detail="Cannot edit or reactivate a retired society.")
 
                 cur.execute("""UPDATE societies SET name=%s, location=%s, config_version=config_version+1 WHERE id=%s""",
@@ -640,7 +659,6 @@ def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
                 society_id = int(society_id_raw)
                 status = "ASSIGNED"
                 
-                # FIX: Prevent assigning to a retired society
                 cur.execute("SELECT status FROM societies WHERE id=%s", (society_id,))
                 soc = cur.fetchone()
                 if not soc:
@@ -914,7 +932,6 @@ def pi_command_ack(payload: dict, x_device_id: str = Header(None, alias="X-Devic
                     day = int(cmd_data["params"].get("day", 15))
                     cur.execute("UPDATE societies SET reset_day = %s, config_version = config_version + 1 WHERE id = %s", (day, society_id))
 
-            # FIX: Semantic timestamp mapping
             ts_column = None
             if status == "EXECUTING": ts_column = "started_at"
             elif status == "HARDWARE_VERIFIED": ts_column = "hardware_verified_at"
@@ -964,7 +981,6 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            # FIX: Enforce device status = ASSIGNED and society status = active
             cur.execute("""
                 SELECT d.id 
                 FROM pi_devices d 
