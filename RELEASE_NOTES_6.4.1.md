@@ -1,39 +1,50 @@
-# EMS SaaS Industrial 6.4.1 — Strict Hardened Candidate
+# EMS SaaS 6.4.1 — Strict Hardened Candidate
 
-Base: GitHub `daulatrao123/ems-saas`, main commit `cb15919032596021e732321a4c7c84e60429f5f6`.
+Base: `daulatrao123/ems-saas` main at `cb15919032596021e732321a4c7c84e60429f5f6`
 
-## Security / reliability changes
+## Deployment blocker fixed
 
-- Database schema DDL removed from FastAPI startup. Production schema is now controlled by Alembic.
-- Render startup runs `alembic upgrade head` before Uvicorn.
-- Added idempotent industrial baseline migration that adopts existing v6.x schemas and normalizes legacy wing/slot names.
-- Browser authentication moved from `localStorage` JWT storage to `HttpOnly; Secure; SameSite=None` cookie sessions with `/api/auth/me` and `/api/auth/logout`.
-- Added controlled bootstrap administrator password recovery using `EMS_BOOTSTRAP_RECOVERY_TOKEN` + current `EMS_BOOTSTRAP_PASSWORD`.
-- Strict command FSM: queued commands cannot jump directly to executing; `HARDWARE_VERIFIED` requires explicit verification state.
-- Retired devices cannot be reassigned through society configuration.
-- Retired societies cannot receive new commands.
-- Super-admin and society-admin frontend routes now verify server-side session role rather than trusting browser storage.
-- Added Ed25519 firmware signing and SHA-256 integrity metadata on firmware records.
-- Pi firmware download requires authenticated device headers and returns a signed manifest rather than unsigned source text.
-- Added Pi-side Ed25519 verification and application A/B staging with atomic active/pending markers and automatic rollback of an unconfirmed boot.
-- EMS systemd service remains least-privilege (`User=pi`, `Group=pi`, `NoNewPrivileges=true`) and uses the OTA boot selector.
-- Pi refuses to mutate hardware if it cannot durably persist the `EXECUTING` state first.
+The Render startup failure caused by parameterizing PostgreSQL DDL is eliminated by moving schema creation/migration out of `backend/main.py` entirely. The reset-day default is now applied by the Alembic migration using a PostgreSQL-safe literal.
 
-## QA evidence included
+Render now runs:
 
-- `qa/strict_6_4_1_check.py` — static industrial invariants.
-- `qa/runtime_6_4_1_test.py` — signed OTA verification and legacy state compatibility.
-- `qa/HIL_TEST_PLAN.md` — required physical contactor/feedback/power-loss qualification.
-- `qa/STORAGE_ENDURANCE_PLAN.md` — required 7–30 day production-storage soak and WAF measurement.
+`alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port $PORT`
 
-## Important release status
+## 6.4.1 hardening included
 
-This is a **strict hardened candidate**, not a claim of field certification. The following require the actual production environment:
+- Alembic versioned migration baseline for the current relational schema and legacy wing/slot normalization.
+- No application-startup DDL in `backend/main.py`.
+- Strict command FSM: `QUEUED -> DELIVERED -> EXECUTING -> HARDWARE_VERIFIED -> COMPLETED -> ACKED`, with explicit failure/expiry/recovery branches.
+- 120-second delivery lease and 300-second absolute command expiry.
+- `HARDWARE_VERIFIED` requires explicit verification state.
+- `UNKNOWN_AFTER_REBOOT` is not eligible for normal queue execution.
+- Legacy SQLite command databases are extended before indexes are created.
+- Legacy `STATE_VERSION=4` JSON safely defaults missing usage counters.
+- Hardware mutation is blocked if the Pi cannot persist its `EXECUTING` state first; the Pi enters `FAULT` instead.
+- Retired Pi devices cannot be silently reassigned through society configuration.
+- Dashboard feedback capability is clamped to actual device feedback hardware.
+- Explicit, non-formatting USB data-device provisioning remains enforced.
+- Pi controller service runs as `pi:pi` with GPIO/I2C supplementary groups.
+- Pi API credentials are sent through headers by the current client, not duplicated in JSON.
+- Existing GPIO/storage/resource subsystems remain byte-identical to the main baseline.
 
-1. Physical HIL qualification with the welded-contactor, missing-feedback and 500 ms power-loss cases.
-2. 7–30 day endurance soak on the exact production Pi OS + USB device to measure system-level write amplification.
-3. Real production deployment of Alembic against a backup/restore-tested database.
-4. OTA qualification on the exact Raspberry Pi boot/storage layout, including boot-failure rollback.
-5. Frontend HTTPS deployment and browser cookie/CORS verification.
+## QA executed offline
 
-Do not push to production solely because the static checks pass.
+- Python syntax/compile checks: PASS.
+- Shell syntax check for `setup_pi.sh`: PASS.
+- Strict source-level release gate: PASS.
+- Legacy SQLite queue migration/runtime compatibility: PASS.
+- Legacy `STATE_VERSION=4` state compatibility: PASS.
+- Alembic offline SQL generation: PASS; PostgreSQL migration context reports transactional DDL.
+
+## Remaining qualification gates — NOT certified by this ZIP
+
+These require target infrastructure/hardware and must remain release blockers for a true industrial production certification:
+
+1. Physical HIL: welded contactor, missing feedback, feedback mismatch, and power-loss during the 500 ms interlock.
+2. 7–30 day storage endurance soak on the exact production Raspberry Pi OS + USB device; measure actual system WAF and total physical writes.
+3. Live PostgreSQL migration rehearsal against a backup/staging clone of the production schema.
+4. HttpOnly/Secure/SameSite cookie authentication and refresh-token rotation.
+5. Ed25519-signed firmware verification plus target-specific A/B boot and automatic rollback.
+
+**Release status: HARDENED CANDIDATE — NOT INDUSTRIAL-PRODUCTION CERTIFIED.**
