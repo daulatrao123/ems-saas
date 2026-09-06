@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api";
+import { getSession } from "@/lib/auth";
 
 export default function MemberDashboard() {
   const router = useRouter();
@@ -9,13 +10,10 @@ export default function MemberDashboard() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const role = localStorage.getItem("role");
-    const token = localStorage.getItem("token");
-    if (!token || role !== "member") {
-      router.push("/login");
-      return;
-    }
-    fetchDashboard();
+    getSession().then(session => {
+      if (session.role !== "member") { router.push("/login"); return; }
+      fetchDashboard();
+    }).catch(() => router.push("/login"));
   }, [router]);
 
   const fetchDashboard = async () => {

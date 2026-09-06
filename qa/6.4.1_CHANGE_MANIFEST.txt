@@ -1,19 +1,55 @@
-EMS SaaS Industrial 6.4.1 — Strict Targeted Hardening
+EMS SaaS Industrial 6.4.1 Change Manifest
+=========================================
 
-Base: cb15919032596021e732321a4c7c84e60429f5f6
+BASE
+- daulatrao123/ems-saas
+- main commit: cb15919032596021e732321a4c7c84e60429f5f6
 
-Key changes:
-- Fix PostgreSQL startup crash caused by parameter binding in ALTER TABLE ... SET DEFAULT.
-- Preserve STATE_VERSION=4 compatibility with safe defaults for newly introduced state fields.
-- Harden local command recovery and strict lifecycle handling.
-- Do not allow direct QUEUED -> EXECUTING transitions.
-- Persist EXECUTING state before any GPIO mutation; abort hardware mutation when durable state persistence fails.
-- Use a 120-second delivery lease and 300-second absolute command expiry.
-- Keep terminal completion separate from ACKED confirmation.
-- Prevent reassignment of RETIRED Pi devices.
-- Keep feedback_enabled consistent with device-level feedback hardware capability.
-- Use explicit EMS_DATA_DEVICE provisioning and a least-privilege systemd service.
-- Keep protected GPIO/storage/resource subsystems unchanged from the baseline.
+DATABASE
+- backend/alembic.ini
+- backend/migrations/env.py
+- backend/migrations/script.py.mako
+- backend/migrations/versions/0001_industrial_baseline.py
+- backend/main.py: no application-startup DDL
+- backend/render.yaml: alembic upgrade head before uvicorn
 
-Not certified by this ZIP:
-HIL/electrical qualification, endurance/wear qualification, Alembic migration qualification, secure OTA/rollback, browser/session security finalization, dependency vulnerability closure, and full production CI/deployment qualification.
+WEB AUTH
+- backend/main.py: HttpOnly cookie session, /api/auth/me, /api/auth/logout
+- backend/main.py: controlled bootstrap password recovery
+- frontend/src/lib/api.ts: withCredentials, no browser token injection
+- frontend/src/lib/auth.ts: session/logout helper
+- frontend/src/app/login/page.tsx: cookie-session login
+- frontend/src/app/admin/page.tsx: server-session role gate
+- frontend/src/app/super-admin/page.tsx: server-session role gate
+- frontend/src/app/member/page.tsx: server-session role gate
+- frontend/src/app/society/[id]/page.tsx: server-session role gate
+- frontend/src/components/Sidebar.tsx: session-derived identity/logout
+
+COMMAND / LIFECYCLE
+- strict queued -> delivered/expired only
+- HARDWARE_VERIFIED requires explicit verification
+- retired lifecycle protected from reassignment/commanding
+- 120 s delivery lease and 300 s absolute expiry retained
+
+PI SAFETY / STORAGE
+- pi_firmware/ems_controller.py: durable EXECUTING state required before hardware mutation
+- pi_firmware/setup_pi.sh: explicit non-destructive data device, root:pi 0770
+- pi_firmware/ems-controller.service: least privilege + OTA boot selector
+
+OTA
+- backend/main.py: Ed25519 signing + SHA-256 firmware metadata
+- pi_firmware/api_client.py: signed firmware manifest download
+- pi_firmware/ota_manager.py: Ed25519 verification, atomic A/B staging, rollback marker
+- pi_firmware/ota_boot.sh: boot selection + rollback check
+
+QA
+- qa/strict_6_4_1_check.py
+- qa/runtime_6_4_1_test.py
+- qa/HIL_TEST_PLAN.md
+- qa/STORAGE_ENDURANCE_PLAN.md
+
+NOT INCLUDED AS CERTIFIED
+- Physical HIL results
+- Long-duration endurance results
+- Production database migration execution/restore evidence
+- Exact Pi bootloader A/B qualification

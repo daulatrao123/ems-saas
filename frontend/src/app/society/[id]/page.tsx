@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api"; // Adjust import path if needed
+import { getSession } from "@/lib/auth";
 
 export default function SocietyDashboard() {
   const router = useRouter();
@@ -11,16 +12,11 @@ export default function SocietyDashboard() {
   const [toast, setToast] = useState<any>(null);
 
   useEffect(() => {
-    const sid = localStorage.getItem("society_id");
-    const role = localStorage.getItem("role");
-    const token = localStorage.getItem("token");
-    
-    if (!token || !sid) {
-      router.push("/login");
-      return;
-    }
-    setSocietyId(sid);
-    fetchDashboard(sid);
+    getSession().then(session => {
+      if (session.role !== "society_admin") { router.push("/login"); return; }
+      setSocietyId(String(session.society_id));
+      fetchDashboard(String(session.society_id));
+    }).catch(() => router.push("/login"));
   }, [router]);
 
   const fetchDashboard = async (sid: string) => {
