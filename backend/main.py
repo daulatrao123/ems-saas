@@ -242,7 +242,8 @@ def ensure_db_schema():
             cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
             cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS reset_day INT")
             cur.execute("UPDATE societies SET reset_day=%s WHERE reset_day IS NULL OR reset_day < 1 OR reset_day > 28", (DEFAULT_RESET_DAY,))
-            cur.execute("ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT %s", (DEFAULT_RESET_DAY,))
+            # PostgreSQL rejects bind parameters in DDL; DEFAULT_RESET_DAY is a trusted module constant.
+            cur.execute(f"ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT {int(DEFAULT_RESET_DAY)}")
             cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
             cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
             cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
@@ -328,7 +329,7 @@ def is_pi_online(pi_state: dict) -> bool:
         try:
             if last_sync.endswith("Z"): last_sync = last_sync[:-1] + "+00:00"
             last_sync = datetime.fromisoformat(last_sync)
-        except: return False
+        except (TypeError, ValueError): return False
     if last_sync.tzinfo is None: last_sync = last_sync.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - last_sync).total_seconds() <= PI_ONLINE_THRESHOLD_SECONDS
 
@@ -348,11 +349,11 @@ def validate_command(command: str, params: dict, slot: str = "") -> None:
             raise HTTPException(400, f"Valid slot ({', '.join(SLOTS)}) is required")
     if command == "set_days":
         try: days = int(params.get("days"))
-        except: raise HTTPException(400, "days must be an integer")
+        except (TypeError, ValueError): raise HTTPException(400, "days must be an integer")
         if not 1 <= days <= 31: raise HTTPException(400, "days must be 1-31")
     if command == "set_reset_day":
         try: day = int(params.get("day"))
-        except: raise HTTPException(400, "day must be an integer")
+        except (TypeError, ValueError): raise HTTPException(400, "day must be an integer")
         if not 1 <= day <= 28: raise HTTPException(400, "reset day must be 1-28")
 
 # ================================================================
@@ -1141,7 +1142,7 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     if user.get("role") not in {"super_admin", "society_admin"}:
         raise HTTPException(403, "Only super_admin or society_admin may issue commands")
     try: sid = int(data.get("society_id"))
-    except: raise HTTPException(400, "Invalid society_id")
+    except (TypeError, ValueError): raise HTTPException(400, "Invalid society_id")
 
     if user.get("role") != "super_admin" and str(user.get("society_id")) != str(sid):
         raise HTTPException(403, "Cannot access other society data")

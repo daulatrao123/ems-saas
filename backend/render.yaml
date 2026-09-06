@@ -1,9 +1,14 @@
-﻿services:
+services:
   - type: web
     name: ems-backend
     runtime: python
+    rootDir: backend
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: ./start.sh
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.6
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
