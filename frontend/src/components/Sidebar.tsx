@@ -14,7 +14,7 @@ export default function Sidebar({ role }: { role: string }) {
   const adminLinks = [{ href: "/admin", label: "Dashboard", icon: "\uD83D\uDCCA" }];
   const links = role === "super_admin" ? superAdminLinks : adminLinks;
   const close = () => setOpen(false);
-  const handleLogout = () => { localStorage.clear(); window.location.href = "/login"; };
+  const handleLogout = async () => { try { await (await import("@/lib/api")).default.post("/api/auth/logout"); } finally { localStorage.clear(); window.location.href = "/login"; } };
 
   return (
     <>

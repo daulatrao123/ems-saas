@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 import hashlib
+import secrets
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
@@ -40,7 +41,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.4.1-strict")
+app = FastAPI(title="EMS SaaS API", version="6.5.0-hardened")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -69,13 +70,16 @@ VALID_COMMANDS = {
 }
 
 # ================================================================
-# DATABASE & SCHEMA INITIALIZATION
+# DATABASE
 # ================================================================
 
 def get_db():
     conn = psycopg.connect(DATABASE_URL, connect_timeout=10, row_factory=dict_row)
     conn.autocommit = False
     return conn
+
+# Database schema is managed exclusively by Alembic before the web process starts.
+# Do NOT add CREATE/ALTER/DROP statements to application startup.
 
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
@@ -95,7 +99,7 @@ def _cors_headers(origin: str) -> dict:
         "Access-Control-Allow-Origin": valid,
         "Access-Control-Allow-Credentials": "true",
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Api-Key",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Api-Key, X-CSRF-Token",
     }
 
 @app.exception_handler(HTTPException)
@@ -112,17 +116,48 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Api-Key"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Api-Key", "X-CSRF-Token"],
 )
 
 # ================================================================
 # UTILITIES
 # ================================================================
 
+ACCESS_TOKEN_MINUTES = 15
+REFRESH_TOKEN_DAYS = 7
+COOKIE_SECURE = os.getenv("EMS_COOKIE_SECURE", "true").lower() == "true"
+COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
+
 def create_token(data: dict) -> str:
     payload = data.copy()
-    payload["exp"] = datetime.now(timezone.utc) + timedelta(days=30)
+    payload["exp"] = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_MINUTES)
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+def _cookie_kwargs() -> dict:
+    return {"secure": COOKIE_SECURE, "httponly": True, "samesite": COOKIE_SAMESITE, "path": "/"}
+
+def _csrf_cookie_kwargs() -> dict:
+    return {"secure": COOKIE_SECURE, "httponly": False, "samesite": COOKIE_SAMESITE, "path": "/"}
+
+def _refresh_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def issue_refresh_token(cur, user_id: int) -> str:
+    raw = secrets.token_urlsafe(48)
+    token_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    cur.execute(
+        "INSERT INTO auth_refresh_tokens (id,user_id,token_hash,expires_at,created_at) VALUES (%s,%s,%s,%s,%s)",
+        (token_id, user_id, _refresh_hash(raw), now + timedelta(days=REFRESH_TOKEN_DAYS), now),
+    )
+    return raw
+
+def require_csrf(request: Request) -> None:
+    if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+        cookie = request.cookies.get("ems_csrf")
+        header = request.headers.get("X-CSRF-Token")
+        if not cookie or not header or not secrets.compare_digest(cookie, header):
+            raise HTTPException(403, "CSRF validation failed")
 
 def is_pi_online(pi_state: dict) -> bool:
     if not pi_state: return False
@@ -167,11 +202,18 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
-async def get_current_user(authorization: str = Header(None)) -> dict:
-    if not authorization or not authorization.startswith("Bearer "):
+async def get_current_user(
+    request: Request,
+    authorization: str = Header(None),
+) -> dict:
+    require_csrf(request)
+    token = request.cookies.get("ems_access")
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+    if not token:
         raise HTTPException(status_code=401, detail="Valid token required")
     try:
-        return jwt.decode(authorization[7:], SECRET_KEY, algorithms=["HS256"])
+        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
@@ -312,16 +354,82 @@ def login(request: Request, user: UserLogin):
             if not db_user or not bcrypt.checkpw(user.password.encode(), db_user["password"].encode()):
                 raise HTTPException(status_code=401, detail="Invalid credentials")
 
-            token = create_token({
-                "id": db_user["id"], "role": db_user["role"],
-                "society_id": db_user["society_id"]
+            token = create_token({"id": db_user["id"], "role": db_user["role"], "society_id": db_user["society_id"]})
+            refresh = issue_refresh_token(cur, db_user["id"])
+            csrf = secrets.token_urlsafe(32)
+            conn.commit()
+
+            response = JSONResponse({
+                "role": db_user["role"],
+                "name": db_user["name"],
+                "society_id": db_user["society_id"],
             })
-            return {
-                "token": token, "role": db_user["role"],
-                "name": db_user["name"], "society_id": db_user["society_id"],
-            }
+            response.set_cookie("ems_access", token, max_age=ACCESS_TOKEN_MINUTES * 60, **_cookie_kwargs())
+            response.set_cookie("ems_refresh", refresh, max_age=REFRESH_TOKEN_DAYS * 86400, **_cookie_kwargs())
+            response.set_cookie("ems_csrf", csrf, max_age=REFRESH_TOKEN_DAYS * 86400, **_csrf_cookie_kwargs())
+            return response
+    except HTTPException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
+@app.post("/api/auth/refresh")
+@limiter.limit("20/minute")
+def refresh_access(request: Request):
+    require_csrf(request)
+    raw = request.cookies.get("ems_refresh")
+    if not raw:
+        raise HTTPException(401, "Refresh token required")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id,user_id,expires_at,revoked_at FROM auth_refresh_tokens WHERE token_hash=%s FOR UPDATE", (_refresh_hash(raw),))
+            row = cur.fetchone()
+            now = datetime.now(timezone.utc)
+            if not row or row["revoked_at"] is not None or row["expires_at"] <= now:
+                raise HTTPException(401, "Invalid or expired refresh token")
+            cur.execute("SELECT id,role,society_id,name FROM users WHERE id=%s", (row["user_id"],))
+            db_user = cur.fetchone()
+            if not db_user:
+                raise HTTPException(401, "User no longer exists")
+            new_refresh = issue_refresh_token(cur, db_user["id"])
+            cur.execute("SELECT id FROM auth_refresh_tokens WHERE token_hash=%s", (_refresh_hash(new_refresh),))
+            new_id = cur.fetchone()["id"]
+            cur.execute("UPDATE auth_refresh_tokens SET revoked_at=%s,replaced_by=%s WHERE id=%s", (now, new_id, row["id"]))
+            access = create_token({"id": db_user["id"], "role": db_user["role"], "society_id": db_user["society_id"]})
+            conn.commit()
+            response = JSONResponse({"role": db_user["role"], "name": db_user["name"], "society_id": db_user["society_id"]})
+            response.set_cookie("ems_access", access, max_age=ACCESS_TOKEN_MINUTES * 60, **_cookie_kwargs())
+            response.set_cookie("ems_refresh", new_refresh, max_age=REFRESH_TOKEN_DAYS * 86400, **_cookie_kwargs())
+            response.set_cookie("ems_csrf", secrets.token_urlsafe(32), max_age=REFRESH_TOKEN_DAYS * 86400, **_csrf_cookie_kwargs())
+            return response
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+@app.post("/api/auth/logout")
+def logout(request: Request):
+    require_csrf(request)
+    raw = request.cookies.get("ems_refresh")
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            if raw:
+                cur.execute("UPDATE auth_refresh_tokens SET revoked_at=%s WHERE token_hash=%s AND revoked_at IS NULL", (datetime.now(timezone.utc), _refresh_hash(raw)))
+        conn.commit()
+    finally:
+        conn.close()
+    response = JSONResponse({"message": "Logged out"})
+    for name in ("ems_access", "ems_refresh", "ems_csrf"):
+        response.delete_cookie(name, path="/")
+    return response
+
+@app.get("/api/auth/me")
+def auth_me(user: dict = Depends(get_current_user)):
+    return user
 
 # ================================================================
 # SUPER-ADMIN — SOCIETIES (Multi-Pi & 4-Slot)
@@ -375,6 +483,7 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
 
                 result.append({
                     "id": s["id"], "name": s["name"], "location": s["location"],
+                    "status": s["status"], "reset_day": s["reset_day"],
                     "pi_online": society_online,
                     "devices": devices_data
                 })
@@ -425,12 +534,11 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             for dev in devices:
                 dev_id = dev["device_id"]
                 if not dev_id: continue
-
                 cur.execute("SELECT status FROM pi_devices WHERE id=%s FOR UPDATE", (dev_id,))
-                existing_device = cur.fetchone()
-                if not existing_device:
-                    raise HTTPException(404, f"Device not found: {dev_id}")
-                if str(existing_device["status"]).upper() == "RETIRED":
+                device_row = cur.fetchone()
+                if not device_row:
+                    raise HTTPException(404, f"Pi device not found: {dev_id}")
+                if str(device_row["status"]).upper() == "RETIRED":
                     raise HTTPException(409, f"Retired device cannot be reassigned: {dev_id}")
 
                 cur.execute(
@@ -519,6 +627,10 @@ def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
             society_id_raw = data.get("society_id")
             if society_id_raw and society_id_raw != "":
                 society_id = int(society_id_raw)
+                cur.execute("SELECT status FROM societies WHERE id=%s", (society_id,))
+                society_row = cur.fetchone()
+                if not society_row or str(society_row["status"]).upper() != "ACTIVE":
+                    raise HTTPException(409, "Only an active society can receive a Pi device")
                 status = "ASSIGNED"
             else:
                 society_id = None
@@ -711,9 +823,13 @@ def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))
     return {"message": "Force flag updated"}
 
 @app.get("/api/pi/firmware-download")
-def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-Key")):
-    if not x_api_key:
-        raise HTTPException(403, "API key required in X-Api-Key header")
+def download_firmware(
+    version: str,
+    x_device_id: str | None = Header(None, alias="X-Device-ID"),
+    x_api_key: str | None = Header(None, alias="X-Api-Key"),
+):
+    # Firmware is device-authenticated; a bare API key is never sufficient.
+    authenticate_pi({}, x_device_id, x_api_key)
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -882,10 +998,6 @@ def pi_command_ack(
                 raise HTTPException(409, f"Invalid command transition {current} -> {status}")
 
             now = datetime.now(timezone.utc)
-
-            if status == "hardware_verified":
-                if verification not in {"VERIFIED_ON", "VERIFIED_OFF", "GPIO_CONFIRMED"}:
-                    raise HTTPException(409, "HARDWARE_VERIFIED requires explicit hardware verification")
 
             # Configuration commands are committed only after the Pi reports
             # terminal completion. Hardware commands never mutate configuration.

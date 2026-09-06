@@ -1,0 +1,27 @@
+EMS SaaS Industrial 6.5.0 Hardened Candidate
+
+BASELINE
+- Exact source baseline: main commit cb15919032596021e732321a4c7c84e60429f5f6
+
+MAJOR CHANGES
+- backend/main.py: removed startup DDL; strict command FSM; device lifecycle checks; feedback consistency; device-authenticated firmware download; cookie auth + refresh rotation + CSRF.
+- backend/alembic.ini: Alembic configuration.
+- backend/alembic/env.py: DATABASE_URL-driven migration runner.
+- backend/alembic/versions/0001_ems_current_schema.py: current schema + legacy wing/slot normalization.
+- backend/start.sh: migration-before-application startup.
+- backend/render.yaml: explicit migration-first Render startup.
+- backend/requirements.txt: Alembic + SQLAlchemy dependencies.
+- frontend/src/lib/api.ts: HttpOnly-cookie session client + CSRF + refresh retry.
+- frontend/src/app/login/page.tsx: no JWT localStorage.
+- frontend/src/app/member/page.tsx: server-session guard.
+- frontend/src/app/society/[id]/page.tsx: server-session guard.
+- frontend/src/app/admin/page.tsx: strict society-admin dashboard route.
+- frontend/src/app/super-admin/page.tsx: strict super-admin dashboard route.
+- frontend/src/components/Sidebar.tsx: server logout.
+- qa/: 6.5.0 release/review documentation.
+
+EXPLICIT NON-CLAIMS
+- No production HIL sign-off.
+- No storage endurance sign-off.
+- No Ed25519/A-B OTA sign-off.
+- No claim of production certification until staging and target hardware tests pass.

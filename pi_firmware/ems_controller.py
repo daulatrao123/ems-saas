@@ -80,7 +80,6 @@ class EMSController:
 
         self._last_sync = 0.0
         self._last_usage_day = self.state.last_usage_date
-        self._last_usage_day = self.state.last_usage_date
         self._last_telemetry = 0.0
         self._last_queue_cleanup = 0.0
 
@@ -455,9 +454,11 @@ class EMSController:
                 "Rejected command with invalid slot: %s",
                 slot,
             )
+            self.api.push_ack(command_id, "EXECUTING", "PENDING")
             self.api.push_ack(
                 command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"
             )
+            self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "INVALID_SLOT")
             return
 
         normalized = {
@@ -484,12 +485,13 @@ class EMSController:
                 "reset_days",
                 "lcd_display",
             }:
-                if self.api.push_ack(
-                    command_id, "COMPLETED", "NOT_AVAILABLE"
-                ):
-                    self.api.push_ack(
-                        command_id, "ACKED", "NOT_AVAILABLE"
-                    )
+                if self.api.push_ack(command_id, "EXECUTING", "PENDING"):
+                    if self.api.push_ack(command_id, "COMPLETED", "NOT_AVAILABLE"):
+                        self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE")
+            else:
+                if self.api.push_ack(command_id, "EXECUTING", "PENDING"):
+                    if self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "UNSUPPORTED_PI_COMMAND"):
+                        self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "UNSUPPORTED_PI_COMMAND")
 
             return
 
@@ -540,13 +542,16 @@ class EMSController:
             SystemState.EXECUTING
         )
 
+        # Safety invariant: persist EXECUTING before touching hardware. If the
+        # state file cannot be durably written, do not energize/de-energize a
+        # contactor because reboot reconciliation would otherwise lose intent.
         if not self.state.save_state(immediate=True):
+            self.state.system_state = SystemState.FAULT
             logger.critical(
-                "Command %s blocked: unable to persist EXECUTING state before hardware mutation.",
+                "Command %s blocked: EXECUTING state could not be persisted.",
                 command_id,
             )
-            self.state.system_state = SystemState.FAULT
-            return True
+            return False
 
         success = False
         verification = (

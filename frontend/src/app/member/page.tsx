@@ -9,13 +9,10 @@ export default function MemberDashboard() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const role = localStorage.getItem("role");
-    const token = localStorage.getItem("token");
-    if (!token || role !== "member") {
-      router.push("/login");
-      return;
-    }
-    fetchDashboard();
+    api.get("/api/auth/me").then((res) => {
+      if (res.data.role !== "member") { router.push("/login"); return; }
+      fetchDashboard();
+    }).catch(() => router.push("/login"));
   }, [router]);
 
   const fetchDashboard = async () => {

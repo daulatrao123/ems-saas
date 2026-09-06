@@ -185,10 +185,8 @@ class OfflineQueue:
                 """
             )
 
-            # Backward-compatible schema extension MUST happen before indexes
-            # reference newly introduced columns. Existing command history is kept.
-            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(commands)").fetchall()}
-            additions = {
+            existing = {row[1] for row in self.conn.execute("PRAGMA table_info(commands)").fetchall()}
+            migrations = {
                 "delivered_at": "TEXT",
                 "started_at": "TEXT",
                 "hardware_verified_at": "TEXT",
@@ -201,8 +199,8 @@ class OfflineQueue:
                 "hardware_verification": "TEXT",
                 "ack_status": "TEXT NOT NULL DEFAULT 'PENDING'",
             }
-            for column, definition in additions.items():
-                if column not in columns:
+            for column, definition in migrations.items():
+                if column not in existing:
                     self.conn.execute(f"ALTER TABLE commands ADD COLUMN {column} {definition}")
 
             self.conn.execute(
