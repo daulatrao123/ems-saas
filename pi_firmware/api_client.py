@@ -196,24 +196,3 @@ class ApiClient:
             self.session.close()
         except Exception:
             pass
-    # ============================================================
-    # SIGNED FIRMWARE
-    # ============================================================
-
-    def download_signed_firmware(self, version: str):
-        try:
-            response = self.session.get(
-                f"{self.base_url}/api/pi/firmware-download",
-                params={"version": version},
-                timeout=API_TIMEOUT_S,
-            )
-            if response.status_code != 200:
-                logger.error("Firmware download rejected: HTTP %s", response.status_code)
-                return None
-            data = response.json()
-            if not isinstance(data, dict):
-                return None
-            return data
-        except Exception as exc:
-            logger.error("Firmware download failed: %s", exc)
-            return None

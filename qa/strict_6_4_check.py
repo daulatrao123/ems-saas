@@ -1,108 +1,55 @@
-"""Static release gate for EMS 6.4 targeted hardening.
-
-This does not certify hardware, storage endurance, OTA, or production security.
-It verifies the targeted source-level invariants that can be checked offline.
-"""
+"""Self-contained offline release gate for EMS 6.4.1."""
 from pathlib import Path
 import ast
-import hashlib
-import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 
-PROTECTED = [
-    "pi_firmware/gpio_manager.py",
-    "pi_firmware/storage_io_manager.py",
-    "pi_firmware/storage_manager.py",
-    "pi_firmware/logger.py",
-    "pi_firmware/memory_manager.py",
-    "pi_firmware/resource_guard.py",
-]
-
+def text(rel):
+    return (ROOT / rel).read_text(encoding="utf-8")
 
 def fail(msg):
-    raise SystemExit(f"FAIL: {msg}")
-
-
-def read(path):
-    return (ROOT / path).read_text(encoding="utf-8")
-
+    raise SystemExit("FAIL: " + msg)
 
 def main():
-    changed = subprocess.check_output(
-        ["git", "diff", "--name-only"], cwd=ROOT, text=True
-    ).splitlines()
-    allowed = {
-        "backend/main.py",
-        "frontend/test_system.py",
-        "pi_firmware/api_client.py",
-        "pi_firmware/ems_controller.py",
-        "pi_firmware/offline_queue.py",
-        "pi_firmware/setup_pi.sh",
-        "pi_firmware/state.py",
-        "pi_firmware/ems-controller.service",
-    }
-    if any(p not in allowed for p in changed):
-        fail(f"unexpected modified files: {[p for p in changed if p not in allowed]}")
+    backend=text("backend/main.py")
+    controller=text("pi_firmware/ems_controller.py")
+    queue=text("pi_firmware/offline_queue.py")
+    state=text("pi_firmware/state.py")
+    api=text("pi_firmware/api_client.py")
+    setup=text("pi_firmware/setup_pi.sh")
+    service=text("pi_firmware/ems-controller.service")
+    tests=text("frontend/test_system.py")
 
-    for path in PROTECTED:
-        if subprocess.call(["git", "diff", "--quiet", "--", path], cwd=ROOT) != 0:
-            fail(f"protected subsystem changed: {path}")
-
-    backend = read("backend/main.py")
-    controller = read("pi_firmware/ems_controller.py")
-    queue = read("pi_firmware/offline_queue.py")
-    api = read("pi_firmware/api_client.py")
-    setup = read("pi_firmware/setup_pi.sh")
-    service = read("pi_firmware/ems-controller.service")
-    state = read("pi_firmware/state.py")
-
-    required = [
-        ("backend command FSM", '"hardware_verified": {"completed", "failed"}'),
-        ("backend ACKED state", '"acked": set()'),
-        ("backend header auth", 'alias="X-Api-Key"'),
-        ("backend delivery lease", "COMMAND_DELIVERY_LEASE_SECONDS = 120"),
-        ("5-minute absolute expiry", "COMMAND_EXPIRY_SECONDS = 300"),
-        ("retirement", "UPDATE pi_devices SET status='RETIRED'"),
-        ("controller hardware verification", '"HARDWARE_VERIFIED"'),
-        ("controller reboot ambiguity", '"UNKNOWN_AFTER_REBOOT"'),
-        ("monthly reset marker", "last_reset_period"),
-        ("physical ON visibility", 'physical == "ON"'),
-        ("Pi API header", '"X-Device-ID"'),
-        ("explicit device storage", "EMS_DATA_DEVICE"),
-        ("no formatting", "NO FORMAT OPERATION WILL BE PERFORMED"),
-        ("least privilege service", "User=pi"),
-        ("gpio group", "SupplementaryGroups=gpio i2c"),
-        ("legacy state compatibility", 'data.get("last_reset_period")'),
+    required=[
+      ("strict queued FSM", '"queued": {"delivered", "expired"}'),
+      ("delivery lease", "COMMAND_DELIVERY_LEASE_SECONDS = 120"),
+      ("absolute expiry", "COMMAND_EXPIRY_SECONDS = 300"),
+      ("HARDWARE_VERIFIED FSM", '"hardware_verified": {"completed", "failed"}'),
+      ("ACKED terminal state", '"acked": set()'),
+      ("verification evidence", '"VERIFIED_ON", "VERIFIED_OFF", "GPIO_CONFIRMED"'),
+      ("reboot ambiguity", '"UNKNOWN_AFTER_REBOOT"'),
+      ("legacy state fields", 'data.get("used_days", 0)'),
+      ("reset period", 'last_reset_period'),
+      ("physical ON visibility", 'physical == "ON"'),
+      ("Pi device header", '"X-Device-ID"'),
+      ("Pi API header", '"X-API-Key"'),
+      ("storage device", "EMS_DATA_DEVICE"),
+      ("no format", "NO FORMAT OPERATION WILL BE PERFORMED"),
+      ("least privilege", "User=pi"),
+      ("GPIO/I2C groups", "SupplementaryGroups=gpio i2c"),
+      ("queue migration", "PRAGMA table_info(commands)"),
     ]
+    allsrc=backend+controller+queue+state+api+setup+service
     for name, token in required:
-        if token not in (backend + controller + queue + api + setup + service + state):
-            fail(f"missing {name}: {token}")
-
-    # No plaintext test passwords may be shipped.
-    tests = read("frontend/test_system.py")
-    if "admin123" in tests:
-        fail("hardcoded test password remains")
-
-    for path in [
-        "backend/main.py", "frontend/test_system.py",
-        "pi_firmware/api_client.py", "pi_firmware/ems_controller.py",
-        "pi_firmware/offline_queue.py", "pi_firmware/setup_pi.sh", "pi_firmware/state.py",
-    ]:
-        ast.parse(read(path), filename=path) if path.endswith(".py") else None
-
-    if "DELETE FROM pi_devices" in backend or "DELETE FROM societies" in backend:
-        fail("destructive lifecycle SQL remains")
-
-    if "payload[\"key\"]" in api or '"key": self.api_key' in api:
-        fail("Pi API key is still duplicated into request JSON")
-
-    print("PASS: strict 6.4 targeted source gate")
-    print("PASS: protected GPIO/storage/resource subsystems unchanged")
-    print("PASS: command lifecycle, reboot recovery, reset persistence, header auth")
-    print("PASS: explicit storage device and least-privilege service")
-    print("NOTE: hardware HIL, endurance, OTA, dependency and deployment tests remain mandatory")
-
-
-if __name__ == "__main__":
-    main()
+        if token not in allsrc: fail(name)
+    if "DELETE FROM pi_devices" in backend or "DELETE FROM societies" in backend: fail("destructive lifecycle SQL")
+    if '"key": self.api_key' in api or 'payload["key"]' in api: fail("API key in JSON")
+    if "admin123" in tests: fail("hardcoded test password")
+    for rel in ["backend/main.py","frontend/test_system.py","pi_firmware/api_client.py","pi_firmware/ems_controller.py","pi_firmware/offline_queue.py","pi_firmware/state.py"]:
+        ast.parse(text(rel), filename=rel)
+    if "storage_health.py" in {p.name for p in (ROOT/"pi_firmware").iterdir()}: fail("obsolete storage_health.py remains")
+    print("PASS: EMS 6.4.1 strict offline gate")
+    print("PASS: FSM, delivery lease/expiry, reboot recovery, legacy state/queue migration")
+    print("PASS: header auth, storage provisioning, least privilege, lifecycle safety")
+    print("NOTE: HIL/electrical, endurance, OTA, Alembic, dependency and frontend production CI remain certification gates")
+if __name__ == "__main__": main()

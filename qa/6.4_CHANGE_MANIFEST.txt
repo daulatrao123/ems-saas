@@ -1,25 +1,26 @@
-# EMS 6.4 source-level change manifest
-# base cb15919032596021e732321a4c7c84e60429f5f6
+# EMS SaaS Industrial 6.4.1 strict hardened candidate
+# Baseline: cb15919032596021e732321a4c7c84e60429f5f6
 
-pi_firmware/gpio_manager.py: UNCHANGED
-pi_firmware/storage_io_manager.py: UNCHANGED
-pi_firmware/storage_manager.py: UNCHANGED
-pi_firmware/logger.py: UNCHANGED
-pi_firmware/memory_manager.py: UNCHANGED
-pi_firmware/resource_guard.py: UNCHANGED
+Targeted application changes:
+- backend/main.py: strict command FSM, 120s delivery lease, 300s expiry, ACK contract, reset-day/config persistence, retirement protection, feedback capability consistency.
+- pi_firmware/ems_controller.py: reboot reconciliation, usage/reset accounting, strict command lifecycle ACKs, durable EXECUTING persistence before hardware actuation.
+- pi_firmware/offline_queue.py: legacy schema migration before indexes, durable lifecycle/recovery records.
+- pi_firmware/state.py: monthly usage/reset fields with STATE_VERSION=4 backward-compatible loading.
+- pi_firmware/api_client.py: header-based Pi authentication without key in JSON.
+- pi_firmware/setup_pi.sh + ems-controller.service: explicit ext4 storage provisioning, no formatting, pi:pi least privilege.
+- frontend/test_system.py: credentials via environment variables.
 
-# Working-tree source changes tracked against main:
-M	backend/main.py
-M	frontend/test_system.py
-M	pi_firmware/api_client.py
-M	pi_firmware/ems_controller.py
-M	pi_firmware/offline_queue.py
-M	pi_firmware/setup_pi.sh
-M	pi_firmware/state.py
+Protected baseline subsystems intended unchanged:
+- pi_firmware/gpio_manager.py
+- pi_firmware/storage_io_manager.py
+- pi_firmware/storage_manager.py
+- pi_firmware/logger.py
+- pi_firmware/memory_manager.py
+- pi_firmware/resource_guard.py
 
-# New files included in release:
-pi_firmware/ems-controller.service
-qa/strict_6_4_check.py
-RELEASE_NOTES_6.4.md
-# Removed:
-pi_firmware/storage_health.py
+Removed:
+- pi_firmware/storage_health.py
+
+QA included:
+- qa/strict_6_4_check.py
+- qa/6.4.1_REVIEW_GUIDE.md

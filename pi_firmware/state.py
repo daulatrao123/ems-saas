@@ -79,7 +79,7 @@ class SlotState:
 
         self.last_command_at = None
 
-        # Optional in legacy STATE_VERSION=4 documents.
+        # Optional fields for legacy STATE_VERSION=4 compatibility.
         self.used_days = 0
         self.clicks = 0
 

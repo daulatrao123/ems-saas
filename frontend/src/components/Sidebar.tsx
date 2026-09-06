@@ -2,7 +2,6 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { logout } from "@/lib/auth";
 
 export default function Sidebar({ role }: { role: string }) {
   const pathname = usePathname();
@@ -10,13 +9,12 @@ export default function Sidebar({ role }: { role: string }) {
   useEffect(() => { setOpen(false); }, [pathname]);
   useEffect(() => { document.body.style.overflow = open ? "hidden" : ""; return () => { document.body.style.overflow = ""; }; }, [open]);
 
-  const [name, setName] = useState("");
-  useEffect(() => { import("@/lib/auth").then(({ getSession }) => getSession().then(s => setName(s.name)).catch(() => {})); }, []);
+  const name = typeof window !== "undefined" ? localStorage.getItem("name") || "" : "";
   const superAdminLinks = [{ href: "/super-admin", label: "All Societies", icon: "\uD83C\uDFE2" }];
   const adminLinks = [{ href: "/admin", label: "Dashboard", icon: "\uD83D\uDCCA" }];
   const links = role === "super_admin" ? superAdminLinks : adminLinks;
   const close = () => setOpen(false);
-  const handleLogout = () => { void logout(); };
+  const handleLogout = () => { localStorage.clear(); window.location.href = "/login"; };
 
   return (
     <>

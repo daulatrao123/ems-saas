@@ -6,8 +6,6 @@ import os
 import time
 import uuid
 import hashlib
-import hmac
-import base64
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
@@ -15,7 +13,6 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import bcrypt
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jose import JWTError, jwt
 from datetime import datetime, timezone, timedelta
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -43,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.4.1-industrial")
+app = FastAPI(title="EMS SaaS API", version="6.4.1-strict-hardened")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -72,7 +69,7 @@ VALID_COMMANDS = {
 }
 
 # ================================================================
-# DATABASE
+# DATABASE & SCHEMA INITIALIZATION
 # ================================================================
 
 def get_db():
@@ -80,8 +77,201 @@ def get_db():
     conn.autocommit = False
     return conn
 
-# Database DDL is managed exclusively by Alembic migrations. The web process
-# must never mutate production schema during startup.
+@app.on_event("startup")
+def ensure_db_schema():
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS societies (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT, location TEXT, plan TEXT, status TEXT,
+                    tailscale_ip TEXT, pi_port INT, society_code TEXT,
+                    config_version INT DEFAULT 1
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    email TEXT UNIQUE, name TEXT, password TEXT, role TEXT, society_id INT
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_devices (
+                    id UUID PRIMARY KEY,
+                    society_id INT,
+                    name TEXT,
+                    api_key_hash TEXT UNIQUE,
+                    firmware_version TEXT,
+                    last_seen TIMESTAMPTZ,
+                    status TEXT DEFAULT 'INVENTORY',
+                    hardware_profile TEXT DEFAULT 'EMS-4CH-v1',
+                    feedback_hardware_installed BOOLEAN DEFAULT FALSE
+                );
+            """)
+
+            # PRODUCTION v6.2.3: Bulletproof Migration
+            cur.execute("""
+                DO $$ BEGIN
+                    -- 1. Handle slot_configs collision
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
+                            ALTER TABLE wing_configs RENAME TO slot_configs;
+                        ELSE
+                            ALTER TABLE wing_configs RENAME TO wing_configs_abandoned;
+                        END IF;
+                    END IF;
+
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs_old') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
+                            ALTER TABLE wing_configs_old RENAME TO slot_configs;
+                        ELSE
+                            ALTER TABLE wing_configs_old RENAME TO wing_configs_old_abandoned;
+                        END IF;
+                    END IF;
+
+                    -- 2. Handle slot_state collision
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
+                            ALTER TABLE wing_state RENAME TO slot_state;
+                        ELSE
+                            ALTER TABLE wing_state RENAME TO wing_state_abandoned;
+                        END IF;
+                    END IF;
+
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state_old') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
+                            ALTER TABLE wing_state_old RENAME TO slot_state;
+                        ELSE
+                            ALTER TABLE wing_state_old RENAME TO wing_state_old_abandoned;
+                        END IF;
+                    END IF;
+
+                    -- 3. Normalize column names to 'slot' in slot_configs
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='wing_code') THEN
+                        ALTER TABLE slot_configs RENAME COLUMN wing_code TO slot;
+                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='slot_code') THEN
+                        ALTER TABLE slot_configs RENAME COLUMN slot_code TO slot;
+                    END IF;
+
+                    -- 4. Normalize column names to 'slot' in slot_state
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='wing_code') THEN
+                        ALTER TABLE slot_state RENAME COLUMN wing_code TO slot;
+                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='slot_code') THEN
+                        ALTER TABLE slot_state RENAME COLUMN slot_code TO slot;
+                    END IF;
+
+                    -- 5. Normalize column names in pi_commands
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
+                        ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
+                    END IF;
+
+                    -- 6. Normalize column names in pi_state
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
+                        ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
+                    END IF;
+                END $$;
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS slot_configs (
+                    device_id UUID,
+                    slot TEXT,
+                    display_name TEXT,
+                    target_days INT,
+                    disabled BOOL DEFAULT FALSE,
+                    feedback_enabled BOOL DEFAULT FALSE,
+                    PRIMARY KEY (device_id, slot),
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS slot_state (
+                    device_id UUID,
+                    slot TEXT,
+                    physical_toggle TEXT DEFAULT 'UNKNOWN',
+                    used_days INT DEFAULT 0,
+                    clicks INT DEFAULT 0,
+                    PRIMARY KEY (device_id, slot),
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_state (
+                    device_id UUID PRIMARY KEY,
+                    active_slot TEXT, reset_day INT, emergency_stop BOOL,
+                    uptime_seconds INT, cpu_temp FLOAT, disk_free_mb FLOAT,
+                    last_sync TIMESTAMPTZ, boot_count INT, last_shutdown_reason TEXT, clock_source TEXT,
+                    watchdog_enabled BOOL, last_reboot_reason TEXT,
+                    config_version INT DEFAULT 0,
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_events (
+                    id SERIAL PRIMARY KEY,
+                    device_id UUID, event_id TEXT UNIQUE, timestamp TIMESTAMPTZ, type TEXT, message TEXT,
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_commands (
+                    id UUID PRIMARY KEY,
+                    device_id UUID, command TEXT, slot TEXT, params JSONB,
+                    status TEXT DEFAULT 'queued',
+                    created_at TIMESTAMPTZ, delivered_at TIMESTAMPTZ, acked_at TIMESTAMPTZ, expires_at TIMESTAMPTZ,
+                    error TEXT, result TEXT,
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS firmware_versions (
+                    version TEXT PRIMARY KEY,
+                    code TEXT, changelog TEXT, forced BOOL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id SERIAL PRIMARY KEY,
+                    society_id INT, user_id INT, device_id UUID,
+                    action TEXT, details JSONB, created_at TIMESTAMPTZ
+                );
+            """)
+
+            # Auto-add missing columns safely
+            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
+            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS reset_day INT")
+            cur.execute("UPDATE societies SET reset_day=%s WHERE reset_day IS NULL OR reset_day < 1 OR reset_day > 28", (DEFAULT_RESET_DAY,))
+            cur.execute("ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT %s", (DEFAULT_RESET_DAY,))
+            cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
+            cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS hardware_profile TEXT DEFAULT 'EMS-4CH-v1'")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS feedback_hardware_installed BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE slot_configs ADD COLUMN IF NOT EXISTS feedback_enabled BOOL DEFAULT FALSE")
+
+            # Drop the unique constraint from v5.6 if it exists
+            cur.execute("DROP INDEX IF EXISTS uq_pi_devices_society_id")
+
+            cur.execute("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_society') THEN
+                        ALTER TABLE users ADD CONSTRAINT fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_devices_society') THEN
+                        ALTER TABLE pi_devices ADD CONSTRAINT fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
+                    END IF;
+                END $$;
+            """)
+
+        conn.commit()
+        print("DB schema verified OK (Relational v6.2.3 Strict Slot Migration)")
+    except Exception as e:
+        conn.rollback()
+        print(f"DB SCHEMA CHECK ERROR: {e}")
+        raise RuntimeError(f"Database schema initialization failed: {e}")
+    finally:
+        conn.close()
 
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
@@ -173,20 +363,13 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
-async def get_current_user(request: Request) -> dict:
-    # Browser sessions use an HttpOnly cookie. Bearer remains accepted only for
-    # controlled API clients during migration; the web UI never stores tokens.
-    token = request.cookies.get("ems_session")
-    if not token:
-        authorization = request.headers.get("Authorization", "")
-        if authorization.startswith("Bearer "):
-            token = authorization[7:]
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
+async def get_current_user(authorization: str = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Valid token required")
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return jwt.decode(authorization[7:], SECRET_KEY, algorithms=["HS256"])
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 def require_role(*roles):
     async def checker(user: dict = Depends(get_current_user)):
@@ -310,30 +493,6 @@ def bootstrap(request: Request):
 
     return {"message": "Initialized. Change default passwords.", "device_id": device_id, "api_key": raw_api_key}
 
-@app.post("/api/bootstrap/recover-admin")
-@limiter.limit("1/minute")
-def recover_bootstrap_admin(request: Request, x_bootstrap_recovery_token: str | None = Header(None, alias="X-Bootstrap-Recovery-Token")):
-    recovery = os.getenv("EMS_BOOTSTRAP_RECOVERY_TOKEN")
-    bootstrap_pass = os.getenv("EMS_BOOTSTRAP_PASSWORD")
-    if not recovery or not bootstrap_pass:
-        raise HTTPException(404, "Bootstrap recovery is disabled")
-    if not x_bootstrap_recovery_token or not hmac.compare_digest(hashlib.sha256(x_bootstrap_recovery_token.encode()).hexdigest(), hashlib.sha256(recovery.encode()).hexdigest()):
-        raise HTTPException(403, "Invalid bootstrap recovery token")
-    conn = get_db()
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT id, role FROM users WHERE email=%s FOR UPDATE", ("admin@ems.com",))
-            user = cur.fetchone()
-            if not user or user["role"] != "super_admin":
-                raise HTTPException(404, "Bootstrap administrator not found")
-            cur.execute("UPDATE users SET password=%s WHERE id=%s", (bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), user["id"]))
-        conn.commit()
-    except Exception:
-        conn.rollback(); raise
-    finally:
-        conn.close()
-    return {"success": True, "message": "Bootstrap administrator password reset"}
-
 # ================================================================
 # AUTH LOGIN
 # ================================================================
@@ -351,30 +510,14 @@ def login(request: Request, user: UserLogin):
 
             token = create_token({
                 "id": db_user["id"], "role": db_user["role"],
-                "society_id": db_user["society_id"], "name": db_user["name"]
+                "society_id": db_user["society_id"]
             })
-            response = JSONResponse(content={
-                "role": db_user["role"],
-                "name": db_user["name"],
-                "society_id": db_user["society_id"],
-            })
-            response.set_cookie(
-                key="ems_session", value=token, httponly=True, secure=True,
-                samesite="none", max_age=30 * 24 * 60 * 60, path="/"
-            )
-            return response
+            return {
+                "token": token, "role": db_user["role"],
+                "name": db_user["name"], "society_id": db_user["society_id"],
+            }
     finally:
         conn.close()
-
-@app.get("/api/auth/me")
-def auth_me(user: dict = Depends(get_current_user)):
-    return {"id": user.get("id"), "role": user.get("role"), "name": user.get("name"), "society_id": user.get("society_id")}
-
-@app.post("/api/auth/logout")
-def auth_logout():
-    response = JSONResponse(content={"success": True})
-    response.delete_cookie("ems_session", path="/")
-    return response
 
 # ================================================================
 # SUPER-ADMIN — SOCIETIES (Multi-Pi & 4-Slot)
@@ -477,13 +620,15 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
 
             for dev in devices:
                 dev_id = dev["device_id"]
-                if not dev_id: continue
+                if not dev_id:
+                    continue
+
                 cur.execute("SELECT status FROM pi_devices WHERE id=%s FOR UPDATE", (dev_id,))
-                lifecycle = cur.fetchone()
-                if not lifecycle:
+                device_row = cur.fetchone()
+                if not device_row:
                     raise HTTPException(404, f"Device not found: {dev_id}")
-                if str(lifecycle["status"]).upper() == "RETIRED":
-                    raise HTTPException(409, f"Retired device cannot be reassigned: {dev_id}")
+                if str(device_row["status"]).upper() == "RETIRED":
+                    raise HTTPException(409, "Retired device cannot be assigned; create a new device")
 
                 cur.execute(
                     "UPDATE pi_devices SET society_id=%s, status='ASSIGNED', hardware_profile=%s, feedback_hardware_installed=%s WHERE id=%s",
@@ -571,6 +716,12 @@ def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
             society_id_raw = data.get("society_id")
             if society_id_raw and society_id_raw != "":
                 society_id = int(society_id_raw)
+                cur.execute("SELECT status FROM societies WHERE id=%s", (society_id,))
+                society_row = cur.fetchone()
+                if not society_row:
+                    raise HTTPException(404, "Society not found")
+                if str(society_row["status"]).lower() != "active":
+                    raise HTTPException(409, "Cannot assign a device to an inactive or retired society")
                 status = "ASSIGNED"
             else:
                 society_id = None
@@ -717,25 +868,14 @@ def save_firmware_version(data: dict, user: dict = Depends(require_role("super_a
             forced = data.get("forced", False)
             if not version or not code:
                 raise HTTPException(400, "Version and code required")
-            signing_key_b64 = os.getenv("EMS_FIRMWARE_SIGNING_PRIVATE_KEY_B64")
-            if not signing_key_b64:
-                raise HTTPException(503, "Firmware signing key is not configured")
-            try:
-                signing_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(signing_key_b64))
-                payload_bytes = code.encode("utf-8")
-                signature = base64.b64encode(signing_key.sign(payload_bytes)).decode("ascii")
-                sha256 = hashlib.sha256(payload_bytes).hexdigest()
-            except Exception:
-                raise HTTPException(500, "Firmware signing failed")
 
             if forced:
                 cur.execute("UPDATE firmware_versions SET forced = FALSE")
 
-            now = datetime.now(timezone.utc)
-            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at, signature, sha256)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                           ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s, signature=%s, sha256=%s""",
-                        (version, code, changelog, forced, now, now, signature, sha256, code, changelog, forced, now, signature, sha256))
+            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at)
+                           VALUES (%s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s""",
+                        (version, code, changelog, forced, datetime.now(timezone.utc), datetime.now(timezone.utc), code, changelog, forced, datetime.now(timezone.utc)))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -774,23 +914,17 @@ def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))
     return {"message": "Force flag updated"}
 
 @app.get("/api/pi/firmware-download")
-def download_firmware(
-    version: str,
-    x_device_id: str | None = Header(None, alias="X-Device-ID"),
-    x_api_key: str | None = Header(None, alias="X-Api-Key"),
-):
-    device_id, _ = authenticate_pi({}, x_device_id, x_api_key)
+def download_firmware(version: str, x_api_key: str = Header(None, alias="X-Api-Key")):
+    if not x_api_key:
+        raise HTTPException(403, "API key required in X-Api-Key header")
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT version, code, signature, sha256, changelog FROM firmware_versions WHERE version = %s", (version,))
+            cur.execute("SELECT code FROM firmware_versions WHERE version = %s", (version,))
             fv = cur.fetchone()
-            if not fv or not fv.get("signature") or not fv.get("sha256"):
-                raise HTTPException(404, "Signed firmware version not found")
-            return {
-                "device_id": str(device_id), "version": fv["version"], "code": fv["code"],
-                "signature": fv["signature"], "sha256": fv["sha256"], "changelog": fv["changelog"] or "",
-            }
+            if not fv:
+                raise HTTPException(404, "Version not found")
+            return PlainTextResponse(fv["code"], media_type="text/plain")
     finally:
         conn.close()
 
@@ -950,12 +1084,12 @@ def pi_command_ack(
                     return {"success": True, "status": current}
                 raise HTTPException(409, f"Invalid command transition {current} -> {status}")
 
+            now = datetime.now(timezone.utc)
+
             if status == "hardware_verified" and verification not in {
                 "VERIFIED_ON", "VERIFIED_OFF", "GPIO_CONFIRMED"
             }:
-                raise HTTPException(409, "HARDWARE_VERIFIED requires explicit hardware verification")
-
-            now = datetime.now(timezone.utc)
+                raise HTTPException(409, "HARDWARE_VERIFIED requires verified hardware evidence")
 
             # Configuration commands are committed only after the Pi reports
             # terminal completion. Hardware commands never mutate configuration.
@@ -1024,10 +1158,6 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT status FROM societies WHERE id=%s", (sid,))
-            society_row = cur.fetchone()
-            if not society_row or str(society_row["status"]).upper() == "RETIRED":
-                raise HTTPException(409, "Society is retired")
             cur.execute("SELECT id, status FROM pi_devices WHERE id=%s AND society_id=%s", (device_id, sid))
             dev = cur.fetchone()
             if not dev or str(dev["status"]).upper() != "ASSIGNED":

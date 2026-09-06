@@ -185,6 +185,26 @@ class OfflineQueue:
                 """
             )
 
+            # Migrate legacy queue databases before creating indexes that
+            # reference newer columns. This is required for in-place upgrades.
+            existing = {row[1] for row in self.conn.execute("PRAGMA table_info(commands)").fetchall()}
+            migrations = {
+                "delivered_at": "TEXT",
+                "started_at": "TEXT",
+                "hardware_verified_at": "TEXT",
+                "completed_at": "TEXT",
+                "acked_at": "TEXT",
+                "expires_at": "TEXT",
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_error": "TEXT",
+                "config_version": "TEXT",
+                "hardware_verification": "TEXT",
+                "ack_status": "TEXT NOT NULL DEFAULT 'PENDING'",
+            }
+            for column, definition in migrations.items():
+                if column not in existing:
+                    self.conn.execute(f"ALTER TABLE commands ADD COLUMN {column} {definition}")
+
             self.conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS

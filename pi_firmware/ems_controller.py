@@ -20,7 +20,6 @@ from storage_manager import StorageManager
 from offline_queue import OfflineQueue
 from gpio_manager import GPIOManager
 from api_client import ApiClient
-from ota_manager import confirm_boot
 
 
 class EMSController:
@@ -80,6 +79,7 @@ class EMSController:
         )
 
         self._last_sync = 0.0
+        self._last_usage_day = self.state.last_usage_date
         self._last_usage_day = self.state.last_usage_date
         self._last_telemetry = 0.0
         self._last_queue_cleanup = 0.0
@@ -152,8 +152,6 @@ class EMSController:
                 immediate=True
             )
 
-        # Only a fully reconciled, non-faulted boot confirms a staged OTA slot.
-        confirm_boot()
         logger.info(
             "EMS controller boot complete."
         )
@@ -186,15 +184,8 @@ class EMSController:
                 reset_day = int(reset_day)
                 if 1 <= reset_day <= 28:
                     self.device_config["reset_day"] = reset_day
-            except (TypeError, ValueError):
-                logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
-
-        reset_day = response.get("resetDay")
-        if reset_day is not None:
-            try:
-                reset_day = int(reset_day)
-                if 1 <= reset_day <= 28:
-                    self.device_config["reset_day"] = reset_day
+                else:
+                    logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
             except (TypeError, ValueError):
                 logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
 
@@ -457,9 +448,9 @@ class EMSController:
                 "Rejected command with invalid slot: %s",
                 slot,
             )
-            self.api.push_ack(
-                command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"
-            )
+            if self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE"):
+                if self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"):
+                    self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "INVALID_SLOT")
             return
 
         normalized = {
@@ -470,6 +461,13 @@ class EMSController:
             "off_all":
                 "DEACTIVATE_ALL",
         }.get(command)
+
+        if normalized is not None and normalized != "DEACTIVATE_ALL" and slot not in SUPPORTED_SLOTS:
+            logger.critical("Rejected hardware command %s with invalid/missing slot: %s", command_id, slot)
+            if self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE"):
+                if self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"):
+                    self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "INVALID_SLOT")
+            return
 
         if normalized is None:
             logger.warning(
@@ -486,13 +484,16 @@ class EMSController:
                 "reset_days",
                 "lcd_display",
             }:
-                if self.api.push_ack(
-                    command_id, "COMPLETED", "NOT_AVAILABLE"
-                ):
-                    self.api.push_ack(
-                        command_id, "ACKED", "NOT_AVAILABLE"
-                    )
+                # These commands are applied through the cloud configuration
+                # snapshot; the Pi acknowledges lifecycle completion only.
+                if self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE"):
+                    if self.api.push_ack(command_id, "COMPLETED", "NOT_AVAILABLE"):
+                        self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE")
+                return
 
+            self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE")
+            self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "UNSUPPORTED_COMMAND")
+            self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "UNSUPPORTED_COMMAND")
             return
 
         created_at = datetime.now(
@@ -542,12 +543,12 @@ class EMSController:
             SystemState.EXECUTING
         )
 
+        # Persist EXECUTING before touching hardware. If durable state cannot
+        # be written, do not actuate: recovery semantics depend on this record.
         if not self.state.save_state(immediate=True):
-            # Never change hardware when the durable EXECUTING state cannot be
-            # persisted. Recovery must have an authoritative local record.
+            logger.critical("Cannot persist EXECUTING state; hardware command %s not actuated", command_id)
             self.state.system_state = SystemState.FAULT
-            logger.critical("Cannot persist EXECUTING state; hardware command held")
-            return False
+            return True
 
         success = False
         verification = (
