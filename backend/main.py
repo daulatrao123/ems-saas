@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v6.5.6 — Industrial Production (Strict Hardened RC)
+EMS SaaS Backend v6.5.7 — Industrial Production (Strict Hardened RC)
 """
 
 import os
@@ -23,11 +23,11 @@ from slowapi.errors import RateLimitExceeded
 # CONFIG
 # ================================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required.")
 
-SECRET_KEY = os.getenv("SECRET_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY environment variable is required.")
 
@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.5.6-prod")
+app = FastAPI(title="EMS SaaS API", version="6.5.7-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -214,7 +214,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (v6.5.6 Strict Hardened RC)")
+        print("DB schema verified OK (v6.5.7 Strict Hardened RC)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -266,7 +266,8 @@ app.add_middleware(
 
 def create_token(data: dict) -> str:
     payload = data.copy()
-    payload["exp"] = datetime.now(timezone.utc) + timedelta(days=30)
+    # FIX: Use strict integer timestamp for expiration to avoid python-jose timezone serialization issues
+    payload["exp"] = int(time.time()) + (30 * 24 * 60 * 60) # 30 days in seconds
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
 def is_pi_online(pi_state: dict) -> bool:
@@ -308,12 +309,14 @@ def validate_command(command: str, params: dict, slot: str = "") -> None:
 # AUTH
 # ================================================================
 
-async def get_current_user(authorization: str = Header(None)) -> dict:
+async def get_current_user(authorization: str = Header(None, alias="Authorization")) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Valid token required")
     try:
-        return jwt.decode(authorization[7:], SECRET_KEY, algorithms=["HS256"])
-    except JWTError:
+        payload = jwt.decode(authorization[7:], SECRET_KEY, algorithms=["HS256"])
+        return payload
+    except JWTError as e:
+        print(f"JWT Decode Error: {e}")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 def require_role(*roles):
