@@ -187,17 +187,6 @@ class ApiClient:
         except Exception:
             return False
 
-
-    def download_firmware(self, version: str):
-        try:
-            response=self.session.get(f"{self.base_url}/pi/firmware-download",params={"version":version},timeout=API_TIMEOUT_S)
-            if response.status_code != 200:
-                logger.error("Firmware download failed: HTTP %s",response.status_code); return None
-            data=response.json()
-            return data if isinstance(data,dict) else None
-        except Exception as exc:
-            logger.warning("Firmware download unavailable: %s",exc); return None
-
     # ============================================================
     # CLOSE
     # ============================================================

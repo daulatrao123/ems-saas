@@ -187,15 +187,6 @@ class EMSController:
             except (TypeError, ValueError):
                 logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
 
-        reset_day = response.get("resetDay")
-        if reset_day is not None:
-            try:
-                reset_day = int(reset_day)
-                if 1 <= reset_day <= 28:
-                    self.device_config["reset_day"] = reset_day
-            except (TypeError, ValueError):
-                logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
-
         self.device_config[
             "feedback_hardware_installed"
         ] = bool(
@@ -540,9 +531,15 @@ class EMSController:
             SystemState.EXECUTING
         )
 
-        self.state.save_state(
-            immediate=True
-        )
+        # Safety invariant: never mutate contactor hardware unless the
+        # command's EXECUTING state has been durably persisted first.
+        if not self.state.save_state(immediate=True):
+            self.state.system_state = SystemState.FAULT
+            logger.critical(
+                "Cannot persist EXECUTING state; hardware command %s was not started.",
+                command_id,
+            )
+            return True
 
         success = False
         verification = (

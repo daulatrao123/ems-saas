@@ -6,7 +6,6 @@ import os
 import time
 import uuid
 import hashlib
-import base64
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
@@ -41,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.5.0-industrial")
+app = FastAPI(title="EMS SaaS API", version="6.4.0-targeted")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -69,6 +68,11 @@ VALID_COMMANDS = {
     "reboot", "reset_days", "off_slot", "off_all", "lcd_display",
 }
 
+# Request model must be defined before any route/decorator references it.
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
 # ================================================================
 # DATABASE & SCHEMA INITIALIZATION
 # ================================================================
@@ -78,6 +82,201 @@ def get_db():
     conn.autocommit = False
     return conn
 
+@app.on_event("startup")
+def ensure_db_schema():
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS societies (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT, location TEXT, plan TEXT, status TEXT,
+                    tailscale_ip TEXT, pi_port INT, society_code TEXT,
+                    config_version INT DEFAULT 1
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    email TEXT UNIQUE, name TEXT, password TEXT, role TEXT, society_id INT
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_devices (
+                    id UUID PRIMARY KEY,
+                    society_id INT,
+                    name TEXT,
+                    api_key_hash TEXT UNIQUE,
+                    firmware_version TEXT,
+                    last_seen TIMESTAMPTZ,
+                    status TEXT DEFAULT 'INVENTORY',
+                    hardware_profile TEXT DEFAULT 'EMS-4CH-v1',
+                    feedback_hardware_installed BOOLEAN DEFAULT FALSE
+                );
+            """)
+
+            # PRODUCTION v6.2.3: Bulletproof Migration
+            cur.execute("""
+                DO $$ BEGIN
+                    -- 1. Handle slot_configs collision
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
+                            ALTER TABLE wing_configs RENAME TO slot_configs;
+                        ELSE
+                            ALTER TABLE wing_configs RENAME TO wing_configs_abandoned;
+                        END IF;
+                    END IF;
+
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs_old') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
+                            ALTER TABLE wing_configs_old RENAME TO slot_configs;
+                        ELSE
+                            ALTER TABLE wing_configs_old RENAME TO wing_configs_old_abandoned;
+                        END IF;
+                    END IF;
+
+                    -- 2. Handle slot_state collision
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
+                            ALTER TABLE wing_state RENAME TO slot_state;
+                        ELSE
+                            ALTER TABLE wing_state RENAME TO wing_state_abandoned;
+                        END IF;
+                    END IF;
+
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state_old') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
+                            ALTER TABLE wing_state_old RENAME TO slot_state;
+                        ELSE
+                            ALTER TABLE wing_state_old RENAME TO wing_state_old_abandoned;
+                        END IF;
+                    END IF;
+
+                    -- 3. Normalize column names to 'slot' in slot_configs
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='wing_code') THEN
+                        ALTER TABLE slot_configs RENAME COLUMN wing_code TO slot;
+                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='slot_code') THEN
+                        ALTER TABLE slot_configs RENAME COLUMN slot_code TO slot;
+                    END IF;
+
+                    -- 4. Normalize column names to 'slot' in slot_state
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='wing_code') THEN
+                        ALTER TABLE slot_state RENAME COLUMN wing_code TO slot;
+                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='slot_code') THEN
+                        ALTER TABLE slot_state RENAME COLUMN slot_code TO slot;
+                    END IF;
+
+                    -- 5. Normalize column names in pi_commands
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
+                        ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
+                    END IF;
+
+                    -- 6. Normalize column names in pi_state
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
+                        ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
+                    END IF;
+                END $$;
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS slot_configs (
+                    device_id UUID,
+                    slot TEXT,
+                    display_name TEXT,
+                    target_days INT,
+                    disabled BOOL DEFAULT FALSE,
+                    feedback_enabled BOOL DEFAULT FALSE,
+                    PRIMARY KEY (device_id, slot),
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS slot_state (
+                    device_id UUID,
+                    slot TEXT,
+                    physical_toggle TEXT DEFAULT 'UNKNOWN',
+                    used_days INT DEFAULT 0,
+                    clicks INT DEFAULT 0,
+                    PRIMARY KEY (device_id, slot),
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_state (
+                    device_id UUID PRIMARY KEY,
+                    active_slot TEXT, reset_day INT, emergency_stop BOOL,
+                    uptime_seconds INT, cpu_temp FLOAT, disk_free_mb FLOAT,
+                    last_sync TIMESTAMPTZ, boot_count INT, last_shutdown_reason TEXT, clock_source TEXT,
+                    watchdog_enabled BOOL, last_reboot_reason TEXT,
+                    config_version INT DEFAULT 0,
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_events (
+                    id SERIAL PRIMARY KEY,
+                    device_id UUID, event_id TEXT UNIQUE, timestamp TIMESTAMPTZ, type TEXT, message TEXT,
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pi_commands (
+                    id UUID PRIMARY KEY,
+                    device_id UUID, command TEXT, slot TEXT, params JSONB,
+                    status TEXT DEFAULT 'queued',
+                    created_at TIMESTAMPTZ, delivered_at TIMESTAMPTZ, acked_at TIMESTAMPTZ, expires_at TIMESTAMPTZ,
+                    error TEXT, result TEXT,
+                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS firmware_versions (
+                    version TEXT PRIMARY KEY,
+                    code TEXT, changelog TEXT, forced BOOL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id SERIAL PRIMARY KEY,
+                    society_id INT, user_id INT, device_id UUID,
+                    action TEXT, details JSONB, created_at TIMESTAMPTZ
+                );
+            """)
+
+            # Auto-add missing columns safely
+            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
+            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS reset_day INT")
+            cur.execute("UPDATE societies SET reset_day=%s WHERE reset_day IS NULL OR reset_day < 1 OR reset_day > 28", (DEFAULT_RESET_DAY,))
+            cur.execute("ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT %s", (DEFAULT_RESET_DAY,))
+            cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
+            cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS hardware_profile TEXT DEFAULT 'EMS-4CH-v1'")
+            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS feedback_hardware_installed BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE slot_configs ADD COLUMN IF NOT EXISTS feedback_enabled BOOL DEFAULT FALSE")
+
+            # Drop the unique constraint from v5.6 if it exists
+            cur.execute("DROP INDEX IF EXISTS uq_pi_devices_society_id")
+
+            cur.execute("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_society') THEN
+                        ALTER TABLE users ADD CONSTRAINT fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_devices_society') THEN
+                        ALTER TABLE pi_devices ADD CONSTRAINT fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
+                    END IF;
+                END $$;
+            """)
+
+        conn.commit()
+        print("DB schema verified OK (Relational v6.2.3 Strict Slot Migration)")
+    except Exception as e:
+        conn.rollback()
+        print(f"DB SCHEMA CHECK ERROR: {e}")
+        raise RuntimeError(f"Database schema initialization failed: {e}")
+    finally:
+        conn.close()
 
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
@@ -117,53 +316,61 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Api-Key"],
 )
 
-
-@app.middleware("http")
-async def browser_origin_guard(request: Request, call_next):
-    # Cookie-authenticated state-changing requests must originate from an
-    # explicitly allowed web origin. Pi requests use X-Device-ID/X-Api-Key
-    # and normally have no Origin header, so this does not affect them.
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.cookies.get("ems_access"):
-        origin=request.headers.get("origin")
-        if origin and origin not in ALLOWED_ORIGINS:
-            return JSONResponse(status_code=403, content={"detail":"Untrusted browser origin"})
-    return await call_next(request)
-
 # ================================================================
 # UTILITIES
 # ================================================================
 
-ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "15"))
-REFRESH_TOKEN_DAYS = int(os.getenv("REFRESH_TOKEN_DAYS", "7"))
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() == "true"
-COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "none")
-REFRESH_SECRET = os.getenv("REFRESH_SECRET") or SECRET_KEY
+def create_token(data: dict) -> str:
+    payload = data.copy()
+    payload["exp"] = datetime.now(timezone.utc) + timedelta(days=30)
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
-def create_token(data: dict, minutes: int = ACCESS_TOKEN_MINUTES) -> str:
-    payload=data.copy(); payload["type"]="access"; payload["exp"]=datetime.now(timezone.utc)+timedelta(minutes=minutes)
-    return jwt.encode(payload,SECRET_KEY,algorithm="HS256")
+def is_pi_online(pi_state: dict) -> bool:
+    if not pi_state: return False
+    last_sync = pi_state.get("last_sync")
+    if not last_sync: return False
+    if isinstance(last_sync, str):
+        try:
+            if last_sync.endswith("Z"): last_sync = last_sync[:-1] + "+00:00"
+            last_sync = datetime.fromisoformat(last_sync)
+        except: return False
+    if last_sync.tzinfo is None: last_sync = last_sync.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last_sync).total_seconds() <= PI_ONLINE_THRESHOLD_SECONDS
 
-def create_refresh_token(data: dict, jti: str) -> str:
-    payload=data.copy(); payload.update({"type":"refresh","jti":jti,"exp":datetime.now(timezone.utc)+timedelta(days=REFRESH_TOKEN_DAYS)})
-    return jwt.encode(payload,REFRESH_SECRET,algorithm="HS256")
+def slot_is_visible(config: dict, state: dict) -> bool:
+    physical = str(state.get("physical_toggle", "UNKNOWN")).upper()
+    return (
+        int(config.get("target_days", 0)) > 0
+        and physical == "ON"
+        and not bool(config.get("disabled", False))
+    )
 
-def _set_auth_cookies(response, access_token, refresh_token):
-    common={"secure":COOKIE_SECURE,"samesite":COOKIE_SAMESITE,"path":"/"}
-    response.set_cookie("ems_access",access_token,httponly=True,max_age=ACCESS_TOKEN_MINUTES*60,**common)
-    response.set_cookie("ems_refresh",refresh_token,httponly=True,max_age=REFRESH_TOKEN_DAYS*86400,**common)
+def validate_command(command: str, params: dict, slot: str = "") -> None:
+    if command not in VALID_COMMANDS:
+        raise HTTPException(400, f"Unsupported command: {command}")
+    if command in ("set_active_slot", "set_days", "off_slot"):
+        if slot not in SLOTS:
+            raise HTTPException(400, f"Valid slot ({', '.join(SLOTS)}) is required")
+    if command == "set_days":
+        try: days = int(params.get("days"))
+        except: raise HTTPException(400, "days must be an integer")
+        if not 1 <= days <= 31: raise HTTPException(400, "days must be 1-31")
+    if command == "set_reset_day":
+        try: day = int(params.get("day"))
+        except: raise HTTPException(400, "day must be an integer")
+        if not 1 <= day <= 28: raise HTTPException(400, "reset day must be 1-28")
 
-def _clear_auth_cookies(response):
-    response.delete_cookie("ems_access",path="/"); response.delete_cookie("ems_refresh",path="/")
+# ================================================================
+# AUTH
+# ================================================================
 
-async def get_current_user(request: Request, authorization: str = Header(None)) -> dict:
-    token=request.cookies.get("ems_access") if request is not None else None
-    if not token and authorization and authorization.startswith("Bearer "): token=authorization[7:]
-    if not token: raise HTTPException(401,"Valid session required")
+async def get_current_user(authorization: str = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Valid token required")
     try:
-        claims=jwt.decode(token,SECRET_KEY,algorithms=["HS256"])
-        if claims.get("type") not in (None,"access"): raise HTTPException(401,"Invalid access token")
-        return claims
-    except JWTError: raise HTTPException(401,"Invalid or expired session")
+        return jwt.decode(authorization[7:], SECRET_KEY, algorithms=["HS256"])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 def require_role(*roles):
     async def checker(user: dict = Depends(get_current_user)):
@@ -294,54 +501,24 @@ def bootstrap(request: Request):
 @app.post("/api/auth/login")
 @limiter.limit("5/minute")
 def login(request: Request, user: UserLogin):
-    conn=get_db()
+    conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT * FROM users WHERE email = %s",(user.email.strip().lower(),)); db_user=cur.fetchone()
-            if not db_user or not bcrypt.checkpw(user.password.encode(),db_user["password"].encode()): raise HTTPException(401,"Invalid credentials")
-            claims={"id":db_user["id"],"role":db_user["role"],"society_id":db_user["society_id"]}
-            jti=str(uuid.uuid4()); access=create_token(claims); refresh_token=create_refresh_token(claims,jti); now=datetime.now(timezone.utc)
-            cur.execute("INSERT INTO auth_sessions (jti,user_id,expires_at,created_at) VALUES (%s,%s,%s,%s)",(jti,db_user["id"],now+timedelta(days=REFRESH_TOKEN_DAYS),now))
-            conn.commit()
-            response=JSONResponse({"role":db_user["role"],"name":db_user["name"],"society_id":db_user["society_id"]})
-            _set_auth_cookies(response,access,refresh_token); return response
-    finally: conn.close()
+            cur.execute("SELECT * FROM users WHERE email = %s", (user.email,))
+            db_user = cur.fetchone()
+            if not db_user or not bcrypt.checkpw(user.password.encode(), db_user["password"].encode()):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
 
-@app.post("/api/auth/refresh")
-@limiter.limit("10/minute")
-def refresh(request: Request):
-    raw=request.cookies.get("ems_refresh")
-    if not raw: raise HTTPException(401,"Refresh session required")
-    try: claims=jwt.decode(raw,REFRESH_SECRET,algorithms=["HS256"])
-    except JWTError: raise HTTPException(401,"Invalid or expired refresh session")
-    if claims.get("type")!="refresh" or not claims.get("jti"): raise HTTPException(401,"Invalid refresh session")
-    conn=get_db()
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            now=datetime.now(timezone.utc); cur.execute("SELECT * FROM auth_sessions WHERE jti=%s FOR UPDATE",(claims["jti"],)); sess=cur.fetchone()
-            if not sess or sess["revoked_at"] is not None or sess["expires_at"]<=now: raise HTTPException(401,"Refresh session is invalid")
-            cur.execute("SELECT id,role,society_id,name FROM users WHERE id=%s",(sess["user_id"],)); u=cur.fetchone()
-            if not u: raise HTTPException(401,"User no longer exists")
-            cur.execute("UPDATE auth_sessions SET revoked_at=%s WHERE jti=%s",(now,claims["jti"]))
-            new_jti=str(uuid.uuid4()); cur.execute("INSERT INTO auth_sessions (jti,user_id,expires_at,created_at) VALUES (%s,%s,%s,%s)",(new_jti,u["id"],now+timedelta(days=REFRESH_TOKEN_DAYS),now))
-            response=JSONResponse({"role":u["role"],"name":u["name"],"society_id":u["society_id"]})
-            _set_auth_cookies(response,create_token({"id":u["id"],"role":u["role"],"society_id":u["society_id"]}),create_refresh_token({"id":u["id"],"role":u["role"],"society_id":u["society_id"]},new_jti))
-        conn.commit(); return response
-    finally: conn.close()
-
-@app.post("/api/auth/logout")
-def logout(request: Request):
-    raw=request.cookies.get("ems_refresh"); conn=get_db()
-    try:
-        if raw:
-            try: claims=jwt.decode(raw,REFRESH_SECRET,algorithms=["HS256"])
-            except JWTError: claims={}
-            if claims.get("jti"):
-                with conn.cursor() as cur: cur.execute("UPDATE auth_sessions SET revoked_at=%s WHERE jti=%s AND revoked_at IS NULL",(datetime.now(timezone.utc),claims["jti"]))
-                conn.commit()
-        response=JSONResponse({"message":"Logged out"}); _clear_auth_cookies(response); return response
-    finally: conn.close()
-
+            token = create_token({
+                "id": db_user["id"], "role": db_user["role"],
+                "society_id": db_user["society_id"]
+            })
+            return {
+                "token": token, "role": db_user["role"],
+                "name": db_user["name"], "society_id": db_user["society_id"],
+            }
+    finally:
+        conn.close()
 
 # ================================================================
 # SUPER-ADMIN — SOCIETIES (Multi-Pi & 4-Slot)
@@ -445,6 +622,13 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             for dev in devices:
                 dev_id = dev["device_id"]
                 if not dev_id: continue
+
+                cur.execute("SELECT status FROM pi_devices WHERE id=%s FOR UPDATE", (dev_id,))
+                device_row = cur.fetchone()
+                if not device_row:
+                    raise HTTPException(404, f"Device not found: {dev_id}")
+                if str(device_row["status"]).upper() == "RETIRED":
+                    raise HTTPException(409, f"Retired device cannot be reassigned: {dev_id}")
 
                 cur.execute(
                     "UPDATE pi_devices SET society_id=%s, status='ASSIGNED', hardware_profile=%s, feedback_hardware_installed=%s WHERE id=%s",
@@ -592,15 +776,6 @@ def delete_device(data: dict, user: dict = Depends(require_role("super_admin")))
     return {"message": "Device retired successfully"}
 
 # ================================================================
-def _firmware_signing_private_key():
-    raw=os.getenv("EMS_FIRMWARE_SIGNING_PRIVATE_KEY")
-    if not raw: raise HTTPException(503,"Firmware signing is not configured")
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    try: return Ed25519PrivateKey.from_private_bytes(base64.b64decode(raw))
-    except Exception as exc: raise HTTPException(500,"Invalid firmware signing key configuration") from exc
-
-def _firmware_message(version, sha256, code): return (version+"\n"+sha256+"\n"+code).encode("utf-8")
-
 # SUPER-ADMIN — USERS & FIRMWARE
 # ================================================================
 
@@ -670,7 +845,7 @@ def get_firmware_versions(user: dict = Depends(require_role("super_admin"))):
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT version, changelog, forced, sha256, signature, key_id, created_at, updated_at FROM firmware_versions ORDER BY created_at DESC")
+            cur.execute("SELECT version, changelog, forced, created_at, updated_at FROM firmware_versions ORDER BY created_at DESC")
             versions = cur.fetchall()
             return versions
     finally:
@@ -678,23 +853,37 @@ def get_firmware_versions(user: dict = Depends(require_role("super_admin"))):
 
 @app.post("/api/super-admin/firmware/save")
 def save_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
-    version=str(data.get("version","")).strip(); code=data.get("code",""); changelog=data.get("changelog",""); forced=bool(data.get("forced",False))
-    if not version or not code: raise HTTPException(400,"Version and code required")
-    digest=hashlib.sha256(code.encode()).hexdigest(); private=_firmware_signing_private_key(); signature=base64.b64encode(private.sign(_firmware_message(version,digest,code))).decode(); key_id=os.getenv("EMS_FIRMWARE_KEY_ID","primary-ed25519-v1"); now=datetime.now(timezone.utc)
-    conn=get_db()
+    conn = get_db()
     try:
         with conn.cursor() as cur:
-            if forced: cur.execute("UPDATE firmware_versions SET forced=FALSE")
-            cur.execute("""INSERT INTO firmware_versions (version,code,changelog,forced,sha256,signature,key_id,created_at,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (version) DO UPDATE SET code=%s,changelog=%s,forced=%s,sha256=%s,signature=%s,key_id=%s,updated_at=%s""",(version,code,changelog,forced,digest,signature,key_id,now,now,code,changelog,forced,digest,signature,key_id,now))
-        conn.commit(); return {"message":"Saved and signed","version":version,"sha256":digest,"key_id":key_id}
-    finally: conn.close()
+            version = data.get("version", "").strip()
+            code = data.get("code", "")
+            changelog = data.get("changelog", "")
+            forced = data.get("forced", False)
+            if not version or not code:
+                raise HTTPException(400, "Version and code required")
+
+            if forced:
+                cur.execute("UPDATE firmware_versions SET forced = FALSE")
+
+            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at)
+                           VALUES (%s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s""",
+                        (version, code, changelog, forced, datetime.now(timezone.utc), datetime.now(timezone.utc), code, changelog, forced, datetime.now(timezone.utc)))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+    return {"message": "Saved"}
 
 @app.post("/api/super-admin/firmware/delete")
 def delete_firmware_version(data: dict, user: dict = Depends(require_role("super_admin"))):
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE firmware_versions SET forced=FALSE WHERE version = %s", (data.get("version"),))
+            cur.execute("DELETE FROM firmware_versions WHERE version = %s", (data.get("version"),))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -719,15 +908,31 @@ def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))
     return {"message": "Force flag updated"}
 
 @app.get("/api/pi/firmware-download")
-def download_firmware(version: str, x_device_id: str | None = Header(None, alias="X-Device-ID"), x_api_key: str | None = Header(None, alias="X-Api-Key")):
-    device_id,_=authenticate_pi({},x_device_id,x_api_key); conn=get_db()
+def download_firmware(
+    version: str,
+    x_api_key: str = Header(None, alias="X-Api-Key"),
+    x_device_id: str = Header(None, alias="X-Device-ID"),
+):
+    if not x_api_key or not x_device_id:
+        raise HTTPException(403, "X-Device-ID and X-Api-Key headers are required")
+    conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT version,code,changelog,forced,sha256,signature,key_id FROM firmware_versions WHERE version=%s",(version,)); fv=cur.fetchone()
-            if not fv: raise HTTPException(404,"Version not found")
-            if not fv["signature"] or not fv["sha256"]: raise HTTPException(503,"Firmware artifact is unsigned")
-            return {"version":fv["version"],"code":fv["code"],"changelog":fv["changelog"],"forced":bool(fv["forced"]),"sha256":fv["sha256"],"signature":fv["signature"],"key_id":fv["key_id"],"device_id":str(device_id)}
-    finally: conn.close()
+            cur.execute(
+                "SELECT id, society_id, status FROM pi_devices WHERE id=%s AND api_key_hash=%s",
+                (x_device_id, hash_api_key(x_api_key)),
+            )
+            device = cur.fetchone()
+            if not device or not device["society_id"] or str(device["status"]).upper() != "ASSIGNED":
+                raise HTTPException(403, "Invalid or inactive Pi credentials")
+
+            cur.execute("SELECT code FROM firmware_versions WHERE version = %s", (version,))
+            fv = cur.fetchone()
+            if not fv:
+                raise HTTPException(404, "Version not found")
+            return PlainTextResponse(fv["code"], media_type="text/plain")
+    finally:
+        conn.close()
 
 # ================================================================
 # PI SYNC (Returns canonical config for THIS specific Pi)

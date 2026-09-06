@@ -10,7 +10,8 @@ export default function MemberDashboard() {
 
   useEffect(() => {
     const role = localStorage.getItem("role");
-    if (role !== "member") {
+    const token = localStorage.getItem("token");
+    if (!token || role !== "member") {
       router.push("/login");
       return;
     }

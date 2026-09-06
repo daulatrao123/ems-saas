@@ -1,5 +1,4 @@
 "use client";
-import api from "@/lib/api";
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -15,7 +14,7 @@ export default function Sidebar({ role }: { role: string }) {
   const adminLinks = [{ href: "/admin", label: "Dashboard", icon: "\uD83D\uDCCA" }];
   const links = role === "super_admin" ? superAdminLinks : adminLinks;
   const close = () => setOpen(false);
-  const handleLogout = async () => { try { await api.post("/api/auth/logout"); } finally { localStorage.clear(); window.location.href = "/login"; } };
+  const handleLogout = () => { localStorage.clear(); window.location.href = "/login"; };
 
   return (
     <>

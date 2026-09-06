@@ -13,9 +13,9 @@ export default function Login() {
     e.preventDefault();
     try {
       const res = await api.post("/api/auth/login", { email, password });
+      localStorage.setItem("token", res.data.token);
       localStorage.setItem("role", res.data.role);
       localStorage.setItem("name", res.data.name);
-      if (res.data.society_id != null) localStorage.setItem("society_id", String(res.data.society_id));
       if (res.data.role === "super_admin") router.push("/super-admin");
       else router.push("/admin");
     } catch {
