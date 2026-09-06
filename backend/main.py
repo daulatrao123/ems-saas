@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.4.0-targeted")
+app = FastAPI(title="EMS SaaS API", version="6.4.1-strict")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -51,7 +51,7 @@ COMMAND_EXPIRY_SECONDS = 300
 COMMAND_DELIVERY_LEASE_SECONDS = 120
 
 COMMAND_TRANSITIONS = {
-    "queued": {"delivered", "executing", "expired"},
+    "queued": {"delivered", "expired"},
     "delivered": {"executing", "expired", "unknown_after_reboot"},
     "executing": {"hardware_verified", "failed", "unknown_after_reboot"},
     "hardware_verified": {"completed", "failed"},
@@ -69,7 +69,7 @@ VALID_COMMANDS = {
 }
 
 # ================================================================
-# DATABASE & SCHEMA INITIALIZATION
+# DATABASE
 # ================================================================
 
 def get_db():
@@ -77,201 +77,6 @@ def get_db():
     conn.autocommit = False
     return conn
 
-@app.on_event("startup")
-def ensure_db_schema():
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS societies (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT, location TEXT, plan TEXT, status TEXT,
-                    tailscale_ip TEXT, pi_port INT, society_code TEXT,
-                    config_version INT DEFAULT 1
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    email TEXT UNIQUE, name TEXT, password TEXT, role TEXT, society_id INT
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pi_devices (
-                    id UUID PRIMARY KEY,
-                    society_id INT,
-                    name TEXT,
-                    api_key_hash TEXT UNIQUE,
-                    firmware_version TEXT,
-                    last_seen TIMESTAMPTZ,
-                    status TEXT DEFAULT 'INVENTORY',
-                    hardware_profile TEXT DEFAULT 'EMS-4CH-v1',
-                    feedback_hardware_installed BOOLEAN DEFAULT FALSE
-                );
-            """)
-
-            # PRODUCTION v6.2.3: Bulletproof Migration
-            cur.execute("""
-                DO $$ BEGIN
-                    -- 1. Handle slot_configs collision
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs') THEN
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
-                            ALTER TABLE wing_configs RENAME TO slot_configs;
-                        ELSE
-                            ALTER TABLE wing_configs RENAME TO wing_configs_abandoned;
-                        END IF;
-                    END IF;
-
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs_old') THEN
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
-                            ALTER TABLE wing_configs_old RENAME TO slot_configs;
-                        ELSE
-                            ALTER TABLE wing_configs_old RENAME TO wing_configs_old_abandoned;
-                        END IF;
-                    END IF;
-
-                    -- 2. Handle slot_state collision
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state') THEN
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
-                            ALTER TABLE wing_state RENAME TO slot_state;
-                        ELSE
-                            ALTER TABLE wing_state RENAME TO wing_state_abandoned;
-                        END IF;
-                    END IF;
-
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state_old') THEN
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
-                            ALTER TABLE wing_state_old RENAME TO slot_state;
-                        ELSE
-                            ALTER TABLE wing_state_old RENAME TO wing_state_old_abandoned;
-                        END IF;
-                    END IF;
-
-                    -- 3. Normalize column names to 'slot' in slot_configs
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='wing_code') THEN
-                        ALTER TABLE slot_configs RENAME COLUMN wing_code TO slot;
-                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='slot_code') THEN
-                        ALTER TABLE slot_configs RENAME COLUMN slot_code TO slot;
-                    END IF;
-
-                    -- 4. Normalize column names to 'slot' in slot_state
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='wing_code') THEN
-                        ALTER TABLE slot_state RENAME COLUMN wing_code TO slot;
-                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='slot_code') THEN
-                        ALTER TABLE slot_state RENAME COLUMN slot_code TO slot;
-                    END IF;
-
-                    -- 5. Normalize column names in pi_commands
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
-                        ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
-                    END IF;
-
-                    -- 6. Normalize column names in pi_state
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
-                        ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
-                    END IF;
-                END $$;
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS slot_configs (
-                    device_id UUID,
-                    slot TEXT,
-                    display_name TEXT,
-                    target_days INT,
-                    disabled BOOL DEFAULT FALSE,
-                    feedback_enabled BOOL DEFAULT FALSE,
-                    PRIMARY KEY (device_id, slot),
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS slot_state (
-                    device_id UUID,
-                    slot TEXT,
-                    physical_toggle TEXT DEFAULT 'UNKNOWN',
-                    used_days INT DEFAULT 0,
-                    clicks INT DEFAULT 0,
-                    PRIMARY KEY (device_id, slot),
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pi_state (
-                    device_id UUID PRIMARY KEY,
-                    active_slot TEXT, reset_day INT, emergency_stop BOOL,
-                    uptime_seconds INT, cpu_temp FLOAT, disk_free_mb FLOAT,
-                    last_sync TIMESTAMPTZ, boot_count INT, last_shutdown_reason TEXT, clock_source TEXT,
-                    watchdog_enabled BOOL, last_reboot_reason TEXT,
-                    config_version INT DEFAULT 0,
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pi_events (
-                    id SERIAL PRIMARY KEY,
-                    device_id UUID, event_id TEXT UNIQUE, timestamp TIMESTAMPTZ, type TEXT, message TEXT,
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pi_commands (
-                    id UUID PRIMARY KEY,
-                    device_id UUID, command TEXT, slot TEXT, params JSONB,
-                    status TEXT DEFAULT 'queued',
-                    created_at TIMESTAMPTZ, delivered_at TIMESTAMPTZ, acked_at TIMESTAMPTZ, expires_at TIMESTAMPTZ,
-                    error TEXT, result TEXT,
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS firmware_versions (
-                    version TEXT PRIMARY KEY,
-                    code TEXT, changelog TEXT, forced BOOL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id SERIAL PRIMARY KEY,
-                    society_id INT, user_id INT, device_id UUID,
-                    action TEXT, details JSONB, created_at TIMESTAMPTZ
-                );
-            """)
-
-            # Auto-add missing columns safely
-            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
-            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS reset_day INT")
-            cur.execute("UPDATE societies SET reset_day=%s WHERE reset_day IS NULL OR reset_day < 1 OR reset_day > 28", (DEFAULT_RESET_DAY,))
-            cur.execute(f"ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT {DEFAULT_RESET_DAY}")
-            cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
-            cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
-            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
-            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS hardware_profile TEXT DEFAULT 'EMS-4CH-v1'")
-            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS feedback_hardware_installed BOOLEAN DEFAULT FALSE")
-            cur.execute("ALTER TABLE slot_configs ADD COLUMN IF NOT EXISTS feedback_enabled BOOL DEFAULT FALSE")
-
-            # Drop the unique constraint from v5.6 if it exists
-            cur.execute("DROP INDEX IF EXISTS uq_pi_devices_society_id")
-
-            cur.execute("""
-                DO $$ BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_society') THEN
-                        ALTER TABLE users ADD CONSTRAINT fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_devices_society') THEN
-                        ALTER TABLE pi_devices ADD CONSTRAINT fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
-                    END IF;
-                END $$;
-            """)
-
-        conn.commit()
-        print("DB schema verified OK (Relational v6.2.3 Strict Slot Migration)")
-    except Exception as e:
-        conn.rollback()
-        print(f"DB SCHEMA CHECK ERROR: {e}")
-        raise RuntimeError(f"Database schema initialization failed: {e}")
-    finally:
-        conn.close()
 
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
@@ -554,7 +359,7 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
                             "display_name": c["display_name"],
                             "target_days": c["target_days"],
                             "disabled": c["disabled"],
-                            "feedback_enabled": c["feedback_enabled"],
+                            "feedback_enabled": bool(c["feedback_enabled"]) and bool(dev["feedback_hardware_installed"]),
                             "used_days": st["used_days"] if st else 0,
                             "physical_toggle": st["physical_toggle"] if st else "UNKNOWN",
                         }
@@ -621,6 +426,13 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             for dev in devices:
                 dev_id = dev["device_id"]
                 if not dev_id: continue
+
+                cur.execute("SELECT status FROM pi_devices WHERE id=%s FOR UPDATE", (dev_id,))
+                device_row = cur.fetchone()
+                if not device_row:
+                    raise HTTPException(404, f"Device not found: {dev_id}")
+                if str(device_row["status"]).upper() == "RETIRED":
+                    raise HTTPException(409, f"Retired device cannot be assigned: {dev_id}")
 
                 cur.execute(
                     "UPDATE pi_devices SET society_id=%s, status='ASSIGNED', hardware_profile=%s, feedback_hardware_installed=%s WHERE id=%s",

@@ -187,15 +187,6 @@ class EMSController:
             except (TypeError, ValueError):
                 logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
 
-        reset_day = response.get("resetDay")
-        if reset_day is not None:
-            try:
-                reset_day = int(reset_day)
-                if 1 <= reset_day <= 28:
-                    self.device_config["reset_day"] = reset_day
-            except (TypeError, ValueError):
-                logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
-
         self.device_config[
             "feedback_hardware_installed"
         ] = bool(
@@ -455,9 +446,9 @@ class EMSController:
                 "Rejected command with invalid slot: %s",
                 slot,
             )
-            self.api.push_ack(
-                command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"
-            )
+            self.api.push_ack(command_id, "EXECUTING", "PENDING")
+            if self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"):
+                self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "INVALID_SLOT")
             return
 
         normalized = {
@@ -476,21 +467,22 @@ class EMSController:
                 command,
             )
 
-            # Configuration commands are already delivered
-            # through the sync configuration.
+            # Keep the same cloud FSM for non-hardware commands.  The backend
+            # must see EXECUTING before terminal completion; otherwise a strict
+            # DELIVERED -> COMPLETED transition is correctly rejected.
             if command in {
                 "set_days",
                 "set_reset_day",
                 "reset_days",
                 "lcd_display",
             }:
-                if self.api.push_ack(
-                    command_id, "COMPLETED", "NOT_AVAILABLE"
-                ):
-                    self.api.push_ack(
-                        command_id, "ACKED", "NOT_AVAILABLE"
-                    )
-
+                self.api.push_ack(command_id, "EXECUTING", "PENDING")
+                if self.api.push_ack(command_id, "COMPLETED", "NOT_AVAILABLE"):
+                    self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE")
+            else:
+                self.api.push_ack(command_id, "EXECUTING", "PENDING")
+                if self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "UNSUPPORTED_COMMAND"):
+                    self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "UNSUPPORTED_COMMAND")
             return
 
         created_at = datetime.now(
@@ -540,9 +532,16 @@ class EMSController:
             SystemState.EXECUTING
         )
 
-        self.state.save_state(
-            immediate=True
-        )
+        # Safety invariant: never mutate hardware unless the durable state
+        # records EXECUTING.  If persistence fails, remain in FAULT and let
+        # reboot recovery reconcile the durable queue against physical GPIO.
+        if not self.state.save_state(immediate=True):
+            logger.critical(
+                "Cannot persist EXECUTING state for command %s; hardware execution blocked",
+                command_id,
+            )
+            self.state.system_state = SystemState.FAULT
+            return False
 
         success = False
         verification = (

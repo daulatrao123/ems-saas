@@ -1,0 +1,22 @@
+name: EMS Strict QA
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Syntax gate
+        run: python -m py_compile backend/main.py backend/alembic/env.py backend/alembic/versions/0001_industrial_schema.py pi_firmware/*.py frontend/test_system.py
+      - name: Strict release gate
+        run: python qa/strict_6_4_1_check.py
+      - name: Shell syntax
+        run: bash -n pi_firmware/setup_pi.sh
