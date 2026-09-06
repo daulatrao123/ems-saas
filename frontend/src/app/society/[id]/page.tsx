@@ -12,11 +12,15 @@ export default function SocietyDashboard() {
 
   useEffect(() => {
     const sid = localStorage.getItem("society_id");
-    api.get("/api/auth/me").then((res) => {
-      if (res.data.role !== "society_admin" || !sid || String(res.data.society_id) !== String(sid)) { router.push("/login"); return; }
-      setSocietyId(sid);
-      fetchDashboard(sid);
-    }).catch(() => router.push("/login"));
+    const role = localStorage.getItem("role");
+    const token = localStorage.getItem("token");
+    
+    if (!token || !sid) {
+      router.push("/login");
+      return;
+    }
+    setSocietyId(sid);
+    fetchDashboard(sid);
   }, [router]);
 
   const fetchDashboard = async (sid: string) => {

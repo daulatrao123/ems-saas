@@ -186,15 +186,6 @@ class EMSController:
             except (TypeError, ValueError):
                 logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
 
-        reset_day = response.get("resetDay")
-        if reset_day is not None:
-            try:
-                reset_day = int(reset_day)
-                if 1 <= reset_day <= 28:
-                    self.device_config["reset_day"] = reset_day
-            except (TypeError, ValueError):
-                logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
-
         self.device_config[
             "feedback_hardware_installed"
         ] = bool(
@@ -429,93 +420,39 @@ class EMSController:
         self,
         response: dict,
     ):
-        command_id = str(
-            response.get(
-                "command_id"
-            )
-        )
-
-        command = str(
-            response.get(
-                "command",
-                "",
-            )
-        )
-
-        slot = str(
-            response.get(
-                "slot",
-                "",
-            )
-        )
+        command_id = str(response.get("command_id"))
+        command = str(response.get("command", ""))
+        slot = str(response.get("slot", ""))
 
         if slot and slot not in SUPPORTED_SLOTS:
-            logger.critical(
-                "Rejected command with invalid slot: %s",
-                slot,
-            )
-            self.api.push_ack(command_id, "EXECUTING", "PENDING")
-            self.api.push_ack(
-                command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT"
-            )
-            self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "INVALID_SLOT")
+            logger.critical("Rejected command with invalid slot: %s", slot)
+            self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE")
+            self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT")
             return
 
         normalized = {
-            "set_active_slot":
-                "ACTIVATE",
-            "off_slot":
-                "DEACTIVATE",
-            "off_all":
-                "DEACTIVATE_ALL",
+            "set_active_slot": "ACTIVATE",
+            "off_slot": "DEACTIVATE",
+            "off_all": "DEACTIVATE_ALL",
         }.get(command)
 
         if normalized is None:
-            logger.warning(
-                "Command %s is non-hardware or unsupported on Pi: %s",
-                command_id,
-                command,
-            )
-
-            # Configuration commands are already delivered
-            # through the sync configuration.
-            if command in {
-                "set_days",
-                "set_reset_day",
-                "reset_days",
-                "lcd_display",
-            }:
-                if self.api.push_ack(command_id, "EXECUTING", "PENDING"):
+            logger.warning("Command %s is non-hardware or unsupported on Pi: %s", command_id, command)
+            if command in {"set_days", "set_reset_day", "reset_days", "lcd_display"}:
+                if self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE"):
                     if self.api.push_ack(command_id, "COMPLETED", "NOT_AVAILABLE"):
                         self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE")
             else:
-                if self.api.push_ack(command_id, "EXECUTING", "PENDING"):
-                    if self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "UNSUPPORTED_PI_COMMAND"):
-                        self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE", "UNSUPPORTED_PI_COMMAND")
-
+                self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE")
+                self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "UNSUPPORTED_COMMAND")
             return
 
-        created_at = datetime.now(
-            timezone.utc
-        ).isoformat()
-
-        expires_at = (
-            datetime.now(
-                timezone.utc
-            )
-            + timedelta(minutes=5)
-        ).isoformat()
-
-        self.queue.add_command(
-            command_id,
-            slot,
-            normalized,
-            created_at,
-            expires_at,
-            response.get(
-                "config_version"
-            ),
-        )
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(minutes=5)).isoformat()
+        if not self.queue.add_command(
+            command_id, slot, normalized, now.isoformat(), expires_at, response.get("config_version")
+        ):
+            logger.critical("Unable to durably persist cloud command %s", command_id)
 
     # ============================================================
     # COMMAND EXECUTION
@@ -542,16 +479,13 @@ class EMSController:
             SystemState.EXECUTING
         )
 
-        # Safety invariant: persist EXECUTING before touching hardware. If the
-        # state file cannot be durably written, do not energize/de-energize a
-        # contactor because reboot reconciliation would otherwise lose intent.
         if not self.state.save_state(immediate=True):
-            self.state.system_state = SystemState.FAULT
             logger.critical(
-                "Command %s blocked: EXECUTING state could not be persisted.",
+                "Refusing hardware execution for %s: EXECUTING state could not be persisted.",
                 command_id,
             )
-            return False
+            self.state.system_state = SystemState.FAULT
+            return True
 
         success = False
         verification = (

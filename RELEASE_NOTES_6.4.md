@@ -1,31 +1,42 @@
-# EMS SaaS Industrial 6.4.1 — Strict Hardened Candidate
+# EMS SaaS Industrial 6.4 — Targeted Hardening
 
-Baseline: `cb15919032596021e732321a4c7c84e60429f5f6` (`main`)
+Base: `cb15919032596021e732321a4c7c84e60429f5f6` (`main`)
 
-This ZIP is the corrected targeted hardening candidate. It resolves the previously identified source-level lifecycle, compatibility, migration-order, feedback-consistency, retirement, and delivery-lease issues.
+## Scope
 
-### Included hardening
-- Strict command FSM with no QUEUED → EXECUTING shortcut.
-- 120-second delivery lease and 300-second absolute expiry.
-- HARDWARE_VERIFIED requires actual verification evidence.
-- EXECUTING state is durably persisted before hardware actuation.
-- UNKNOWN_AFTER_REBOOT never enters normal execution; reconciliation is mandatory.
-- Explicit terminal ACK then ACKED lifecycle.
-- Legacy STATE_VERSION=4 JSON compatibility.
-- Legacy SQLite queue schema migration occurs before indexes.
-- Monthly usage/reset accounting persisted.
-- Feedback configuration is constrained by real device capability in admin and Pi sync views.
-- Retired devices cannot be silently re-assigned.
-- Pi credentials use request headers rather than JSON credentials.
-- Explicit EMS storage device, existing ext4 only, no formatting.
-- Least-privilege systemd controller service.
+This release is intentionally built from the stable main baseline. The proven GPIO, storage I/O, storage manager, logger, memory manager, and resource guard implementations are preserved unchanged.
 
-### Validation completed in this build
-- Python compilation: PASS.
-- Bash syntax: PASS.
-- Strict self-contained source gate: PASS.
-- Legacy queue migration runtime test: PASS when run against a temporary legacy DB.
-- Legacy STATE_VERSION=4 load compatibility: PASS.
+### Targeted changes
+- Durable monthly usage/reset-period state while retaining state format version 4 compatibility.
+- Explicit `HARDWARE_VERIFIED` and `UNKNOWN_AFTER_REBOOT` command lifecycle handling.
+- Recovery of interrupted `EXECUTING`, `HARDWARE_VERIFIED`, and `UNKNOWN_AFTER_REBOOT` local queue entries against reconciled hardware truth.
+- Explicit terminal command ACK followed by `ACKED` confirmation.
+- Pi authentication uses `X-Device-ID` and `X-Api-Key` headers; body-key fallback remains for legacy firmware compatibility.
+- Backend command transition validation, 120-second delivery lease, and 300-second absolute command expiry.
+- Device and society retirement instead of destructive deletion.
+- Society reset-day persistence and validation.
+- Feedback-enabled configuration is constrained by device feedback capability in Pi sync.
+- Explicit EMS storage device provisioning; no automatic formatting.
+- Least-privilege systemd unit (`User=pi`, GPIO/I2C supplementary groups, restricted filesystem/device access).
+- Hardcoded integration-test credentials replaced by environment variables.
+- Empty obsolete `pi_firmware/storage_health.py` removed.
 
-### Not production-certified by source review alone
-Hardware HIL/electrical verification, storage endurance/NAND wear qualification, Alembic production migrations, signed OTA/rollback, production frontend auth/CI, dependency security, and final Raspberry Pi/systemd deployment validation remain mandatory gates.
+## Files intentionally protected
+- `pi_firmware/gpio_manager.py`
+- `pi_firmware/storage_io_manager.py`
+- `pi_firmware/storage_manager.py`
+- `pi_firmware/logger.py`
+- `pi_firmware/memory_manager.py`
+- `pi_firmware/resource_guard.py`
+
+## Offline QA completed
+- Python compilation of backend, Pi firmware, and frontend test script: PASS.
+- `bash -n pi_firmware/setup_pi.sh`: PASS.
+- Git whitespace check: PASS.
+- OfflineQueue lifecycle runtime test: PASS.
+- OfflineQueue reboot-recovery state test: PASS.
+- Pi state persistence/legacy-compatible state test: PASS.
+- Strict targeted source gate: PASS.
+
+## Not certified by this ZIP
+Hardware HIL, GPIO electrical polarity, contactor feedback wiring, power-fail testing, storage endurance/NAND wear, OTA signature/rollback, dependency vulnerability remediation, production database migration qualification, and full frontend CI build remain mandatory before production certification.

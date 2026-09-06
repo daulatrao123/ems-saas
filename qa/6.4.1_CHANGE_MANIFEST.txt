@@ -1,7 +1,8 @@
-# EMS 6.4.1 change manifest
-# Base: daulatrao123/ems-saas main @ cb15919032596021e732321a4c7c84e60429f5f6
+# EMS 6.4.1 strict hardening manifest
+# Original product baseline: cb15919032596021e732321a4c7c84e60429f5f6
+# Immediate source baseline: EMS_SaaS_Industrial_6.4_Targeted_Hardened.zip
 
-# Protected subsystems: byte-identical to main
+UNCHANGED PROTECTED SUBSYSTEMS
 pi_firmware/gpio_manager.py
 pi_firmware/storage_io_manager.py
 pi_firmware/storage_manager.py
@@ -9,31 +10,26 @@ pi_firmware/logger.py
 pi_firmware/memory_manager.py
 pi_firmware/resource_guard.py
 
-# Hardened application files
+MODIFIED IN 6.4.1
 backend/main.py
-backend/requirements.txt
-backend/render.yaml
-backend/alembic.ini
-backend/alembic/env.py
-backend/alembic/script.py.mako
-backend/alembic/versions/20260906_0001_industrial_baseline.py
-pi_firmware/api_client.py
+frontend/src/app/login/page.tsx
+frontend/src/app/admin/page.tsx
+frontend/src/app/member/page.tsx
+frontend/src/app/super-admin/page.tsx
 pi_firmware/ems_controller.py
 pi_firmware/offline_queue.py
-pi_firmware/setup_pi.sh
 pi_firmware/state.py
-frontend/test_system.py
-
-# New/review artifacts
-pi_firmware/ems-controller.service
-qa/strict_6_4_check.py
 qa/runtime_compatibility_test.py
-qa/6.4.1_vs_main.diff
-qa/6.4.1_CHANGE_MANIFEST.txt
+qa/strict_6_4_1_check.py
 RELEASE_NOTES_6.4.1.md
 
-# Removed
+REMOVED
+qa/strict_6_4_check.py
+qa/6.4_vs_main.diff
 pi_firmware/storage_health.py
 
-# Explicitly not certified here
-HIL, endurance soak, live DB rehearsal, browser cookie auth, Ed25519 OTA/A-B rollback.
+UNCHANGED FROM 6.4 BASELINE
+pi_firmware/api_client.py
+pi_firmware/setup_pi.sh
+pi_firmware/ems-controller.service
+frontend/test_system.py

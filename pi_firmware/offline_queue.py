@@ -185,7 +185,13 @@ class OfflineQueue:
                 """
             )
 
-            existing = {row[1] for row in self.conn.execute("PRAGMA table_info(commands)").fetchall()}
+            # Backward-compatible migration for queues created by older EMS
+            # firmware. Migration MUST run before indexes reference new columns.
+            existing_columns = {
+                row[1] for row in self.conn.execute(
+                    "PRAGMA table_info(commands);"
+                ).fetchall()
+            }
             migrations = {
                 "delivered_at": "TEXT",
                 "started_at": "TEXT",
@@ -200,8 +206,10 @@ class OfflineQueue:
                 "ack_status": "TEXT NOT NULL DEFAULT 'PENDING'",
             }
             for column, definition in migrations.items():
-                if column not in existing:
-                    self.conn.execute(f"ALTER TABLE commands ADD COLUMN {column} {definition}")
+                if column not in existing_columns:
+                    self.conn.execute(
+                        f"ALTER TABLE commands ADD COLUMN {column} {definition}"
+                    )
 
             self.conn.execute(
                 """
