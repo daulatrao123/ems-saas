@@ -1,5 +1,5 @@
 """
-EMS SaaS Backend v6.5.4 — Industrial Production (Strict Hardened RC)
+EMS SaaS Backend v6.5.5 — Industrial Production (Strict Hardened RC)
 """
 
 import os
@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 ]
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="EMS SaaS API", version="6.5.4-prod")
+app = FastAPI(title="EMS SaaS API", version="6.5.5-prod")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -55,7 +55,6 @@ VALID_COMMANDS = {
     "reboot", "reset_days", "off_slot", "off_all", "lcd_display",
 }
 
-# FIX: Strict Command FSM - Added COMPLETED to EXECUTING for config commands
 VALID_ACK_TRANSITIONS = {
     "QUEUED": ["DELIVERED", "EXPIRED"],
     "DELIVERED": ["EXECUTING", "EXPIRED", "FAILED"],
@@ -67,7 +66,6 @@ VALID_ACK_TRANSITIONS = {
     "EXPIRED": ["ACKED"]
 }
 
-# FIX: Valid physical verification states
 VALID_HARDWARE_VERIFICATIONS = {"VERIFIED_ON", "VERIFIED_OFF", "GPIO_CONFIRMED"}
 
 class UserLogin(BaseModel):
@@ -215,7 +213,7 @@ def ensure_db_schema():
             """)
 
         conn.commit()
-        print("DB schema verified OK (v6.5.4 Strict Hardened RC)")
+        print("DB schema verified OK (v6.5.5 Strict Hardened RC)")
     except Exception as e:
         conn.rollback()
         print(f"DB SCHEMA CHECK ERROR: {e}")
@@ -327,11 +325,23 @@ def require_role(*roles):
 async def require_society_access(request: Request, user: dict = Depends(get_current_user)) -> dict:
     if user.get("role") not in ("super_admin", "society_admin"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    if user["role"] != "super_admin":
+    if user["role"] == "society_admin":
         requested = str(request.query_params.get("society_id", ""))
         owned = str(user.get("society_id", ""))
         if requested and requested != owned:
             raise HTTPException(status_code=403, detail="Cannot access other society data")
+        
+        # FIX: Block access if the society is retired
+        if owned and owned != "None":
+            conn = get_db()
+            try:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("SELECT status FROM societies WHERE id = %s", (owned,))
+                    soc = cur.fetchone()
+                    if not soc or soc["status"] != "active":
+                        raise HTTPException(status_code=403, detail="Society is retired or inactive.")
+            finally:
+                conn.close()
     return user
 
 def authenticate_pi(payload: dict, x_device_id: str = Header(None, alias="X-Device-ID"), x_api_key: str = Header(None, alias="X-Api-Key")) -> tuple:
@@ -509,13 +519,13 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             }
             
             if sid:
-                # FIX: Prevent editing/reactivating retired societies
                 cur.execute("SELECT status FROM societies WHERE id=%s", (sid,))
                 soc_data = cur.fetchone()
                 if not soc_data:
                     raise HTTPException(404, "Society not found")
                 if soc_data["status"] == 'RETIRED':
-                    raise HTTPException(status_code=403, "Cannot edit or reactivate a retired society.")
+                    # FIX: Added detail= keyword argument
+                    raise HTTPException(status_code=403, detail="Cannot edit or reactivate a retired society.")
 
                 cur.execute("""UPDATE societies SET name=%s, location=%s, config_version=config_version+1 WHERE id=%s""",
                             (society["name"], society["location"], sid))
@@ -540,7 +550,6 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 dev_id = dev["device_id"]
                 if not dev_id: continue
                 
-                # FIX: Validate device existence and retirement status explicitly
                 cur.execute("SELECT status FROM pi_devices WHERE id=%s", (dev_id,))
                 db_dev = cur.fetchone()
                 if not db_dev:
@@ -625,11 +634,19 @@ def get_devices(user: dict = Depends(require_role("super_admin"))):
 def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
     conn = get_db()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             society_id_raw = data.get("society_id")
             if society_id_raw and society_id_raw != "":
                 society_id = int(society_id_raw)
                 status = "ASSIGNED"
+                
+                # FIX: Prevent assigning to a retired society
+                cur.execute("SELECT status FROM societies WHERE id=%s", (society_id,))
+                soc = cur.fetchone()
+                if not soc:
+                    raise HTTPException(404, "Society not found.")
+                if soc["status"] == "RETIRED":
+                    raise HTTPException(400, "Cannot assign device to a retired society.")
             else:
                 society_id = None
                 status = "INVENTORY"
@@ -855,7 +872,7 @@ def pi_sync(request: Request, payload: dict, x_device_id: str = Header(None, ali
     return reply
 
 # ================================================================
-# PI COMMAND ACK (Strict FSM & Hardware Verification)
+# PI COMMAND ACK (Strict FSM, Hardware Verification & Semantic Timestamps)
 # ================================================================
 
 @app.post("/api/pi/command-ack")
@@ -869,7 +886,6 @@ def pi_command_ack(payload: dict, x_device_id: str = Header(None, alias="X-Devic
     verification = str(payload.get("verification_state", "UNKNOWN"))
     error = payload.get("error")
 
-    # FIX: Enforce actual hardware verification evidence
     if status == "HARDWARE_VERIFIED":
         if verification not in VALID_HARDWARE_VERIFICATIONS:
             raise HTTPException(400, "HARDWARE_VERIFIED requires valid physical or GPIO confirmation.")
@@ -898,9 +914,25 @@ def pi_command_ack(payload: dict, x_device_id: str = Header(None, alias="X-Devic
                     day = int(cmd_data["params"].get("day", 15))
                     cur.execute("UPDATE societies SET reset_day = %s, config_version = config_version + 1 WHERE id = %s", (day, society_id))
 
-            cur.execute("""UPDATE pi_commands SET status = %s, acked_at = %s, error = %s, result = %s 
-                           WHERE id = %s AND device_id = %s""",
-                        (status.lower(), datetime.now(timezone.utc), error if status != "COMPLETED" else None, verification, command_id, device_id))
+            # FIX: Semantic timestamp mapping
+            ts_column = None
+            if status == "EXECUTING": ts_column = "started_at"
+            elif status == "HARDWARE_VERIFIED": ts_column = "hardware_verified_at"
+            elif status in ["COMPLETED", "FAILED", "EXPIRED"]: ts_column = "completed_at"
+            elif status == "ACKED": ts_column = "acked_at"
+            
+            ts_value = datetime.now(timezone.utc)
+            
+            if ts_column:
+                query = f"""UPDATE pi_commands SET status = %s, {ts_column} = %s, error = %s, result = %s 
+                            WHERE id = %s AND device_id = %s"""
+                params = (status.lower(), ts_value, error if status != "COMPLETED" else None, verification, command_id, device_id)
+            else:
+                query = """UPDATE pi_commands SET status = %s, error = %s, result = %s 
+                           WHERE id = %s AND device_id = %s"""
+                params = (status.lower(), error, verification, command_id, device_id)
+
+            cur.execute(query, params)
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -932,8 +964,15 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM pi_devices WHERE id=%s AND society_id=%s", (device_id, sid))
-            if not cur.fetchone(): raise HTTPException(404, "Device not found in this society")
+            # FIX: Enforce device status = ASSIGNED and society status = active
+            cur.execute("""
+                SELECT d.id 
+                FROM pi_devices d 
+                JOIN societies s ON d.society_id = s.id 
+                WHERE d.id=%s AND d.society_id=%s AND d.status='ASSIGNED' AND s.status='active'
+            """, (device_id, sid))
+            if not cur.fetchone(): 
+                raise HTTPException(404, "Device not found, not assigned, or society is retired.")
             
             command_id = str(uuid.uuid4())
             cur.execute("""INSERT INTO pi_commands (id, device_id, command, slot, params, status, created_at, expires_at) 
