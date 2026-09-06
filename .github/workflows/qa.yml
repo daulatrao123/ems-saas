@@ -15,7 +15,7 @@ jobs:
       - name: Install backend dependencies
         run: pip install -r backend/requirements.txt
       - name: Syntax gate
-        run: python -m py_compile backend/main.py backend/alembic/env.py backend/alembic/versions/0001_industrial_schema.py pi_firmware/*.py frontend/test_system.py
+        run: python -m py_compile backend/main.py backend/alembic/env.py backend/alembic/versions/0001_ems_baseline.py pi_firmware/*.py frontend/test_system.py
       - name: Strict release gate
         run: python qa/strict_6_4_1_check.py
       - name: Shell syntax

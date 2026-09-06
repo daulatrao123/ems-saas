@@ -3,27 +3,31 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api";
 import Sidebar from "@/components/Sidebar";
+import { getSession, Session } from "@/lib/auth";
 
 export default function SuperAdminDashboard() {
   const router = useRouter();
+  const [session, setSession] = useState<Session | null>(null);
   const [societies, setSocieties] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    const token = localStorage.getItem("token");
-    const role = localStorage.getItem("role");
-    if (!token || role !== "super_admin") { router.push("/login"); return; }
-    api.get("/api/super-admin/societies")
-      .then((res) => setSocieties(res.data || []))
-      .catch(() => setError("Failed to load EMS inventory."))
-      .finally(() => setLoading(false));
+    getSession().then((s) => {
+      const role = s?.role;
+      if (!s || role !== "super_admin") { router.push("/login"); return; }
+      setSession(s);
+      api.get("/api/super-admin/societies")
+        .then((res) => setSocieties(res.data || []))
+        .catch(() => setError("Failed to load EMS inventory."))
+        .finally(() => setLoading(false));
+    });
   }, [router]);
 
   if (loading) return <div className="flex h-screen items-center justify-center text-gray-500">Loading EMS inventory...</div>;
   return (
     <div className="flex h-screen overflow-hidden bg-[#0a0e17]">
-      <Sidebar role="super_admin" />
+      <Sidebar role="super_admin" name={session?.name || ""} />
       <main className="flex-1 overflow-y-auto p-6 pt-20">
         <h1 className="text-2xl font-bold text-white">Super Admin</h1>
         <p className="text-xs text-gray-500 mb-6">Society and Pi inventory overview</p>

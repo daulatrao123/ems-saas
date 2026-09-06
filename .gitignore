@@ -10,3 +10,9 @@ credentials.json
 *.pem
 *.key
 .credentials
+
+# internal agent memory / generated QA artifacts — never ship
+memory/
+test_reports/
+.pytest_cache/
+.ruff_cache/

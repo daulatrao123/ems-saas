@@ -5,10 +5,12 @@ EMS SaaS Backend v6.2.3 — Industrial Production (Strict Multi-Pi & 4-Slot Cont
 import os
 import time
 import uuid
+import hmac
 import hashlib
+import secrets
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,6 +40,20 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5500",
     "http://localhost:5500",
 ]
+
+# Browser session (T4): HttpOnly cookies, short access JWT, rotating opaque refresh token.
+ACCESS_TOKEN_MINUTES = 15
+REFRESH_TOKEN_DAYS = 7
+ACCESS_COOKIE = "ems_access"
+REFRESH_COOKIE = "ems_refresh"
+CSRF_COOKIE = "ems_csrf"
+CSRF_HEADER = "X-CSRF-Token"
+REFRESH_COOKIE_PATH = "/api/auth"
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() != "false"
+TRUSTED_ORIGINS = {
+    o.strip().rstrip("/") for o in os.getenv("EMS_TRUSTED_ORIGINS", ",".join(ALLOWED_ORIGINS)).split(",") if o.strip()
+}
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="EMS SaaS API", version="6.4.0-targeted")
@@ -292,7 +308,7 @@ def _cors_headers(origin: str) -> dict:
         "Access-Control-Allow-Origin": valid,
         "Access-Control-Allow-Credentials": "true",
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Api-Key",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Api-Key, X-CSRF-Token",
     }
 
 @app.exception_handler(HTTPException)
@@ -309,17 +325,79 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Api-Key"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Api-Key", "X-CSRF-Token"],
 )
 
 # ================================================================
 # UTILITIES
 # ================================================================
 
-def create_token(data: dict) -> str:
-    payload = data.copy()
-    payload["exp"] = datetime.now(timezone.utc) + timedelta(days=30)
+def create_access_token(user: dict) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user["id"]), "id": user["id"], "role": user["role"],
+        "society_id": user["society_id"], "type": "access",
+        "iat": now, "exp": now + timedelta(minutes=ACCESS_TOKEN_MINUTES),
+    }
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+def hash_refresh_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def _referer_origin(request: Request) -> str:
+    referer = request.headers.get("referer", "")
+    parts = referer.split("/", 3)
+    return f"{parts[0]}//{parts[2]}" if len(parts) >= 3 and parts[1] == "" else ""
+
+def assert_trusted_origin(request: Request) -> None:
+    # Origin and Referer are browser-controlled (forbidden) headers, so neither can be
+    # forged by a cross-site page. Origin is authoritative; Referer covers proxies that
+    # rewrite Origin (observed on the preview ingress). Matching is exact (scheme+host+port).
+    # Missing both => reject: every browser session endpoint (login included) needs a source.
+    origin = (request.headers.get("origin") or "").rstrip("/")
+    referer_origin = _referer_origin(request)
+    if origin in TRUSTED_ORIGINS or referer_origin in TRUSTED_ORIGINS:
+        return
+    raise HTTPException(status_code=403, detail="Untrusted origin")
+
+def assert_csrf(request: Request) -> None:
+    cookie = request.cookies.get(CSRF_COOKIE, "")
+    header = request.headers.get(CSRF_HEADER, "")
+    if not cookie or not header or not hmac.compare_digest(cookie, header):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+
+def set_session_cookies(response: Response, access_token: str, refresh_token: str, csrf_token: str) -> None:
+    refresh_max_age = REFRESH_TOKEN_DAYS * 86400
+    response.set_cookie(ACCESS_COOKIE, access_token, max_age=ACCESS_TOKEN_MINUTES * 60, path="/",
+                        httponly=True, secure=COOKIE_SECURE, samesite="lax")
+    response.set_cookie(REFRESH_COOKIE, refresh_token, max_age=refresh_max_age, path=REFRESH_COOKIE_PATH,
+                        httponly=True, secure=COOKIE_SECURE, samesite="lax")
+    response.set_cookie(CSRF_COOKIE, csrf_token, max_age=refresh_max_age, path="/",
+                        httponly=False, secure=COOKIE_SECURE, samesite="lax")
+
+def clear_session_cookies(response: Response) -> None:
+    response.delete_cookie(ACCESS_COOKIE, path="/", secure=COOKIE_SECURE, samesite="lax")
+    response.delete_cookie(REFRESH_COOKIE, path=REFRESH_COOKIE_PATH, secure=COOKIE_SECURE, samesite="lax")
+    response.delete_cookie(CSRF_COOKIE, path="/", secure=COOKIE_SECURE, samesite="lax")
+
+def issue_refresh_token(cur, user_id: int, family_id: str, replaces: str | None = None) -> str:
+    raw = secrets.token_urlsafe(48)
+    now = datetime.now(timezone.utc)
+    new_id = str(uuid.uuid4())
+    cur.execute("""INSERT INTO auth_refresh_tokens (id, user_id, family_id, token_hash, created_at, expires_at)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (new_id, user_id, family_id, hash_refresh_token(raw), now, now + timedelta(days=REFRESH_TOKEN_DAYS)))
+    if replaces:
+        cur.execute("UPDATE auth_refresh_tokens SET used_at=%s, replaced_by=%s WHERE id=%s", (now, new_id, replaces))
+    return raw
+
+def revoke_refresh_family(cur, family_id: str) -> None:
+    cur.execute("UPDATE auth_refresh_tokens SET revoked_at=%s WHERE family_id=%s AND revoked_at IS NULL",
+                (datetime.now(timezone.utc), family_id))
+
+def public_user(db_user: dict) -> dict:
+    return {"id": db_user["id"], "email": db_user["email"], "name": db_user["name"],
+            "role": db_user["role"], "society_id": db_user["society_id"]}
 
 def is_pi_online(pi_state: dict) -> bool:
     if not pi_state: return False
@@ -364,13 +442,21 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
-async def get_current_user(authorization: str = Header(None)) -> dict:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Valid token required")
+async def get_current_user(request: Request) -> dict:
+    token = request.cookies.get(ACCESS_COOKIE)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
     try:
-        return jwt.decode(authorization[7:], SECRET_KEY, algorithms=["HS256"])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    # Cookie-authenticated state changes need CSRF proof and a trusted browser origin.
+    if request.method.upper() in UNSAFE_METHODS:
+        assert_trusted_origin(request)
+        assert_csrf(request)
+    return {"id": payload.get("id"), "role": payload.get("role"), "society_id": payload.get("society_id")}
 
 def require_role(*roles):
     async def checker(user: dict = Depends(get_current_user)):
@@ -495,12 +581,13 @@ def bootstrap(request: Request):
     return {"message": "Initialized. Change default passwords.", "device_id": device_id, "api_key": raw_api_key}
 
 # ================================================================
-# AUTH LOGIN
+# AUTH — BROWSER SESSION (HttpOnly cookies, refresh rotation, CSRF)
 # ================================================================
 
 @app.post("/api/auth/login")
 @limiter.limit("5/minute")
-def login(request: Request, user: UserLogin):
+def login(request: Request, response: Response, user: UserLogin):
+    assert_trusted_origin(request)
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -508,17 +595,93 @@ def login(request: Request, user: UserLogin):
             db_user = cur.fetchone()
             if not db_user or not bcrypt.checkpw(user.password.encode(), db_user["password"].encode()):
                 raise HTTPException(status_code=401, detail="Invalid credentials")
-
-            token = create_token({
-                "id": db_user["id"], "role": db_user["role"],
-                "society_id": db_user["society_id"]
-            })
-            return {
-                "token": token, "role": db_user["role"],
-                "name": db_user["name"], "society_id": db_user["society_id"],
-            }
+            refresh_raw = issue_refresh_token(cur, db_user["id"], str(uuid.uuid4()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+    set_session_cookies(response, create_access_token(db_user), refresh_raw, secrets.token_urlsafe(32))
+    return public_user(db_user)
+
+@app.post("/api/auth/refresh")
+@limiter.limit("30/minute")
+def refresh_session(request: Request, response: Response):
+    assert_trusted_origin(request)
+    assert_csrf(request)
+    raw = request.cookies.get(REFRESH_COOKIE, "")
+    if not raw:
+        clear_session_cookies(response)
+        raise HTTPException(status_code=401, detail="No refresh session")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM auth_refresh_tokens WHERE token_hash = %s FOR UPDATE", (hash_refresh_token(raw),))
+            row = cur.fetchone()
+            if not row:
+                clear_session_cookies(response)
+                raise HTTPException(status_code=401, detail="Invalid refresh session")
+            if row["revoked_at"] is not None or row["used_at"] is not None:
+                # Reuse of a rotated/revoked token: treat the whole family as compromised.
+                revoke_refresh_family(cur, str(row["family_id"]))
+                conn.commit()
+                clear_session_cookies(response)
+                raise HTTPException(status_code=401, detail="Refresh token reuse detected; session revoked")
+            if row["expires_at"] <= datetime.now(timezone.utc):
+                clear_session_cookies(response)
+                raise HTTPException(status_code=401, detail="Refresh session expired")
+            cur.execute("SELECT * FROM users WHERE id = %s", (row["user_id"],))
+            db_user = cur.fetchone()
+            if not db_user:
+                revoke_refresh_family(cur, str(row["family_id"]))
+                conn.commit()
+                clear_session_cookies(response)
+                raise HTTPException(status_code=401, detail="User no longer exists")
+            new_raw = issue_refresh_token(cur, db_user["id"], str(row["family_id"]), replaces=str(row["id"]))
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    set_session_cookies(response, create_access_token(db_user), new_raw, secrets.token_urlsafe(32))
+    return public_user(db_user)
+
+@app.post("/api/auth/logout")
+@limiter.limit("30/minute")
+def logout(request: Request, response: Response):
+    assert_trusted_origin(request)
+    assert_csrf(request)
+    raw = request.cookies.get(REFRESH_COOKIE, "")
+    if raw:
+        conn = get_db()
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT family_id FROM auth_refresh_tokens WHERE token_hash = %s", (hash_refresh_token(raw),))
+                row = cur.fetchone()
+                if row:
+                    revoke_refresh_family(cur, str(row["family_id"]))
+            conn.commit()
+        finally:
+            conn.close()
+    clear_session_cookies(response)
+    return {"message": "Logged out"}
+
+@app.get("/api/auth/me")
+def me(user: dict = Depends(get_current_user)):
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user["id"],))
+            db_user = cur.fetchone()
+    finally:
+        conn.close()
+    if not db_user:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    return public_user(db_user)
 
 # ================================================================
 # SUPER-ADMIN — SOCIETIES (Multi-Pi & 4-Slot)

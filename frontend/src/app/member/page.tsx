@@ -3,27 +3,31 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api";
 import Sidebar from "@/components/Sidebar";
+import { getSession, Session } from "@/lib/auth";
 
 export default function MemberDashboard() {
   const router = useRouter();
+  const [session, setSession] = useState<Session | null>(null);
   const [devices, setDevices] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem("token");
-    const role = localStorage.getItem("role");
-    const sid = localStorage.getItem("society_id");
-    if (!token || !sid || role !== "member") { router.push("/login"); return; }
-    api.get(`/api/admin/dashboard?society_id=${encodeURIComponent(sid)}`)
-      .then((res) => setDevices(res.data.devices || []))
-      .catch(() => setDevices([]))
-      .finally(() => setLoading(false));
+    getSession().then((s) => {
+      const role = s?.role;
+      const sid = s?.society_id != null ? String(s.society_id) : null;
+      if (!s || !sid || role !== "member") { router.push("/login"); return; }
+      setSession(s);
+      api.get(`/api/admin/dashboard?society_id=${encodeURIComponent(sid)}`)
+        .then((res) => setDevices(res.data.devices || []))
+        .catch(() => setDevices([]))
+        .finally(() => setLoading(false));
+    });
   }, [router]);
 
   if (loading) return <div className="flex h-screen items-center justify-center text-gray-500">Loading Dashboard...</div>;
   return (
     <div className="flex h-screen overflow-hidden bg-[#0a0e17]">
-      <Sidebar role="member" />
+      <Sidebar role="member" name={session?.name || ""} />
       <main className="flex-1 overflow-y-auto p-6 pt-20">
         <h1 className="text-2xl font-bold text-white mb-2">EMS Status</h1>
         <p className="text-xs text-gray-500 mb-6">Read-only access</p>

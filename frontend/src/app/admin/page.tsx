@@ -1,26 +1,30 @@
 "use client";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import api from "@/lib/api"; // Adjust import path if needed
+import api from "@/lib/api";
+import Sidebar from "@/components/Sidebar";
+import { getSession, Session } from "@/lib/auth";
 
 export default function AdminDashboard() {
   const router = useRouter();
+  const [session, setSession] = useState<Session | null>(null);
   const [devices, setDevices] = useState<any[]>([]);
   const [societyId, setSocietyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<any>(null);
 
   useEffect(() => {
-    const sid = localStorage.getItem("society_id");
-    const role = localStorage.getItem("role");
-    const token = localStorage.getItem("token");
-    
-    if (!token || !sid || role !== "society_admin") {
-      router.push("/login");
-      return;
-    }
-    setSocietyId(sid);
-    fetchDashboard(sid);
+    getSession().then((s) => {
+      const role = s?.role;
+      const sid = s?.society_id != null ? String(s.society_id) : null;
+      if (!s || !sid || role !== "society_admin") {
+        router.push("/login");
+        return;
+      }
+      setSession(s);
+      setSocietyId(sid);
+      fetchDashboard(sid);
+    });
   }, [router]);
 
   const fetchDashboard = async (sid: string) => {
@@ -58,6 +62,7 @@ export default function AdminDashboard() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-[#0a0e17]">
+      <Sidebar role="society_admin" name={session?.name || ""} />
       <main className="flex-1 overflow-y-auto p-6 pt-20">
         <div className="mb-6">
           <h1 className="text-2xl font-bold text-white">Society Dashboard</h1>

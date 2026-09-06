@@ -2,19 +2,20 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { logout } from "@/lib/auth";
 
-export default function Sidebar({ role }: { role: string }) {
+export default function Sidebar({ role, name = "" }: { role: string; name?: string }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
   useEffect(() => { setOpen(false); }, [pathname]);
   useEffect(() => { document.body.style.overflow = open ? "hidden" : ""; return () => { document.body.style.overflow = ""; }; }, [open]);
 
-  const name = typeof window !== "undefined" ? localStorage.getItem("name") || "" : "";
   const superAdminLinks = [{ href: "/super-admin", label: "All Societies", icon: "\uD83C\uDFE2" }];
   const adminLinks = [{ href: "/admin", label: "Dashboard", icon: "\uD83D\uDCCA" }];
-  const links = role === "super_admin" ? superAdminLinks : adminLinks;
+  const memberLinks = [{ href: "/member", label: "Status", icon: "\uD83D\uDCCA" }];
+  const links = role === "super_admin" ? superAdminLinks : role === "member" ? memberLinks : adminLinks;
   const close = () => setOpen(false);
-  const handleLogout = () => { localStorage.clear(); window.location.href = "/login"; };
+  const handleLogout = () => { void logout(); };
 
   return (
     <>
@@ -35,7 +36,7 @@ export default function Sidebar({ role }: { role: string }) {
           <h1 className="text-lg font-bold text-cyan-400">EMS Cloud</h1>
         </div>
         <div className="p-4">
-          <div className="text-xs text-gray-500 uppercase tracking-wider mb-2">{role === "super_admin" ? "Super Admin" : "Society Admin"}</div>
+          <div className="text-xs text-gray-500 uppercase tracking-wider mb-2">{role === "super_admin" ? "Super Admin" : role === "society_admin" ? "Society Admin" : "Member"}</div>
           {name && <div className="text-sm text-gray-300 mb-4">{name}</div>}
           <nav className="space-y-1">
             {links.map((link) => (

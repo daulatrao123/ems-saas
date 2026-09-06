@@ -1,27 +1,36 @@
 "use client";
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import api from "@/lib/api"; // Adjust import path if needed
+import { useParams, useRouter } from "next/navigation";
+import api from "@/lib/api";
+import Sidebar from "@/components/Sidebar";
+import { getSession, Session } from "@/lib/auth";
 
 export default function SocietyDashboard() {
   const router = useRouter();
+  const params = useParams<{ id: string }>();
+  const [session, setSession] = useState<Session | null>(null);
   const [devices, setDevices] = useState<any[]>([]);
   const [societyId, setSocietyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<any>(null);
 
   useEffect(() => {
-    const sid = localStorage.getItem("society_id");
-    const role = localStorage.getItem("role");
-    const token = localStorage.getItem("token");
-    
-    if (!token || !sid) {
-      router.push("/login");
-      return;
-    }
-    setSocietyId(sid);
-    fetchDashboard(sid);
-  }, [router]);
+    getSession().then((s) => {
+      if (!s) {
+        router.push("/login");
+        return;
+      }
+      // Super admins may open any society; everyone else is pinned to their own.
+      const sid = s.role === "super_admin" ? String(params.id) : s.society_id != null ? String(s.society_id) : null;
+      if (!sid) {
+        router.push("/login");
+        return;
+      }
+      setSession(s);
+      setSocietyId(sid);
+      fetchDashboard(sid);
+    });
+  }, [router, params.id]);
 
   const fetchDashboard = async (sid: string) => {
     try {
@@ -58,6 +67,7 @@ export default function SocietyDashboard() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-[#0a0e17]">
+      <Sidebar role={session?.role || "member"} name={session?.name || ""} />
       <main className="flex-1 overflow-y-auto p-6 pt-20">
         <div className="mb-6">
           <h1 className="text-2xl font-bold text-white">Society Dashboard</h1>

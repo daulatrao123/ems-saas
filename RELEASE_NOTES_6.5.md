@@ -1,5 +1,21 @@
 # EMS SaaS Industrial 6.5 — Hardened Candidate
 
+> ## IMPLEMENTATION STATUS — READ FIRST
+>
+> This document describes the **intended 6.5 hardening target**.
+> It is **NOT** a certification or a statement that every listed security
+> control is currently implemented in the repository.
+>
+> Current status must be verified against the actual source tree.
+> As of the T1–T3 baseline (June 2026) the following items below are
+> **target only / not yet present in code**: startup-DDL removal
+> (`ensure_db_schema()` still runs), HttpOnly cookie authentication,
+> refresh-token rotation, logout revocation, Origin guard, `auth_sessions`
+> table, firmware SHA-256/Ed25519 signing and signed OTA manifests.
+> Present in code: Alembic single-root migration (`0001_ems_baseline`),
+> migration-first `start.sh`/`render.yaml`, strict command FSM, retired-device
+> guard, feedback-capability clamping.
+
 ## What changed
 
 ### P0 database migration architecture

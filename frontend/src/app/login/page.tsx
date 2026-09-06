@@ -1,28 +1,38 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api";
+import { getSession, homeFor } from "@/lib/auth";
 
 export default function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const router = useRouter();
+
+  useEffect(() => {
+    const expired = new URLSearchParams(window.location.search).get("expired");
+    getSession().then((s) => {
+      if (s) router.replace(homeFor(s.role));
+      else if (expired) setError("Your session expired. Please sign in again.");
+    });
+  }, [router]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setSubmitting(true);
+    setError("");
     try {
       const res = await api.post("/api/auth/login", { email, password });
-      localStorage.setItem("token", res.data.token);
-      localStorage.setItem("role", res.data.role);
-      localStorage.setItem("name", res.data.name);
-      if (res.data.society_id != null) localStorage.setItem("society_id", String(res.data.society_id));
       if (res.data.role === "super_admin") router.push("/super-admin");
       else if (res.data.role === "society_admin") router.push("/admin");
       else if (res.data.role === "member") router.push("/member");
       else router.push("/login");
     } catch {
       setError("Invalid email or password");
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -64,9 +74,10 @@ export default function Login() {
           </div>
           <button
             type="submit"
-            className="w-full bg-cyan-500 hover:bg-cyan-600 text-black font-bold py-3 rounded-lg"
+            disabled={submitting}
+            className="w-full bg-cyan-500 hover:bg-cyan-600 disabled:opacity-60 text-black font-bold py-3 rounded-lg"
           >
-            Sign In
+            {submitting ? "Signing in..." : "Sign In"}
           </button>
         </form>
       </div>
