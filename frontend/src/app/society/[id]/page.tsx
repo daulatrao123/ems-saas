@@ -13,9 +13,8 @@ export default function SocietyDashboard() {
   useEffect(() => {
     const sid = localStorage.getItem("society_id");
     const role = localStorage.getItem("role");
-    const token = localStorage.getItem("token");
     
-    if (!token || !sid) {
+    if (!sid) {
       router.push("/login");
       return;
     }

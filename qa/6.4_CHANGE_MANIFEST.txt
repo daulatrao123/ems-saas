@@ -1,41 +1,25 @@
-# EMS 6.4.1 strict source change manifest
-# Base: main commit cb15919032596021e732321a4c7c84e60429f5f6
+# EMS 6.4 source-level change manifest
+# base cb15919032596021e732321a4c7c84e60429f5f6
 
-CORE APPLICATION CHANGES
-backend/main.py
-pi_firmware/api_client.py
-pi_firmware/ems_controller.py
-pi_firmware/offline_queue.py
-pi_firmware/state.py
-pi_firmware/setup_pi.sh
-frontend/test_system.py
+pi_firmware/gpio_manager.py: UNCHANGED
+pi_firmware/storage_io_manager.py: UNCHANGED
+pi_firmware/storage_manager.py: UNCHANGED
+pi_firmware/logger.py: UNCHANGED
+pi_firmware/memory_manager.py: UNCHANGED
+pi_firmware/resource_guard.py: UNCHANGED
 
-DATABASE MIGRATION
-backend/alembic.ini
-backend/alembic/env.py
-backend/alembic/script.py.mako
-backend/alembic/versions/0001_industrial_schema.py
-backend/requirements.txt
-backend/render.yaml
+# Working-tree source changes tracked against main:
+M	backend/main.py
+M	frontend/test_system.py
+M	pi_firmware/api_client.py
+M	pi_firmware/ems_controller.py
+M	pi_firmware/offline_queue.py
+M	pi_firmware/setup_pi.sh
+M	pi_firmware/state.py
 
-DEPLOYMENT / SERVICE
+# New files included in release:
 pi_firmware/ems-controller.service
-
-QA / RELEASE
-qa/strict_6_4_1_check.py
-qa/6.4.1_REVIEW_GUIDE.md
-RELEASE_NOTES_6.4.1.md
-
-REMOVED
-pi_firmware/storage_health.py
 qa/strict_6_4_check.py
-qa/6.4_vs_main.diff (stale initial diff removed; do not use as a current comparison)
-
-PROTECTED LOW-LEVEL FILES
-The following remain hash-locked in this candidate:
-pi_firmware/gpio_manager.py
-pi_firmware/storage_io_manager.py
-pi_firmware/storage_manager.py
-pi_firmware/logger.py
-pi_firmware/memory_manager.py
-pi_firmware/resource_guard.py
+RELEASE_NOTES_6.4.md
+# Removed:
+pi_firmware/storage_health.py

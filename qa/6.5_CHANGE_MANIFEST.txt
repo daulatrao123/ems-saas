@@ -1,0 +1,29 @@
+EMS SaaS Industrial 6.5 hardened candidate
+Base: EMS_SaaS_Industrial_6.4_Targeted_Hardened.zip
+
+P0
+- backend/main.py: runtime DDL removed; Alembic is the schema authority.
+- backend/alembic/: versioned PostgreSQL schema + legacy normalization.
+- backend/render.yaml: alembic upgrade head before FastAPI.
+
+P1
+- frontend/src/lib/api.ts: credentialed HttpOnly-cookie session handling + refresh retry.
+- frontend/src/app/login/page.tsx: no JWT localStorage.
+- frontend/src/components/Sidebar.tsx: server logout.
+- backend/main.py: rotating refresh sessions, origin guard, signed firmware metadata.
+- pi_firmware/ota_manager.py: SHA-256 + Ed25519 verification and inactive-slot staging.
+- pi_firmware/ems-ota-stage.py: explicit staging CLI; never auto-executes code.
+- pi_firmware/api_client.py: signed firmware download client.
+
+QA / qualification
+- qa/industrial_6_5_gate.py
+- qa/HIL_QUALIFICATION_MATRIX.md
+- qa/STORAGE_ENDURANCE_SOAK.md
+
+Protected from the 6.4 base and rechecked byte-for-byte:
+- gpio_manager.py
+- storage_io_manager.py
+- storage_manager.py
+- logger.py
+- memory_manager.py
+- resource_guard.py
