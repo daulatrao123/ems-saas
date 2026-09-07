@@ -85,210 +85,60 @@ VALID_COMMANDS = {
 }
 
 # ================================================================
-# DATABASE & SCHEMA INITIALIZATION
+# DATABASE & SCHEMA OWNERSHIP
 # ================================================================
+# Alembic is the sole owner of the schema. The application never issues DDL; it
+# only verifies at boot that the database is at this build's single migration head
+# and refuses to serve otherwise (start.sh runs `alembic upgrade head` first).
+
+ALEMBIC_INI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alembic.ini")
 
 def get_db():
     conn = psycopg.connect(DATABASE_URL, connect_timeout=10, row_factory=dict_row)
     conn.autocommit = False
     return conn
 
+def expected_schema_revision() -> tuple[str, set[str]]:
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    script = ScriptDirectory.from_config(Config(ALEMBIC_INI))
+    heads = script.get_heads()
+    if len(heads) != 1:
+        raise RuntimeError(f"Migration tree must have exactly one head, found {heads}")
+    return heads[0], {rev.revision for rev in script.walk_revisions()}
+
 @app.on_event("startup")
-def ensure_db_schema():
-    conn = get_db()
+def verify_schema_revision():
+    head, known = expected_schema_revision()
+    try:
+        conn = get_db()
+    except Exception as e:
+        raise RuntimeError(f"Database unreachable during startup schema check: {e}")
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS societies (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT, location TEXT, plan TEXT, status TEXT,
-                    tailscale_ip TEXT, pi_port INT, society_code TEXT,
-                    config_version INT DEFAULT 1
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    email TEXT UNIQUE, name TEXT, password TEXT, role TEXT, society_id INT
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pi_devices (
-                    id UUID PRIMARY KEY,
-                    society_id INT,
-                    name TEXT,
-                    api_key_hash TEXT UNIQUE,
-                    firmware_version TEXT,
-                    last_seen TIMESTAMPTZ,
-                    status TEXT DEFAULT 'INVENTORY',
-                    hardware_profile TEXT DEFAULT 'EMS-4CH-v1',
-                    feedback_hardware_installed BOOLEAN DEFAULT FALSE
-                );
-            """)
-
-            # PRODUCTION v6.2.3: Bulletproof Migration
-            cur.execute("""
-                DO $$ BEGIN
-                    -- 1. Handle slot_configs collision
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs') THEN
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
-                            ALTER TABLE wing_configs RENAME TO slot_configs;
-                        ELSE
-                            ALTER TABLE wing_configs RENAME TO wing_configs_abandoned;
-                        END IF;
-                    END IF;
-
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_configs_old') THEN
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_configs') THEN
-                            ALTER TABLE wing_configs_old RENAME TO slot_configs;
-                        ELSE
-                            ALTER TABLE wing_configs_old RENAME TO wing_configs_old_abandoned;
-                        END IF;
-                    END IF;
-
-                    -- 2. Handle slot_state collision
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state') THEN
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
-                            ALTER TABLE wing_state RENAME TO slot_state;
-                        ELSE
-                            ALTER TABLE wing_state RENAME TO wing_state_abandoned;
-                        END IF;
-                    END IF;
-
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wing_state_old') THEN
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='slot_state') THEN
-                            ALTER TABLE wing_state_old RENAME TO slot_state;
-                        ELSE
-                            ALTER TABLE wing_state_old RENAME TO wing_state_old_abandoned;
-                        END IF;
-                    END IF;
-
-                    -- 3. Normalize column names to 'slot' in slot_configs
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='wing_code') THEN
-                        ALTER TABLE slot_configs RENAME COLUMN wing_code TO slot;
-                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_configs' AND column_name='slot_code') THEN
-                        ALTER TABLE slot_configs RENAME COLUMN slot_code TO slot;
-                    END IF;
-
-                    -- 4. Normalize column names to 'slot' in slot_state
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='wing_code') THEN
-                        ALTER TABLE slot_state RENAME COLUMN wing_code TO slot;
-                    ELSIF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='slot_state' AND column_name='slot_code') THEN
-                        ALTER TABLE slot_state RENAME COLUMN slot_code TO slot;
-                    END IF;
-
-                    -- 5. Normalize column names in pi_commands
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_commands' AND column_name='wing') THEN
-                        ALTER TABLE pi_commands RENAME COLUMN wing TO slot;
-                    END IF;
-
-                    -- 6. Normalize column names in pi_state
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pi_state' AND column_name='active_wing') THEN
-                        ALTER TABLE pi_state RENAME COLUMN active_wing TO active_slot;
-                    END IF;
-                END $$;
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS slot_configs (
-                    device_id UUID,
-                    slot TEXT,
-                    display_name TEXT,
-                    target_days INT,
-                    disabled BOOL DEFAULT FALSE,
-                    feedback_enabled BOOL DEFAULT FALSE,
-                    PRIMARY KEY (device_id, slot),
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS slot_state (
-                    device_id UUID,
-                    slot TEXT,
-                    physical_toggle TEXT DEFAULT 'UNKNOWN',
-                    used_days INT DEFAULT 0,
-                    clicks INT DEFAULT 0,
-                    PRIMARY KEY (device_id, slot),
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pi_state (
-                    device_id UUID PRIMARY KEY,
-                    active_slot TEXT, reset_day INT, emergency_stop BOOL,
-                    uptime_seconds INT, cpu_temp FLOAT, disk_free_mb FLOAT,
-                    last_sync TIMESTAMPTZ, boot_count INT, last_shutdown_reason TEXT, clock_source TEXT,
-                    watchdog_enabled BOOL, last_reboot_reason TEXT,
-                    config_version INT DEFAULT 0,
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pi_events (
-                    id SERIAL PRIMARY KEY,
-                    device_id UUID, event_id TEXT UNIQUE, timestamp TIMESTAMPTZ, type TEXT, message TEXT,
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pi_commands (
-                    id UUID PRIMARY KEY,
-                    device_id UUID, command TEXT, slot TEXT, params JSONB,
-                    status TEXT DEFAULT 'queued',
-                    created_at TIMESTAMPTZ, delivered_at TIMESTAMPTZ, acked_at TIMESTAMPTZ, expires_at TIMESTAMPTZ,
-                    error TEXT, result TEXT,
-                    FOREIGN KEY (device_id) REFERENCES pi_devices(id) ON DELETE CASCADE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS firmware_versions (
-                    version TEXT PRIMARY KEY,
-                    code TEXT, changelog TEXT, forced BOOL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id SERIAL PRIMARY KEY,
-                    society_id INT, user_id INT, device_id UUID,
-                    action TEXT, details JSONB, created_at TIMESTAMPTZ
-                );
-            """)
-
-            # Auto-add missing columns safely
-            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 1")
-            cur.execute("ALTER TABLE societies ADD COLUMN IF NOT EXISTS reset_day INT")
-            cur.execute("UPDATE societies SET reset_day=%s WHERE reset_day IS NULL OR reset_day < 1 OR reset_day > 28", (DEFAULT_RESET_DAY,))
-            # PostgreSQL rejects bind parameters in DDL; DEFAULT_RESET_DAY is a trusted module constant.
-            cur.execute(f"ALTER TABLE societies ALTER COLUMN reset_day SET DEFAULT {int(DEFAULT_RESET_DAY)}")
-            cur.execute("ALTER TABLE pi_state ADD COLUMN IF NOT EXISTS config_version INT DEFAULT 0")
-            cur.execute("ALTER TABLE pi_devices ALTER COLUMN society_id DROP NOT NULL")
-            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'INVENTORY'")
-            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS hardware_profile TEXT DEFAULT 'EMS-4CH-v1'")
-            cur.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS feedback_hardware_installed BOOLEAN DEFAULT FALSE")
-            cur.execute("ALTER TABLE slot_configs ADD COLUMN IF NOT EXISTS feedback_enabled BOOL DEFAULT FALSE")
-
-            # Drop the unique constraint from v5.6 if it exists
-            cur.execute("DROP INDEX IF EXISTS uq_pi_devices_society_id")
-
-            cur.execute("""
-                DO $$ BEGIN
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_society') THEN
-                        ALTER TABLE users ADD CONSTRAINT fk_users_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
-                    END IF;
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_devices_society') THEN
-                        ALTER TABLE pi_devices ADD CONSTRAINT fk_devices_society FOREIGN KEY (society_id) REFERENCES societies(id) ON DELETE SET NULL;
-                    END IF;
-                END $$;
-            """)
-
-        conn.commit()
-        print("DB schema verified OK (Relational v6.2.3 Strict Slot Migration)")
-    except Exception as e:
+            cur.execute("SELECT to_regclass('public.alembic_version') AS t")
+            if cur.fetchone()["t"] is None:
+                raise RuntimeError(
+                    "SCHEMA GUARD: alembic_version table missing - database has never been migrated. "
+                    f"Run `alembic upgrade head` (expected {head}). Refusing to start.")
+            cur.execute("SELECT version_num FROM alembic_version")
+            versions = [r["version_num"] for r in cur.fetchall()]
         conn.rollback()
-        print(f"DB SCHEMA CHECK ERROR: {e}")
-        raise RuntimeError(f"Database schema initialization failed: {e}")
     finally:
         conn.close()
+    if len(versions) != 1:
+        raise RuntimeError(f"SCHEMA GUARD: alembic_version must hold exactly one revision, found {versions}. Refusing to start.")
+    current = versions[0]
+    if current == head:
+        print(f"SCHEMA GUARD OK: database at Alembic head {head}")
+        return
+    if current in known:
+        raise RuntimeError(
+            f"SCHEMA GUARD: database at {current} is BEHIND this build's head {head}. "
+            "Run `alembic upgrade head`. Refusing to start.")
+    raise RuntimeError(
+        f"SCHEMA GUARD: database at unknown revision {current} (AHEAD of or incompatible with this build, head {head}). "
+        "Deploy a build that knows this revision or restore the database. Refusing to start.")
 
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
