@@ -6,6 +6,8 @@ import api from "@/lib/api";
 import Sidebar from "@/components/Sidebar";
 import { getSession, Session } from "@/lib/auth";
 import { RegisterPiForm, DeviceTable, SocietyDevice } from "@/components/provisioning/AdminDevices";
+import { OperationalControls } from "@/components/operations/OperationalControls";
+import { SlotDaysInput } from "@/components/operations/Controls";
 
 type Slot = { display_name: string; target_days: number; used_days: number; physical_toggle: string; disabled: boolean };
 type DashboardDevice = {
@@ -69,22 +71,28 @@ export default function AdminDashboard() {
     if (societyId) fetchDashboard(societyId);
   };
 
-  const sendCommand = async (deviceId: string, slot: string, command: string) => {
-    if (!societyId) return;
+  const queueCommand = async (deviceId: string, command: string, slot: string, params: Record<string, unknown> = {}): Promise<boolean> => {
+    if (!societyId) return false;
     try {
-      await api.post("/api/admin/pi-command", {
+      const res = await api.post("/api/admin/pi-command", {
         idempotency_key: crypto.randomUUID(), // one logical click = one command, even if retried
         society_id: societyId,
         device_id: deviceId,
-        slot: slot,
-        command: command
+        slot,
+        command,
+        params
       });
-      showToast(`Command ${command} sent to Slot ${slot}`, true);
+      showToast(res.data.duplicate ? `${command} already queued` : `${command}${slot ? ` (slot ${slot})` : ""} queued #${res.data.sequence_no}`, true);
       setTimeout(() => fetchDashboard(societyId), 3000);
-    } catch {
-      showToast("Command failed", false);
+      return true;
+    } catch (err) {
+      const e = err as { response?: { data?: { detail?: string; error?: string } } };
+      showToast(e?.response?.data?.detail || e?.response?.data?.error || `${command} failed`, false);
+      return false;
     }
   };
+
+  const sendCommand = (deviceId: string, slot: string, command: string) => queueCommand(deviceId, command, slot, {});
 
   if (loading) return <div className="flex h-screen items-center justify-center text-gray-500">Loading Dashboard...</div>;
 
@@ -142,14 +150,18 @@ export default function AdminDashboard() {
                     </div>
 
                     {!isDisabled ? (
-                      <button
-                        onClick={() => sendCommand(dev.id, slotCode, isActive ? "off_slot" : "set_active_slot")}
-                        className={`w-full py-1.5 text-[10px] font-bold rounded transition-colors ${
-                          isActive ? "bg-red-500/20 text-red-400 hover:bg-red-500/30 border border-red-500/30" : "bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30 border border-cyan-500/30"
-                        }`}
-                      >
-                        {isActive ? "DEACTIVATE" : "ACTIVATE"}
-                      </button>
+                      <>
+                        <button
+                          data-testid={`cmd-${isActive ? "off_slot" : "set_active_slot"}-${dev.id}-${slotCode}`}
+                          onClick={() => sendCommand(dev.id, slotCode, isActive ? "off_slot" : "set_active_slot")}
+                          className={`w-full py-1.5 text-[10px] font-bold rounded transition-colors ${
+                            isActive ? "bg-red-500/20 text-red-400 hover:bg-red-500/30 border border-red-500/30" : "bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30 border border-cyan-500/30"
+                          }`}
+                        >
+                          {isActive ? "DEACTIVATE" : "ACTIVATE"}
+                        </button>
+                        <SlotDaysInput deviceId={dev.id} slot={slotCode} current={slot.target_days} queue={queueCommand} />
+                      </>
                     ) : (
                       <div className="w-full py-1.5 text-[10px] font-bold rounded bg-gray-700/50 text-gray-500 text-center">
                         DISABLED
@@ -159,6 +171,9 @@ export default function AdminDashboard() {
                 );
               })}
             </div>
+
+            <OperationalControls deviceId={dev.id} queue={queueCommand}
+              slots={["A", "B", "C", "D"].filter((c) => dev.slots[c]).map((c) => ({ code: c, name: dev.slots[c].display_name || `Slot ${c}`, disabled: dev.slots[c].disabled }))} />
           </div>
         ))}
 
