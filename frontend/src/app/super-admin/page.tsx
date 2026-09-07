@@ -7,7 +7,7 @@ import { Dot, btn, label, panel, tone } from "@/components/ops/DashboardHeader";
 import { DeviceStateBadges } from "@/components/StateBadges";
 import { CreateSocietyForm, CreateUserForm } from "@/components/provisioning/SuperAdminForms";
 
-type Device = { id: string; name: string; online: boolean; config_state?: string | null; ota_state?: string | null; storage_state?: string | null };
+type Device = { id: string; name: string; online: boolean; slots?: Record<string, unknown>; config_state?: string | null; ota_state?: string | null; storage_state?: string | null };
 type Society = { id: number; name: string; location: string; status?: string; pi_online: boolean; devices?: Device[] };
 
 function SocietyCard({ s, retired }: { s: Society; retired: boolean }) {
@@ -21,7 +21,7 @@ function SocietyCard({ s, retired }: { s: Society; retired: boolean }) {
         {!retired && <span className={`flex items-center gap-2 font-mono text-[11px] font-bold ${s.pi_online ? "text-emerald-400" : "text-red-400"}`}><Dot on={s.pi_online} />{s.pi_online ? "PI ONLINE" : "PI OFFLINE"}</span>}
       </div>
       <ul className="mt-3 space-y-1">
-        {s.devices?.map((d) => <li key={d.id} className="flex items-center justify-between font-mono text-[11px] text-gray-300"><span>{d.name}</span><span className="flex items-center gap-2"><DeviceStateBadges dev={d} /><span className={d.online ? "text-emerald-400" : "text-gray-500"}>{d.online ? "ONLINE" : "OFFLINE"}</span></span></li>)}
+        {s.devices?.map((d) => <li key={d.id} data-testid={`sa-device-${d.id}`} className="flex items-center justify-between font-mono text-[11px] text-gray-300"><span>{d.name} <span className="text-gray-500">· {Object.keys(d.slots || {}).length} slots</span></span><span className="flex items-center gap-2"><DeviceStateBadges dev={d} /><span data-testid={`sa-device-online-${d.id}`} className={d.online ? "text-emerald-400" : "text-gray-500"}>{d.online ? "ONLINE" : "OFFLINE"}</span></span></li>)}
         {!s.devices?.length && <li className="text-[11px] text-gray-600">No devices linked.</li>}
       </ul>
       {!retired && <Link data-testid={`open-ops-${s.id}`} href={`/society/${s.id}`} className={`${btn} ${tone.cyan} mt-3 inline-block`}>OPEN OPERATIONS →</Link>}

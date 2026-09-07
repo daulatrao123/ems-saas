@@ -14,6 +14,8 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
 from provisioning import build_provisioning_zip
+import logging
+_seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import bcrypt
@@ -592,8 +594,10 @@ def authenticate_pi(
             supplied_hash = hash_api_key(supplied_key)
             # Same response for unknown device / revoked / wrong secret (no enumeration).
             if not dev or not dev["secret_hash"] or not hmac.compare_digest(supplied_hash, str(dev["secret_hash"])):
+                _seclog.warning("PI_AUTH_REJECTED device_id=%s reason=bad_credential", x_device_id)
                 raise HTTPException(403, "Invalid Pi API key or Device ID.")
             if not dev["society_id"] or str(dev["status"]).upper() != "ASSIGNED":
+                _seclog.warning("PI_AUTH_REJECTED device_id=%s reason=not_assigned", x_device_id)
                 raise HTTPException(403, "Device is not assigned to an active society.")
             return dev["id"], dev["society_id"]
     finally:
