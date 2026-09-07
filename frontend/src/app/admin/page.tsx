@@ -1,4 +1,5 @@
 "use client";
+import { DeviceStateBadges } from "../../components/StateBadges";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api";
@@ -83,8 +84,11 @@ export default function AdminDashboard() {
                 <h2 className="text-lg font-bold text-white">{dev.name}</h2>
                 <p className="text-[10px] text-gray-500 font-mono">{dev.id}</p>
               </div>
-              <div className={`px-3 py-1 rounded-full text-[10px] font-bold ${dev.connected ? "bg-emerald-500/15 text-emerald-400" : "bg-red-500/15 text-red-400"}`}>
-                {dev.connected ? "ONLINE" : "OFFLINE"}
+              <div className="flex items-center gap-2">
+                <DeviceStateBadges dev={dev} />
+                <div className={`px-3 py-1 rounded-full text-[10px] font-bold ${dev.connected ? "bg-emerald-500/15 text-emerald-400" : "bg-red-500/15 text-red-400"}`}>
+                  {dev.connected ? "ONLINE" : "OFFLINE"}
+                </div>
               </div>
             </div>
 

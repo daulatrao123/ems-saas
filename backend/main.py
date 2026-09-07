@@ -7,6 +7,7 @@ import time
 import uuid
 import hmac
 import hashlib
+import threading
 import secrets
 import psycopg
 from psycopg.rows import dict_row
@@ -56,6 +57,55 @@ TRUSTED_ORIGINS = {
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 limiter = Limiter(key_func=get_remote_address)
+
+
+def pi_rate_key(request: Request) -> str:
+    """Per-device limit for Pi endpoints (many Pis share one NAT IP); falls back to IP."""
+    dev = (request.headers.get("X-Device-ID") or "").strip()
+    return f"dev:{dev}" if dev else get_remote_address(request)
+
+
+# T8 lightweight in-memory resource metrics: (day, device, metric) -> count. Never persisted,
+# pruned to today+yesterday, read via /api/super-admin/metrics. Zero DB cost per increment.
+from collections import defaultdict as _dd
+METRICS: dict = _dd(int)
+METRICS_LOCK = threading.Lock()
+
+
+def metric_inc(metric: str, device_id=None, n: int = 1):
+    day = datetime.now(timezone.utc).date().isoformat()
+    with METRICS_LOCK:
+        METRICS[(day, str(device_id) if device_id else "-", metric)] += n
+        if len(METRICS) > 50000:  # hard memory bound
+            for k in [k for k in METRICS if k[0] < day]:
+                METRICS.pop(k, None)
+
+
+TERMINAL_COMMAND_STATES = ("acked", "completed", "failed", "expired")
+ARCHIVE_AGE_DAYS = 30
+
+
+def archive_terminal_commands(cur, batch_size: int = 500) -> dict:
+    """One bounded, transaction-safe batch: pick -> INSERT ... SELECT -> delete EXACT ids that are
+    now present in the archive. Safe to run repeatedly/concurrently (SKIP LOCKED, ON CONFLICT)."""
+    batch_size = max(1, min(int(batch_size), 1000))
+    cur.execute(f"""
+        WITH picked AS (
+            SELECT id FROM pi_commands
+            WHERE status = ANY(%s) AND created_at < now() - interval '{ARCHIVE_AGE_DAYS} days'
+            ORDER BY created_at ASC LIMIT %s FOR UPDATE SKIP LOCKED
+        ),
+        ins AS (
+            INSERT INTO pi_commands_archive
+            SELECT c.*, now() FROM pi_commands c JOIN picked p ON p.id = c.id
+            ON CONFLICT (id) DO NOTHING RETURNING id
+        )
+        DELETE FROM pi_commands c USING picked p
+        WHERE c.id = p.id
+          AND (c.id IN (SELECT id FROM ins) OR EXISTS (SELECT 1 FROM pi_commands_archive a WHERE a.id = c.id))
+        RETURNING c.id
+    """, (list(TERMINAL_COMMAND_STATES), batch_size))
+    return {"archived": cur.rowcount, "batch_size": batch_size}
 app = FastAPI(title="EMS SaaS API", version="6.4.0-targeted")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -283,6 +333,7 @@ def revoke_device_credentials(cur, device_id: str, user: dict | None, reason: st
     return revoked
 
 def log_audit(cur, user: dict, society_id: int, action: str, details: dict):
+    metric_inc("audit_rows")
     cur.execute("""INSERT INTO audit_log (society_id, user_id, action, details, created_at)
                    VALUES (%s, %s, %s, %s, %s)""",
                 (society_id if society_id else 0, user.get("id"), action, psycopg.types.json.Json(details), datetime.now(timezone.utc)))
@@ -732,6 +783,9 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
                         "active_slot": pi.get("active_slot") if pi else None,
                         "hardware_profile": dev["hardware_profile"],
                         "feedback_hardware_installed": dev["feedback_hardware_installed"],
+                        "config_state": (pi.get("config_state") if pi else None) or "DESIRED",
+                        "ota_state": pi.get("ota_state") if pi else None,
+                        "storage_state": ("FAILED" if pi.get("disk_free_mb", 0) < 0 else "OK") if pi and pi.get("disk_free_mb") is not None else "UNKNOWN",
                         "slots": slots_data
                     })
 
@@ -911,6 +965,31 @@ def list_device_credentials(device_id: str, user: dict = Depends(require_role("s
     finally:
         conn.close()
 
+@app.get("/api/super-admin/metrics")
+def resource_metrics(user: dict = Depends(require_role("super_admin"))):
+    """In-memory per-device/day resource counters (process-local, reset on restart)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    with METRICS_LOCK:
+        rows = [{"day": k[0], "device_id": k[1], "metric": k[2], "value": v} for k, v in METRICS.items() if k[0] >= today]
+    return {"day": today, "counters": sorted(rows, key=lambda r: (r["device_id"], r["metric"]))}
+
+@app.post("/api/super-admin/maintenance/archive-commands")
+def maintenance_archive_commands(data: dict | None = None, user: dict = Depends(require_role("super_admin"))):
+    """Daily maintenance (invoke from a cron/Render job). One bounded batch per call; rerun-safe."""
+    batch = int((data or {}).get("batch_size", 500)) if isinstance(data, dict) else 500
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            result = archive_terminal_commands(cur, batch)
+            if result["archived"]:
+                log_audit(cur, user, 0, "COMMANDS_ARCHIVED", result)
+        conn.commit()
+        return result
+    except Exception as e:
+        conn.rollback(); raise e
+    finally:
+        conn.close()
+
 @app.get("/api/super-admin/devices")
 def get_devices(user: dict = Depends(require_role("super_admin"))):
     conn = get_db()
@@ -919,7 +998,8 @@ def get_devices(user: dict = Depends(require_role("super_admin"))):
             cur.execute("""
                 SELECT d.id, d.society_id, d.name, d.firmware_version, d.last_seen, d.status, s.name as society_name,
                        s.config_version, p.desired_config_hash, p.applied_config_version, p.applied_config_hash,
-                       p.applied_config_at, COALESCE(p.config_state, 'DESIRED') AS config_state, p.config_error
+                       p.applied_config_at, COALESCE(p.config_state, 'DESIRED') AS config_state, p.config_error,
+                       p.ota_state, p.ota_desired_version, p.ota_last_error, p.disk_free_mb, p.last_sync
                 FROM pi_devices d
                 LEFT JOIN societies s ON d.society_id = s.id
                 LEFT JOIN pi_state p ON p.device_id = d.id
@@ -930,6 +1010,8 @@ def get_devices(user: dict = Depends(require_role("super_admin"))):
                 d["id"] = str(d["id"])
                 d["society_id"] = str(d["society_id"]) if d["society_id"] else None
                 d["applied_config_at"] = d["applied_config_at"].isoformat() if d.get("applied_config_at") else None
+                d["last_sync"] = d["last_sync"].isoformat() if d.get("last_sync") else None
+                d["storage_state"] = "FAILED" if (d.get("disk_free_mb") is not None and d["disk_free_mb"] < 0) else ("UNKNOWN" if d.get("disk_free_mb") is None else "OK")
             return devices
     finally:
         conn.close()
@@ -1158,7 +1240,9 @@ def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))
     return {"message": "Force flag updated"}
 
 @app.get("/api/pi/firmware-download")
+@limiter.limit("10/minute", key_func=pi_rate_key)
 def download_firmware(
+    request: Request,
     version: str,
     x_device_id: str | None = Header(None, alias="X-Device-ID"),
     x_api_key: str | None = Header(None, alias="X-Api-Key"),
@@ -1186,7 +1270,7 @@ def download_firmware(
 # ================================================================
 
 @app.post("/api/pi/sync")
-@limiter.limit("30/minute")
+@limiter.limit("90/minute", key_func=pi_rate_key)
 def pi_sync(
     request: Request,
     payload: dict,
@@ -1195,6 +1279,12 @@ def pi_sync(
 ):
     device_id, society_id = authenticate_pi(payload, x_device_id, x_api_key)
     now = datetime.now(timezone.utc)
+    metric_inc("sync_requests", device_id)
+    metric_inc("db_writes", device_id, 2)  # pi_devices.last_seen + pi_state upsert (existing writes, measured)
+    fb = payload.get("flashBytesToday")
+    if isinstance(fb, (int, float)) and not isinstance(fb, bool) and fb >= 0:
+        with METRICS_LOCK:  # gauge, not counter: latest Pi-reported daily flash bytes
+            METRICS[(now.date().isoformat(), str(device_id), "pi_flash_bytes_today")] = int(fb)
 
     conn = get_db()
     try:
@@ -1312,6 +1402,7 @@ def pi_sync(
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
                 if not ev_id: continue
+                metric_inc("events", device_id); metric_inc("db_writes", device_id)
                 cur.execute("""INSERT INTO pi_events (device_id, event_id, timestamp, type, message)
                                VALUES (%s, %s, %s, %s, %s)
                                ON CONFLICT (event_id) DO NOTHING""",
@@ -1401,7 +1492,9 @@ def pi_sync(
 # ================================================================
 
 @app.post("/api/pi/command-ack")
+@limiter.limit("120/minute", key_func=pi_rate_key)
 def pi_command_ack(
+    request: Request,
     payload: dict,
     x_device_id: str | None = Header(None, alias="X-Device-ID"),
     x_api_key: str | None = Header(None, alias="X-Api-Key"),
@@ -1556,6 +1649,7 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
 
             command_id = str(uuid.uuid4())
             created = datetime.now(timezone.utc)
+            metric_inc("commands_created", device_id); metric_inc("db_writes", device_id)
             cur.execute("""INSERT INTO pi_commands (id, device_id, command, slot, params, status, created_at, expires_at, idempotency_key, sequence_no)
                            VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s, %s, %s)""",
                         (command_id, device_id, command, slot, psycopg.types.json.Json(params), created,
@@ -1620,6 +1714,8 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "applied_config_at": pi["applied_config_at"].isoformat() if pi and pi.get("applied_config_at") else None,
                     "config_state": (pi.get("config_state") if pi else None) or "DESIRED",
                     "config_error": pi.get("config_error") if pi else None,
+                    "ota_state": pi.get("ota_state") if pi else None,
+                    "storage_state": ("FAILED" if pi.get("disk_free_mb", 0) < 0 else "OK") if pi and pi.get("disk_free_mb") is not None else "UNKNOWN",
                 })
 
             return { "society_id": sid, "devices": devices_data }

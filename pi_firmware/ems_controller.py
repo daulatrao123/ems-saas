@@ -100,6 +100,7 @@ class EMSController:
         )
 
         # T7 applied-configuration identity (RAM mirror of execution_meta).
+        self._boot_rejection = None
         self._applied_version = None
         self._applied_hash = None
         self._applied_at = None
@@ -253,6 +254,8 @@ class EMSController:
         # Rejected: hardware stays in the safe startup state, defaults remain
         # active, cloud sync continues and can re-apply the desired revision.
         self._config_error = code
+        # T8: exactly one boot_config_rejected event per boot (metadata only, no config contents).
+        self._boot_rejection = {"code": code, "stored_version": stored.get("version")}
         logger.critical(
             "Stored applied config rejected at boot (%s); running safe defaults until cloud sync.",
             code,
@@ -409,6 +412,9 @@ class EMSController:
             "otaError": self._ota_status.get("error"),
             "otaAttempts": self._ota_status.get("attempts", 0),
             "lastGoodFirmwareVersion": self._ota_status.get("last_good"),
+            "flashBytesToday": int(
+                resource_status.get("storage", {}).get("logical_writes", 0) or 0
+            ),
             "active_slot": self.state.active_slot,
             "resetDay": int(self.device_config.get("reset_day", 15)),
             "emergencyStop": (
@@ -453,6 +459,21 @@ class EMSController:
     def _collect_storage_events(self):
         """Turn storage-band transitions into one cloud event each.
         Staying in the same band produces zero events."""
+
+        if self._boot_rejection:
+            rej = self._boot_rejection
+            self._boot_rejection = None  # emitted once; resent only until a sync succeeds
+            self._pending_events.append(
+                {
+                    "eventId": str(uuid.uuid4()),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "boot_config_rejected",
+                    "message": (
+                        f"BOOT_CONFIG_REJECTED code={rej['code']} "
+                        f"stored_version={rej['stored_version']} firmware={self.firmware_version}"
+                    ),
+                }
+            )
 
         for tr in self.storage.pop_storage_transitions():
             self._pending_events.append(
