@@ -790,7 +790,7 @@ def get_societies(user: dict = Depends(require_role("super_admin"))):
                     })
 
                 result.append({
-                    "id": s["id"], "name": s["name"], "location": s["location"],
+                    "id": s["id"], "name": s["name"], "location": s["location"], "status": s["status"],
                     "pi_online": society_online,
                     "devices": devices_data
                 })
@@ -987,6 +987,138 @@ def maintenance_archive_commands(data: dict | None = None, user: dict = Depends(
         return result
     except Exception as e:
         conn.rollback(); raise e
+    finally:
+        conn.close()
+
+# ---------------------------------------------------------------- T9 provisioning
+@app.post("/api/super-admin/societies")
+def create_society(data: dict, user: dict = Depends(require_role("super_admin"))):
+    """Create-only (no id, no device re-assignment). Single transaction, id from RETURNING."""
+    name = str((data or {}).get("name", "")).strip()[:120]
+    if not name:
+        raise HTTPException(400, "name required")
+    location = str(data.get("location") or "").strip()[:200]
+    try:
+        reset_day = int(data.get("reset_day", DEFAULT_RESET_DAY))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "reset_day must be an integer")
+    if not 1 <= reset_day <= 28:
+        raise HTTPException(400, "reset_day must be 1-28")
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code, config_version, reset_day)
+                           VALUES (%s, %s, 'Basic', 'active', '', 5000, %s, 1, %s) RETURNING id""",
+                        (name, location, f"SOC-{name[:4].upper()}", reset_day))
+            sid = cur.fetchone()["id"]
+            log_audit(cur, user, sid, "CREATE_SOCIETY", {"name": name, "location": location, "reset_day": reset_day, "origin": "provisioning"})
+        conn.commit()
+    except Exception as e:
+        conn.rollback(); raise e
+    finally:
+        conn.close()
+    return {"message": "Society created", "society_id": sid, "name": name, "location": location, "reset_day": reset_day}
+
+@app.post("/api/super-admin/users")
+def create_user(data: dict, user: dict = Depends(require_role("super_admin"))):
+    """Create society_admin/member bound to a society. Temporary password is generated
+    server-side and returned ONCE (never stored in plaintext, never logged)."""
+    role = data.get("role")
+    if role not in ("society_admin", "member"):
+        raise HTTPException(400, "role must be society_admin or member")
+    try: sid = int(data.get("society_id"))
+    except (TypeError, ValueError): raise HTTPException(400, "society_id required")
+    email = str(data.get("email", "")).strip().lower()[:254]; name = str(data.get("name", "")).strip()[:120]
+    if "@" not in email or not name:
+        raise HTTPException(400, "email and name required")
+    temp_password = secrets.token_urlsafe(16)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM societies WHERE id=%s AND status='active'", (sid,))
+            if not cur.fetchone(): raise HTTPException(404, "Society not found")
+            cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+            if cur.fetchone(): raise HTTPException(409, "Email already exists")
+            cur.execute("INSERT INTO users (email, name, role, society_id, password) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                        (email, name, role, sid, bcrypt.hashpw(str(temp_password).encode(), bcrypt.gensalt()).decode()))
+            uid = cur.fetchone()["id"]
+            log_audit(cur, user, sid, "USER_CREATED", {"user_id": uid, "email": email, "role": role})
+        conn.commit()
+    except Exception as e:
+        conn.rollback(); raise e
+    finally:
+        conn.close()
+    return {"user_id": uid, "email": email, "role": role, "society_id": sid, "temporary_password": temp_password}
+
+@app.post("/api/admin/devices/register")
+def register_device(data: dict, user: dict = Depends(get_current_user)):
+    """Society admin registers a Pi in THEIR society (server-side tenant); super admin may target one.
+    Credential comes from the existing 0005 lifecycle; secret returned exactly once."""
+    if user.get("role") not in ("super_admin", "society_admin"):
+        raise HTTPException(403, "Insufficient permissions")
+    if user["role"] == "super_admin":
+        try: sid = int(data.get("society_id"))
+        except (TypeError, ValueError): raise HTTPException(400, "society_id required")
+    else:
+        sid = user.get("society_id")  # never from the browser
+        if not sid: raise HTTPException(403, "No society bound to this account")
+    name = str(data.get("name", "")).strip()[:80] or "Pi Controller"
+    profile = data.get("hardware_profile") or "EMS-4CH-v1"
+    if profile not in ("EMS-4CH-v1",):
+        raise HTTPException(400, "Unknown hardware_profile")
+    feedback = data.get("feedback_hardware_installed") is True  # never assumed installed
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM societies WHERE id=%s AND status='active'", (sid,))
+            if not cur.fetchone(): raise HTTPException(404, "Society not found")
+            device_id = str(uuid.uuid4()); secret = new_device_secret()
+            cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status, hardware_profile, feedback_hardware_installed)
+                           VALUES (%s, %s, %s, %s, 'ASSIGNED', %s, %s)""", (device_id, sid, name, hash_api_key(secret), profile, feedback))
+            issued = issue_device_credential(cur, device_id, user, "register", secret=secret)
+            log_audit(cur, user, sid, "DEVICE_REGISTERED", {"device_id": device_id, "name": name, "hardware_profile": profile,
+                                                            "feedback_hardware_installed": feedback, "key_id": issued["key_id"]})
+        conn.commit()
+    except Exception as e:
+        conn.rollback(); raise e
+    finally:
+        conn.close()
+    return {"device_id": device_id, "society_id": sid, "name": name, "key_id": issued["key_id"], "api_key": secret}
+
+@app.get("/api/admin/devices")
+def list_society_devices(request: Request, user: dict = Depends(get_current_user)):
+    """Lightweight device list for the tenant. society_admin/member: tenant from session only
+    (browser-supplied society_id is ignored). super_admin: ?society_id= required. One query."""
+    if user.get("role") == "super_admin":
+        try: sid = int(request.query_params.get("society_id", ""))
+        except (TypeError, ValueError): raise HTTPException(400, "society_id required")
+    else:
+        sid = user.get("society_id")
+        if not sid: raise HTTPException(403, "No society bound to this account")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""SELECT d.id, d.name, d.status, d.hardware_profile, d.feedback_hardware_installed, d.firmware_version,
+                                  d.last_seen, c.key_id, p.last_sync, COALESCE(p.config_state, 'DESIRED') AS config_state,
+                                  p.ota_state, p.disk_free_mb
+                           FROM pi_devices d
+                           LEFT JOIN pi_device_credentials c ON c.device_id = d.id AND c.status = 'active'
+                           LEFT JOIN pi_state p ON p.device_id = d.id
+                           WHERE d.society_id = %s ORDER BY d.name ASC, d.id ASC""", (sid,))
+            rows = cur.fetchall()
+            out = []
+            for r in rows:
+                out.append({
+                    "id": str(r["id"]), "name": r["name"], "status": r["status"], "hardware_profile": r["hardware_profile"],
+                    "feedback_hardware_installed": bool(r["feedback_hardware_installed"]), "firmware_version": r["firmware_version"],
+                    "key_id": r["key_id"], "credential_state": "active" if r["key_id"] else "none",
+                    "last_seen": r["last_seen"].isoformat() if r.get("last_seen") else None,
+                    "last_sync": r["last_sync"].isoformat() if r.get("last_sync") else None,
+                    "online": is_pi_online(r),
+                    "config_state": r["config_state"], "ota_state": r["ota_state"],
+                    "storage_state": "FAILED" if (r.get("disk_free_mb") is not None and r["disk_free_mb"] < 0) else ("UNKNOWN" if r.get("disk_free_mb") is None else "OK"),
+                })
+            return {"society_id": sid, "devices": out}
     finally:
         conn.close()
 

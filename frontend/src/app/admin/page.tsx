@@ -1,18 +1,52 @@
 "use client";
 import { DeviceStateBadges } from "../../components/StateBadges";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import api from "@/lib/api";
 import Sidebar from "@/components/Sidebar";
 import { getSession, Session } from "@/lib/auth";
+import { RegisterPiForm, DeviceTable, SocietyDevice } from "@/components/provisioning/AdminDevices";
+
+type Slot = { display_name: string; target_days: number; used_days: number; physical_toggle: string; disabled: boolean };
+type DashboardDevice = {
+  id: string; name: string; connected: boolean; active_slot: string | null; slots: Record<string, Slot>;
+  config_state?: string | null; ota_state?: string | null; storage_state?: string | null;
+};
+type Toast = { msg: string; ok: boolean };
 
 export default function AdminDashboard() {
   const router = useRouter();
   const [session, setSession] = useState<Session | null>(null);
-  const [devices, setDevices] = useState<any[]>([]);
+  const [devices, setDevices] = useState<DashboardDevice[]>([]);
+  const [registry, setRegistry] = useState<SocietyDevice[]>([]);
   const [societyId, setSocietyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [toast, setToast] = useState<any>(null);
+  const [toast, setToast] = useState<Toast | null>(null);
+
+  const showToast = (msg: string, ok: boolean) => {
+    setToast({ msg, ok });
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  const fetchDashboard = useCallback(async (sid: string) => {
+    try {
+      const res = await api.get(`/api/admin/dashboard?society_id=${sid}`);
+      setDevices(res.data.devices || []);
+    } catch {
+      showToast("Failed to load dashboard", false);
+    }
+    setLoading(false);
+  }, []);
+
+  // Tenant is derived server-side from the session; no society_id is sent.
+  const fetchRegistry = useCallback(async () => {
+    try {
+      const res = await api.get("/api/admin/devices");
+      setRegistry(res.data.devices || []);
+    } catch {
+      showToast("Failed to load device registry", false);
+    }
+  }, []);
 
   useEffect(() => {
     getSession().then((s) => {
@@ -25,22 +59,14 @@ export default function AdminDashboard() {
       setSession(s);
       setSocietyId(sid);
       fetchDashboard(sid);
+      fetchRegistry();
     });
-  }, [router]);
+  }, [router, fetchDashboard, fetchRegistry]);
 
-  const fetchDashboard = async (sid: string) => {
-    try {
-      const res = await api.get(`/api/admin/dashboard?society_id=${sid}`);
-      setDevices(res.data.devices || []);
-    } catch (err) {
-      showToast("Failed to load dashboard", false);
-    }
-    setLoading(false);
-  };
-
-  const showToast = (msg: string, ok: boolean) => { 
-    setToast({ msg, ok }); 
-    setTimeout(() => setToast(null), 3000); 
+  const onRegistered = () => {
+    showToast("Pi registered — copy the credential now", true);
+    fetchRegistry();
+    if (societyId) fetchDashboard(societyId);
   };
 
   const sendCommand = async (deviceId: string, slot: string, command: string) => {
@@ -54,7 +80,7 @@ export default function AdminDashboard() {
         command: command
       });
       showToast(`Command ${command} sent to Slot ${slot}`, true);
-      setTimeout(() => fetchDashboard(societyId!), 3000);
+      setTimeout(() => fetchDashboard(societyId), 3000);
     } catch {
       showToast("Command failed", false);
     }
@@ -71,13 +97,16 @@ export default function AdminDashboard() {
           <p className="text-xs text-gray-500">{devices.length} Pi devices connected</p>
         </div>
 
+        <RegisterPiForm onRegistered={onRegistered} />
+        <DeviceTable devices={registry} />
+
         {devices.length === 0 && (
           <div className="bg-gray-900/80 border border-gray-800 rounded-xl p-8 text-center text-gray-500">
             No Pi devices assigned to your society yet.
           </div>
         )}
 
-        {devices.map((dev: any) => (
+        {devices.map((dev) => (
           <div key={dev.id} className="bg-gray-900/80 border border-gray-800 rounded-xl p-6 mb-6">
             <div className="flex justify-between items-center mb-4 border-b border-gray-800 pb-3">
               <div>
@@ -98,14 +127,14 @@ export default function AdminDashboard() {
                 if (!slot) return null;
                 const isActive = dev.active_slot === slotCode;
                 const isDisabled = slot.disabled;
-                
+
                 return (
                   <div key={slotCode} className={`border p-4 rounded-lg ${isActive ? "border-cyan-500 bg-cyan-500/5" : "border-gray-800 bg-gray-800/30"}`}>
                     <div className="flex justify-between items-center mb-2">
                       <h3 className="text-sm font-bold text-white">{slot.display_name || `Slot ${slotCode}`}</h3>
                       <span className="text-[9px] font-mono bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded">{slotCode}</span>
                     </div>
-                    
+
                     <div className="text-[10px] text-gray-400 mb-3 space-y-1">
                         <div>Target: <span className="text-gray-200 font-mono">{slot.target_days} days</span></div>
                         <div>Used: <span className="text-gray-200 font-mono">{slot.used_days} days</span></div>
@@ -113,7 +142,7 @@ export default function AdminDashboard() {
                     </div>
 
                     {!isDisabled ? (
-                      <button 
+                      <button
                         onClick={() => sendCommand(dev.id, slotCode, isActive ? "off_slot" : "set_active_slot")}
                         className={`w-full py-1.5 text-[10px] font-bold rounded transition-colors ${
                           isActive ? "bg-red-500/20 text-red-400 hover:bg-red-500/30 border border-red-500/30" : "bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30 border border-cyan-500/30"
