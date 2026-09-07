@@ -33,6 +33,9 @@ def simulate_pi():
             "B": {"usedDays": 2, "physicalToggle": "ON", "clicks": 3},
             "G": {"usedDays": 0, "physicalToggle": "OFF", "clicks": 0}
         },
+        # T6 reconciliation evidence (in-memory only: this simulator is not a durable device)
+        "last_executed_sequence": 0,
+        "executed_command_ids": [],
         "events": [{
             "eventId": str(uuid.uuid4()),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -63,7 +66,14 @@ def simulate_pi():
             cmd_id = data.get("command_id")
             
             if cmd and cmd_id:
-                print(f"📦 Received Command: {cmd} (ID: {cmd_id})")
+                print(f"📦 Received Command: {cmd} (ID: {cmd_id}) seq={data.get('sequence_no')} attempt={data.get('attempt')}")
+                if cmd_id in pi_state["executed_command_ids"]:
+                    print("♻️  Duplicate delivery ignored (already executed)")
+                    time.sleep(5)
+                    continue
+                pi_state["executed_command_ids"] = ([cmd_id] + pi_state["executed_command_ids"])[:50]
+                if data.get("sequence_no"):
+                    pi_state["last_executed_sequence"] = max(pi_state["last_executed_sequence"], int(data["sequence_no"]))
                 event_msg = ""
                 success = True
                 error_msg = None

@@ -25,6 +25,14 @@ def upgrade() -> None:
     op.execute("ALTER TABLE pi_commands ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ")
     op.execute("ALTER TABLE pi_devices ADD COLUMN IF NOT EXISTS next_command_sequence BIGINT NOT NULL DEFAULT 0")
 
+    op.execute("""DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_pi_commands_attempt_nonneg') THEN
+            ALTER TABLE pi_commands ADD CONSTRAINT ck_pi_commands_attempt_nonneg CHECK (attempt_count >= 0);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_pi_devices_next_seq_nonneg') THEN
+            ALTER TABLE pi_devices ADD CONSTRAINT ck_pi_devices_next_seq_nonneg CHECK (next_command_sequence >= 0);
+        END IF;
+    END $$;""")
     op.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_pi_commands_device_idempotency ON pi_commands(device_id, idempotency_key)")
     op.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_pi_commands_device_sequence ON pi_commands(device_id, sequence_no)")
     op.execute("CREATE INDEX IF NOT EXISTS idx_pi_commands_device_status_created ON pi_commands(device_id, status, created_at)")
@@ -44,6 +52,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("ALTER TABLE pi_commands ALTER COLUMN expires_at DROP NOT NULL")
+    op.execute("ALTER TABLE pi_commands DROP CONSTRAINT IF EXISTS ck_pi_commands_attempt_nonneg")
+    op.execute("ALTER TABLE pi_devices DROP CONSTRAINT IF EXISTS ck_pi_devices_next_seq_nonneg")
     op.execute("DROP INDEX IF EXISTS idx_pi_commands_device_status_created")
     op.execute("DROP INDEX IF EXISTS uq_pi_commands_device_sequence")
     op.execute("DROP INDEX IF EXISTS uq_pi_commands_device_idempotency")

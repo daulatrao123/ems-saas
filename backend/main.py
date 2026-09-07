@@ -164,6 +164,13 @@ def verify_schema_revision():
         f"SCHEMA GUARD: database at unknown revision {current} (AHEAD of or incompatible with this build, head {head}). "
         "Deploy a build that knows this revision or restore the database. Refusing to start.")
 
+def require_uuid(value, what: str) -> str:
+    """Reject malformed UUIDs with 400 before they reach PostgreSQL (which would 500)."""
+    try:
+        return str(uuid.UUID(str(value)))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(400, f"{what} must be a UUID")
+
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
@@ -358,6 +365,10 @@ def authenticate_pi(
     # for backward compatibility with older Pi firmware.
     device_id = str(x_device_id or payload.get("deviceId") or "").strip()
     supplied_key = str(x_api_key or payload.get("key") or "").strip()
+    try:
+        uuid.UUID(device_id)
+    except ValueError:
+        raise HTTPException(403, "Invalid Pi API key or Device ID.")
     if not device_id:
         raise HTTPException(400, "Invalid deviceId")
     if not supplied_key:
@@ -1037,11 +1048,17 @@ def pi_sync(
 
             # --- T6 reconciliation: what the Pi says it actually executed -----------
             # Sequence is primary evidence; the bounded id list is secondary evidence.
-            try:
-                last_exec_seq = int(payload.get("last_executed_sequence") or 0)
-            except (TypeError, ValueError):
+            raw_seq = payload.get("last_executed_sequence")
+            if raw_seq is None:
                 last_exec_seq = 0
-            executed_ids = [str(i) for i in (payload.get("executed_command_ids") or [])[:EXECUTED_IDS_MAX]]
+            elif isinstance(raw_seq, bool) or not isinstance(raw_seq, int) or raw_seq < 0:
+                raise HTTPException(400, "last_executed_sequence must be a non-negative integer")
+            else:
+                last_exec_seq = raw_seq
+            raw_ids = payload.get("executed_command_ids") or []
+            if not isinstance(raw_ids, list) or not all(isinstance(i, str) for i in raw_ids):
+                raise HTTPException(400, "executed_command_ids must be a list of command id strings")
+            executed_ids = list(dict.fromkeys(raw_ids[:EXECUTED_IDS_MAX]))  # bounded, de-duplicated, order kept
             reconciled = 0
             if executed_ids:
                 # Delivered (or lease-reclaimed) commands the Pi has executed: promote to
@@ -1124,6 +1141,10 @@ def pi_command_ack(
     if not command_id:
         raise HTTPException(400, "command_id required")
 
+    command_id = require_uuid(command_id, "command_id")
+    attempt = payload.get("attempt")
+    if attempt is not None and (isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0):
+        raise HTTPException(400, "attempt must be a non-negative integer")
     status = str(payload.get("status", "")).lower()
     verification = str(payload.get("verification_state", "UNKNOWN")).upper()
     error = payload.get("error")
@@ -1151,8 +1172,7 @@ def pi_command_ack(
                 raise HTTPException(409, f"Invalid command transition {current} -> {status}")
 
             # Lease/attempt identity: a stale worker (older delivery attempt) may not commit.
-            attempt = payload.get("attempt")
-            if attempt is not None and int(attempt) != int(cmd["attempt_count"]):
+            if attempt is not None and attempt != int(cmd["attempt_count"]):
                 raise HTTPException(409, f"Stale command attempt {attempt}; current attempt is {cmd['attempt_count']}")
 
             now = datetime.now(timezone.utc)
@@ -1228,8 +1248,13 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     slot = str(data.get("slot", ""))
     device_id = data.get("device_id")
     params = dict(data.get("params", {}))
+    device_id = require_uuid(device_id, "device_id")
     idempotency_key = data.get("idempotency_key")
-    idempotency_key = str(idempotency_key).strip()[:128] if idempotency_key else None
+    if idempotency_key is not None and not isinstance(idempotency_key, str):
+        raise HTTPException(400, "idempotency_key must be a string")
+    idempotency_key = idempotency_key.strip()[:128] if idempotency_key else None
+    if idempotency_key is not None and not idempotency_key:
+        idempotency_key = None
 
     validate_command(command, params, slot)
 
