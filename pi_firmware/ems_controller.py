@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import threading
@@ -7,9 +8,16 @@ from datetime import datetime, timezone, timedelta
 
 from config import (
     DEVICE_ID,
+    HARDWARE_PROFILES,
     SUPPORTED_SLOTS,
     SYNC_INTERVAL_S,
     TELEMETRY_DIR,
+)
+from config_hash import (
+    ConfigError,
+    canonical_device_config,
+    canonical_json,
+    config_hash,
 )
 
 from logger import logger
@@ -85,6 +93,13 @@ class EMSController:
         self.queue = OfflineQueue(
             self.storage
         )
+
+        # T7 applied-configuration identity (RAM mirror of execution_meta).
+        self._applied_version = None
+        self._applied_hash = None
+        self._applied_at = None
+        self._config_error = None
+        self._restore_applied_config()
 
         self._last_sync = 0.0
         self._last_usage_day = self.state.last_usage_date
@@ -176,91 +191,89 @@ class EMSController:
         )
 
     # ============================================================
-    # CONFIG
+    # CONFIG (T7: validate -> canonical -> hash -> persist -> then applied)
     # ============================================================
+
+    def _restore_applied_config(self):
+        """Boot: run the last durably applied configuration (offline-safe)."""
+        stored = self.queue.get_applied_config()
+        if not stored:
+            return
+        try:
+            canonical = json.loads(stored["json"])
+            if config_hash(canonical) != stored["hash"]:
+                logger.critical("Stored applied config hash mismatch; ignoring stored config.")
+                return
+        except (ValueError, TypeError) as exc:
+            logger.critical("Stored applied config unreadable: %s", exc)
+            return
+        self._install_effective_config(canonical)
+        self._applied_version = stored["version"]
+        self._applied_hash = stored["hash"]
+        self._applied_at = stored["at"]
+
+    def _install_effective_config(self, canonical):
+        # Mutate in place: GPIOManager holds a reference to this dict.
+        self.device_config.clear()
+        self.device_config.update(
+            {
+                "hardware_profile": canonical["hardware_profile"],
+                "feedback_hardware_installed": canonical["feedback_hardware_installed"],
+                "reset_day": canonical["reset_day"],
+                "slots": {
+                    slot: dict(canonical["slots"][slot])
+                    for slot in SUPPORTED_SLOTS
+                },
+            }
+        )
 
     def _apply_cloud_config(
         self,
         response: dict,
     ):
-        profile = response.get(
-            "hardware_profile"
-        )
+        """Returns True when the effective configuration is durably applied
+        (or already was). Any rejection leaves the running configuration and
+        the applied identity untouched and sets a bounded error code."""
+        try:
+            version = response.get("config_version")
+            if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+                raise ConfigError("UNKNOWN_CONFIG_ERROR")
 
-        if profile:
-            self.device_config[
-                "hardware_profile"
-            ] = profile
-
-        reset_day = response.get("resetDay")
-        if reset_day is not None:
-            try:
-                reset_day = int(reset_day)
-                if 1 <= reset_day <= 28:
-                    self.device_config["reset_day"] = reset_day
-            except (TypeError, ValueError):
-                logger.error("Ignoring invalid cloud resetDay=%r", reset_day)
-
-        self.device_config[
-            "feedback_hardware_installed"
-        ] = bool(
-            response.get(
-                "feedback_hardware_installed",
-                False,
+            canonical = canonical_device_config(
+                response.get("hardware_profile"),
+                response.get("feedback_hardware_installed"),
+                response.get("resetDay"),
+                response.get("slots"),
+                known_profiles=HARDWARE_PROFILES,
             )
-        )
+            new_hash = config_hash(canonical)
+        except ConfigError as exc:
+            self._config_error = exc.code
+            logger.error("Cloud configuration rejected: %s", exc.code)
+            return False
+        except Exception as exc:  # canonicaliser/hash must never take the controller down
+            self._config_error = "CONFIG_HASH_FAILED"
+            logger.error("Cloud configuration hashing failed: %s", exc)
+            return False
 
-        slots = response.get(
-            "slots",
-            {},
-        )
+        if new_hash == self._applied_hash and version == self._applied_version:
+            self._config_error = None
+            return True  # steady state: zero writes
 
-        if not isinstance(slots, dict):
-            return
+        applied_at = datetime.now(timezone.utc).isoformat()
+        if not self.queue.persist_applied_config(
+            canonical_json(canonical), version, new_hash, applied_at
+        ):
+            self._config_error = "CONFIG_PERSIST_FAILED"
+            return False  # not durable -> not applied -> keep running old config
 
-        for slot in SUPPORTED_SLOTS:
-            cloud_slot = slots.get(
-                slot,
-                {},
-            )
-
-            if not isinstance(
-                cloud_slot,
-                dict,
-            ):
-                continue
-
-            self.device_config[
-                "slots"
-            ][slot] = {
-                "target_days": max(
-                    0,
-                    int(
-                        cloud_slot.get(
-                            "target_days",
-                            0,
-                        )
-                    ),
-                ),
-                "disabled": bool(
-                    cloud_slot.get(
-                        "disabled",
-                        True,
-                    )
-                ),
-                "display_name": str(
-                    cloud_slot.get(
-                        "display_name",
-                        f"Slot {slot}",
-                    )
-                ),
-                "feedback_enabled": bool(
-                    cloud_slot.get(
-                        "feedback_enabled",
-                        False,
-                    )
-                ),
-            }
+        self._install_effective_config(canonical)
+        self._applied_version = version
+        self._applied_hash = new_hash
+        self._applied_at = applied_at
+        self._config_error = None
+        logger.info("Configuration applied version=%s hash=%s", version, new_hash[:12])
+        return True
 
     # ============================================================
     # SNAPSHOT
@@ -364,6 +377,11 @@ class EMSController:
             "slots": slots,
             "memory": memory,
             "events": events,
+            # T7 applied configuration identity (RAM; persisted on change only).
+            "applied_config_version": self._applied_version,
+            "applied_config_hash": self._applied_hash,
+            "applied_config_at": self._applied_at,
+            "config_apply_error": self._config_error,
             # T6 execution identity: lets the cloud reconcile instead of re-delivering.
             "last_executed_sequence": self.queue.get_last_executed_sequence(),
             "executed_command_ids": self.queue.get_executed_command_ids(),

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-import requests, time, uuid, os
+import requests, time, uuid, os, sys
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config_hash import ConfigError, canonical_device_config, config_hash  # T7 (same module as real firmware)
 
 BACKEND_URL = os.environ.get("BACKEND_URL")
 DEVICE_ID = os.environ.get("PI_DEVICE_ID")
@@ -36,6 +40,11 @@ def simulate_pi():
         # T6 reconciliation evidence (in-memory only: this simulator is not a durable device)
         "last_executed_sequence": 0,
         "executed_command_ids": [],
+        # T7 applied configuration identity (in-memory only in the simulator)
+        "applied_config_version": None,
+        "applied_config_hash": None,
+        "applied_config_at": None,
+        "config_apply_error": None,
         "events": [{
             "eventId": str(uuid.uuid4()),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -58,6 +67,19 @@ def simulate_pi():
                 
             data = res.json()
             print("✅ Sync Successful. last_sync updated.")
+
+            # T7: hash the EFFECTIVE (validated, clamped) configuration and report it as applied.
+            try:
+                canonical = canonical_device_config(data.get("hardware_profile"), data.get("feedback_hardware_installed"),
+                                                    data.get("resetDay"), data.get("slots"))
+                h = config_hash(canonical)
+                if h != pi_state["applied_config_hash"] or data.get("config_version") != pi_state["applied_config_version"]:
+                    pi_state.update({"applied_config_version": int(data.get("config_version", 0)), "applied_config_hash": h,
+                                     "applied_config_at": datetime.now(timezone.utc).isoformat(), "config_apply_error": None})
+                    print(f"🧩 Config applied version={pi_state['applied_config_version']} hash={h[:12]} state={data.get('config_state')}")
+            except ConfigError as exc:
+                pi_state["config_apply_error"] = exc.code
+                print(f"⚠️  Config rejected: {exc.code}")
             
             # Clear events after successful sync so we don't resend them
             pi_state["events"].clear()

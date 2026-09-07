@@ -67,6 +67,54 @@ COMMAND_EXPIRY_SECONDS = 300
 COMMAND_DELIVERY_LEASE_SECONDS = 120
 EXECUTED_IDS_MAX = 50  # bound on executed_command_ids[] accepted per sync (T6)
 
+# ---------------------------------------------------------------------------
+# T7 canonical device configuration + hash. FROZEN SCHEMA v1 — byte-identical
+# mirror of pi_firmware/config_hash.py (parity enforced by t7 tests).
+# ---------------------------------------------------------------------------
+import json as _json
+CONFIG_STATES = ("DESIRED", "PENDING_APPLY", "APPLIED", "DRIFTED", "FAILED")
+CONFIG_ERROR_CODES = ("INVALID_HARDWARE_PROFILE", "INVALID_SLOT", "INVALID_TARGET_DAYS", "INVALID_RESET_DAY",
+                      "INVALID_FEEDBACK_CONFIGURATION", "INVALID_DISPLAY_NAME", "CONFIG_PERSIST_FAILED",
+                      "CONFIG_HASH_FAILED", "UNKNOWN_CONFIG_ERROR")
+_CANON_SLOTS = ("A", "B", "C", "D")
+
+
+def canonical_device_config(hardware_profile, feedback_hardware_installed, reset_day, slots):
+    """Cloud-side canonicaliser (inputs come from our own rows; ranges already enforced upstream)."""
+    profile = hardware_profile if hardware_profile not in (None, "") else "EMS-4CH-v1"
+    installed = bool(feedback_hardware_installed) if feedback_hardware_installed is not None else False
+    day = int(reset_day) if reset_day is not None else DEFAULT_RESET_DAY
+    out_slots = {}
+    for code in _CANON_SLOTS:
+        raw = (slots or {}).get(code) or {}
+        name = raw.get("display_name")
+        fb = raw.get("feedback_enabled")
+        dis = raw.get("disabled")
+        tgt = raw.get("target_days")
+        out_slots[code] = {
+            "disabled": True if dis is None else bool(dis),
+            "display_name": f"Slot {code}" if name in (None, "") else str(name),
+            "feedback_enabled": bool((False if fb is None else bool(fb)) and installed),
+            "target_days": 0 if tgt is None else int(tgt),
+        }
+    return {"feedback_hardware_installed": installed, "hardware_profile": str(profile),
+            "reset_day": day, "slots": out_slots}
+
+
+def config_hash(canonical) -> str:
+    return hashlib.sha256(_json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                          .encode("utf-8")).hexdigest()
+
+
+def derive_config_state(desired_version, desired_hash, applied_version, applied_hash, config_error) -> str:
+    if config_error:
+        return "FAILED"
+    if applied_hash is None or applied_version is None:
+        return "DESIRED"
+    if int(applied_version) != int(desired_version):
+        return "PENDING_APPLY"
+    return "APPLIED" if applied_hash == desired_hash else "DRIFTED"
+
 COMMAND_TRANSITIONS = {
     "queued": {"delivered", "expired"},
     "delivered": {"executing", "expired", "unknown_after_reboot"},
@@ -743,15 +791,19 @@ def get_devices(user: dict = Depends(require_role("super_admin"))):
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT d.id, d.society_id, d.name, d.firmware_version, d.last_seen, d.status, s.name as society_name
+                SELECT d.id, d.society_id, d.name, d.firmware_version, d.last_seen, d.status, s.name as society_name,
+                       s.config_version, p.desired_config_hash, p.applied_config_version, p.applied_config_hash,
+                       p.applied_config_at, COALESCE(p.config_state, 'DESIRED') AS config_state, p.config_error
                 FROM pi_devices d
                 LEFT JOIN societies s ON d.society_id = s.id
+                LEFT JOIN pi_state p ON p.device_id = d.id
                 ORDER BY d.name ASC
             """)
             devices = cur.fetchall()
             for d in devices:
                 d["id"] = str(d["id"])
                 d["society_id"] = str(d["society_id"]) if d["society_id"] else None
+                d["applied_config_at"] = d["applied_config_at"].isoformat() if d.get("applied_config_at") else None
             return devices
     finally:
         conn.close()
@@ -1008,9 +1060,10 @@ def pi_sync(
                                physical_toggle=EXCLUDED.physical_toggle, used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks""",
                             (device_id, slot_code, physical_toggle, int(w.get("used_days", w.get("usedDays", 0))), int(w.get("clicks", 0))))
 
-            cur.execute("SELECT config_version FROM societies WHERE id = %s", (society_id,))
+            cur.execute("SELECT config_version, reset_day FROM societies WHERE id = %s", (society_id,))
             soc = cur.fetchone()
             cloud_config_version = soc["config_version"] if soc else 0
+            canonical_reset_day = int((soc or {}).get("reset_day") or DEFAULT_RESET_DAY)
 
             cur.execute("SELECT hardware_profile, feedback_hardware_installed FROM pi_devices WHERE id = %s", (device_id,))
             dev_info = cur.fetchone()
@@ -1025,18 +1078,53 @@ def pi_sync(
                 "feedback_enabled": bool(c["feedback_enabled"]) and dev_feedback
             } for c in configs}
 
-            cur.execute("""INSERT INTO pi_state (device_id, active_slot, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason, config_version)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            # --- T7: desired hash is computed from EXACTLY what this device receives below ---
+            desired_hash = config_hash(canonical_device_config(
+                dev_info["hardware_profile"], dev_feedback, canonical_reset_day, slot_configs))
+
+            # Pi-reported applied identity (optional: legacy firmware omits all of it).
+            raw_av = payload.get("applied_config_version")
+            raw_ah = payload.get("applied_config_hash")
+            raw_at = payload.get("applied_config_at")
+            raw_err = payload.get("config_apply_error")
+            reports_applied = raw_av is not None or raw_ah is not None
+            if reports_applied:
+                if isinstance(raw_av, bool) or not isinstance(raw_av, int) or raw_av < 0:
+                    raise HTTPException(400, "applied_config_version must be a non-negative integer")
+                if not isinstance(raw_ah, str) or len(raw_ah) != 64 or any(c not in "0123456789abcdef" for c in raw_ah):
+                    raise HTTPException(400, "applied_config_hash must be a 64-char lowercase hex sha256")
+                if raw_at is not None:
+                    if not isinstance(raw_at, str): raise HTTPException(400, "applied_config_at must be an ISO-8601 string")
+                    try: raw_at = datetime.fromisoformat(raw_at)
+                    except ValueError: raise HTTPException(400, "applied_config_at must be an ISO-8601 string")
+            if raw_err is not None and raw_err not in CONFIG_ERROR_CODES:
+                raise HTTPException(400, "config_apply_error must be a known code")
+
+            cur.execute("SELECT applied_config_version, applied_config_hash, applied_config_at FROM pi_state WHERE device_id=%s", (device_id,))
+            prev = cur.fetchone() or {}
+            # Legacy sync (no fields) must never erase stored convergence evidence.
+            eff_av = raw_av if reports_applied else prev.get("applied_config_version")
+            eff_ah = raw_ah if reports_applied else prev.get("applied_config_hash")
+            eff_at = (raw_at if raw_at is not None else now) if reports_applied else prev.get("applied_config_at")
+            config_state = derive_config_state(cloud_config_version, desired_hash, eff_av, eff_ah, raw_err)
+
+            cur.execute("""INSERT INTO pi_state (device_id, active_slot, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason, config_version,
+                                                 desired_config_hash, applied_config_version, applied_config_hash, applied_config_at, config_state, config_error)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (device_id) DO UPDATE SET
                            active_slot=EXCLUDED.active_slot, reset_day=EXCLUDED.reset_day, emergency_stop=EXCLUDED.emergency_stop,
                            uptime_seconds=EXCLUDED.uptime_seconds, cpu_temp=EXCLUDED.cpu_temp, disk_free_mb=EXCLUDED.disk_free_mb,
                            last_sync=EXCLUDED.last_sync, boot_count=EXCLUDED.boot_count, last_shutdown_reason=EXCLUDED.last_shutdown_reason,
-                           clock_source=EXCLUDED.clock_source, watchdog_enabled=EXCLUDED.watchdog_enabled, last_reboot_reason=EXCLUDED.last_reboot_reason""",
+                           clock_source=EXCLUDED.clock_source, watchdog_enabled=EXCLUDED.watchdog_enabled, last_reboot_reason=EXCLUDED.last_reboot_reason,
+                           config_version=EXCLUDED.config_version, desired_config_hash=EXCLUDED.desired_config_hash,
+                           applied_config_version=EXCLUDED.applied_config_version, applied_config_hash=EXCLUDED.applied_config_hash,
+                           applied_config_at=EXCLUDED.applied_config_at, config_state=EXCLUDED.config_state, config_error=EXCLUDED.config_error""",
                         (device_id, payload.get("active_slot", payload.get("activeWing")), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
                          bool(payload.get("emergencyStop", False)), int(payload.get("uptimeSeconds", 0)),
                          float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
-                         payload.get("lastRebootReason", ""), cloud_config_version))
+                         payload.get("lastRebootReason", ""), cloud_config_version,
+                         desired_hash, eff_av, eff_ah, eff_at, config_state, raw_err))
 
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
@@ -1088,15 +1176,13 @@ def pi_sync(
             cur.execute("SELECT * FROM pi_commands WHERE device_id = %s AND status = 'queued' ORDER BY sequence_no ASC NULLS FIRST, created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED", (device_id,))
             cmd = cur.fetchone()
 
-            cur.execute("SELECT reset_day FROM societies WHERE id=%s", (society_id,))
-            society_row = cur.fetchone()
-            canonical_reset_day = int((society_row or {}).get("reset_day") or DEFAULT_RESET_DAY)
-
             reply = {
                 "success": True,
                 "command": None,
                 "command_id": None,
                 "config_version": cloud_config_version,
+                "config_hash": desired_hash,
+                "config_state": config_state,
                 "device_id": device_id,
                 "hardware_profile": dev_info["hardware_profile"],
                 "feedback_hardware_installed": dev_info["feedback_hardware_installed"],
@@ -1341,7 +1427,15 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "name": dev["name"],
                     "connected": is_pi_online(pi),
                     "active_slot": pi.get("active_slot") if pi else None,
-                    "slots": slots_data
+                    "slots": slots_data,
+                    # T7 convergence evidence (read-only exposure; no UI yet)
+                    "config_version": pi.get("config_version") if pi else None,
+                    "desired_config_hash": pi.get("desired_config_hash") if pi else None,
+                    "applied_config_version": pi.get("applied_config_version") if pi else None,
+                    "applied_config_hash": pi.get("applied_config_hash") if pi else None,
+                    "applied_config_at": pi["applied_config_at"].isoformat() if pi and pi.get("applied_config_at") else None,
+                    "config_state": (pi.get("config_state") if pi else None) or "DESIRED",
+                    "config_error": pi.get("config_error") if pi else None,
                 })
 
             return { "society_id": sid, "devices": devices_data }

@@ -758,6 +758,67 @@ class OfflineQueue:
             return row[0] if row else None
 
     # ============================================================
+    # T7 APPLIED CONFIGURATION (durable, on-change only)
+    # ============================================================
+
+    APPLIED_CONFIG_KEYS = (
+        "applied_config_json",
+        "applied_config_version",
+        "applied_config_hash",
+        "applied_config_at",
+    )
+
+    def get_applied_config(self):
+        """Returns {json, version, hash, at} or None when nothing was ever applied."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT key, value FROM execution_meta WHERE key IN (?,?,?,?)",
+                self.APPLIED_CONFIG_KEYS,
+            ).fetchall()
+        meta = {k: v for k, v in rows}
+        if "applied_config_hash" not in meta or "applied_config_json" not in meta:
+            return None
+        try:
+            version = int(meta.get("applied_config_version", 0))
+        except (TypeError, ValueError):
+            return None
+        return {
+            "json": meta["applied_config_json"],
+            "version": version,
+            "hash": meta["applied_config_hash"],
+            "at": meta.get("applied_config_at"),
+        }
+
+    def persist_applied_config(self, canonical_json, version, config_hash, applied_at):
+        """Single transaction: effective configuration + its identity land together
+        (synchronous=FULL), so a power cut can never leave hash without config."""
+        if not self.storage.is_write_allowed("queue_db"):
+            return False
+        with self.lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE;")
+                for key, value in (
+                    ("applied_config_json", str(canonical_json)),
+                    ("applied_config_version", str(int(version))),
+                    ("applied_config_hash", str(config_hash)),
+                    ("applied_config_at", str(applied_at)),
+                ):
+                    self.conn.execute(
+                        "INSERT INTO execution_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, value),
+                    )
+                self.conn.commit()
+                return True
+            except sqlite3.Error as exc:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                logger.critical("Applied-config persistence failed: %s", exc)
+                return False
+
+    # ============================================================
     # CLEANUP (Phase 0.5 retention)
     # ============================================================
 
