@@ -13,6 +13,7 @@ import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
+from provisioning import build_provisioning_zip
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import bcrypt
@@ -991,6 +992,57 @@ def revoke_device_credential(device_id: str, data: dict | None = None, user: dic
     except Exception as e:
         conn.rollback()
         raise e
+    finally:
+        conn.close()
+
+@app.post("/api/super-admin/devices/{device_id}/provisioning-package")
+def provisioning_package(device_id: str, request: Request, user: dict = Depends(require_role("super_admin"))):
+    """Rotate the device credential (old key stops working) and return a ZIP installer containing the
+    NEW key. The secret exists only in the ZIP body: not in JSON, not in logs, not in audit_log."""
+    device_id = require_uuid(device_id, "device_id")
+    api_url = os.environ.get("EMS_PUBLIC_API_URL") or (str(request.base_url).rstrip("/") + "/api")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT name, status, society_id FROM pi_devices WHERE id = %s", (device_id,))
+            dev = cur.fetchone()
+            if not dev:
+                raise HTTPException(404, "Device not found")
+            issued = issue_device_credential(cur, device_id, user, "provisioning")
+            log_audit(cur, user, dev["society_id"] or 0, "PROVISIONING_PACKAGE",
+                      {"device_id": device_id, "key_id": issued["key_id"], "api_url": api_url})
+            payload = build_provisioning_zip(device_id, dev["name"], issued["key_id"], issued["api_key"], api_url)
+        conn.commit()
+    except Exception as e:
+        conn.rollback(); raise e
+    finally:
+        conn.close()
+    return Response(content=payload, media_type="application/zip", headers={
+        "Content-Disposition": f'attachment; filename="ems-pi-provisioning-{device_id[:8]}.zip"',
+        "Cache-Control": "no-store, no-cache, must-revalidate, private", "Pragma": "no-cache",
+        "X-EMS-Key-Id": issued["key_id"], "X-EMS-Device-Id": device_id,
+    })
+
+@app.post("/api/super-admin/devices/{device_id}/feedback-hardware")
+def set_feedback_hardware(device_id: str, data: dict, user: dict = Depends(require_role("super_admin"))):
+    """Device-level 'feedback hardware physically installed' flag. Bumps the society config_version so the
+    canonical config (effective feedback = installed AND slot.feedback_enabled) re-converges (T7)."""
+    device_id = require_uuid(device_id, "device_id")
+    installed = (data or {}).get("installed") is True
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("UPDATE pi_devices SET feedback_hardware_installed=%s WHERE id=%s RETURNING society_id", (installed, device_id))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Device not found")
+            if row["society_id"]:
+                cur.execute("UPDATE societies SET config_version = config_version + 1 WHERE id=%s", (row["society_id"],))
+            log_audit(cur, user, row["society_id"] or 0, "FEEDBACK_HARDWARE_SET", {"device_id": device_id, "installed": installed})
+        conn.commit()
+        return {"device_id": device_id, "feedback_hardware_installed": installed}
+    except Exception as e:
+        conn.rollback(); raise e
     finally:
         conn.close()
 

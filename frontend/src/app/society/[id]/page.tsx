@@ -2,6 +2,7 @@
 import { useParams } from "next/navigation";
 import { OperationalDashboard } from "@/components/ops/OperationalDashboard";
 import { OpsShell, useRoleSession } from "@/components/ops/OpsShell";
+import { ProvisioningCenter } from "@/components/provisioning/ProvisioningCenter";
 
 // Super admins open any society by id; everyone else is pinned to their own tenant (backend re-checks).
 export default function SocietyOperations() {
@@ -12,7 +13,8 @@ export default function SocietyOperations() {
   const back = session.role === "super_admin" ? "/super-admin" : session.role === "member" ? "/member" : "/admin";
   return (
     <OpsShell session={session}>
-      <OperationalDashboard societyId={sid} readOnly={session.role === "member"} backHref={back} />
+      <OperationalDashboard key={sid || "none"} societyId={sid} readOnly={session.role === "member"} backHref={back} />
+      {session.role === "super_admin" && sid && <div className="mt-3"><ProvisioningCenter societyId={sid} /></div>}
     </OpsShell>
   );
 }
