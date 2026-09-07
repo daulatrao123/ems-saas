@@ -11,10 +11,15 @@ ROOT = Path(__file__).resolve().parents[1]
 PROTECTED = {
     "pi_firmware/gpio_manager.py": "b396b0d074b20f7fc7363bbbca0329c0471d9a54afbd598351f70431893c2dc8",
     "pi_firmware/storage_io_manager.py": "f41617296de4fda888fedb952f953d7db066ae57a9ee3bd75db9119782644fc5",
-    "pi_firmware/storage_manager.py": "ce6be1a3442abcff93322d78c03e63c00f640c17004de7638718d710296999a1",
+    # Phase 0.5 re-baseline (June 2026): storage bands 70/80/90/95 + STORAGE_FAILED,
+    # monitor_once(), transition events, free_mb/storage_state status, cleanup at >=80%.
+    "pi_firmware/storage_manager.py": "73319f7ddca2fdf4aa10df52279f134566873ba047df4c57a2b5f4339abe9b91",
     "pi_firmware/logger.py": "8e1ccc99f4944d87749ee99cc4e09bf41b8be454fa0e2b3d0ff037534e2bdec6",
     "pi_firmware/memory_manager.py": "c353672f37ac706cb3f961a87d19c48895892fafefead5e933183d29719ce5eb",
-    "pi_firmware/resource_guard.py": "c4d6f6278b9ccf58abf658e491651ab7c2cd8734a837d8656cfcc76d45a50449",
+    # Phase 0.5 re-baseline (June 2026): NORMAL/WARNING/CLEANUP_ELIGIBLE/CRITICAL/
+    # STORAGE_PROTECTION/STORAGE_FAILED classification; write policy per band;
+    # critical_log/state/queue_db still always allowed.
+    "pi_firmware/resource_guard.py": "bd5efcdd44a5a12e5afaa256505402217d2101fa1bb68bfaad763abf08920352",
 }
 
 def text(rel):

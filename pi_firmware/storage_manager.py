@@ -2,17 +2,20 @@ import glob
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import (
     DATA_DIR,
     LOG_DIR,
     TELEMETRY_DIR,
+    DIAGNOSTICS_DIR,
     NORMAL_LOG_RETENTION_DAYS,
-    CRITICAL_LOG_RETENTION_DAYS,
     TELEMETRY_RETENTION_DAYS,
     DIAGNOSTIC_RETENTION_DAYS,
     STORAGE_METRICS_INTERVAL_S,
+    STORAGE_CLEANUP_PERCENT,
+    STORAGE_REDUCED_PERCENT,
+    STORAGE_PROTECTED_PERCENT,
 )
 
 from logger import (
@@ -61,6 +64,14 @@ class StorageManager:
 
         self._last_cleanup = 0
 
+        # Phase 0.5: storage-band transitions waiting to be reported to the
+        # cloud (RAM only; drained by the controller, bounded).
+        self._transitions = []
+
+        self._transitions_max = 20
+
+        self._last_disk = self._disk_usage()
+
         self._last_telemetry_day = (
             datetime.now().strftime(
                 "%Y-%m-%d"
@@ -85,30 +96,116 @@ class StorageManager:
 
         while self._running:
 
-            try:
-
-                self.io_meter.update_metrics()
-
-                self.memory_monitor.update_metrics()
-
-                self.guard.evaluate_state()
-
-                self.cleanup_logs_if_needed()
-
-                # Persist storage counters hourly,
-                # not every monitor cycle.
-                self.io_meter.persist_counters()
-
-            except Exception as exc:
-
-                logger.critical(
-                    "Resource monitor failure: %s",
-                    exc,
-                )
+            self.monitor_once()
 
             time.sleep(
                 STORAGE_METRICS_INTERVAL_S
             )
+
+    def monitor_once(self):
+        """One monitor cycle. Separated from the loop so endurance
+        simulations can drive it deterministically."""
+
+        try:
+
+            self.io_meter.update_metrics()
+
+            self.memory_monitor.update_metrics()
+
+            self._last_disk = self._disk_usage()
+
+            old_state, new_state = (
+                self.guard.evaluate_state()
+            )
+
+            if old_state != new_state:
+                self._record_transition(
+                    old_state,
+                    new_state,
+                )
+
+            self.cleanup_logs_if_needed()
+
+            # Persist storage counters hourly,
+            # not every monitor cycle.
+            self.io_meter.persist_counters()
+
+        except Exception as exc:
+
+            logger.critical(
+                "Resource monitor failure: %s",
+                exc,
+            )
+
+    # ============================================================
+    # STORAGE STATE TRANSITIONS
+    # ============================================================
+
+    def _record_transition(
+        self,
+        old_state,
+        new_state,
+    ):
+
+        event = {
+            "from": old_state,
+            "to": new_state,
+            "used_percent": round(
+                float(
+                    self._last_disk["used_percent"]
+                ),
+                2,
+            ),
+            "free_mb": round(
+                float(
+                    self._last_disk["free_mb"]
+                ),
+                1,
+            ),
+            "timestamp": datetime.now(
+                timezone.utc
+            ).isoformat(),
+        }
+
+        self._transitions.append(event)
+
+        # Never let a flapping filesystem grow this list unbounded.
+        if len(self._transitions) > self._transitions_max:
+            self._transitions = (
+                self._transitions[-self._transitions_max:]
+            )
+
+        # Entering a degraded band is a critical record; recovery
+        # transitions use the normal channel (dropped under pressure).
+        rank = ResourceGuard.STATE_RANK
+
+        if rank.get(new_state, 0) >= rank[ResourceGuard.CRITICAL]:
+            logger.critical(
+                "STORAGE_STATE %s -> %s (used=%.2f%% free=%.1fMB)",
+                old_state,
+                new_state,
+                event["used_percent"],
+                event["free_mb"],
+            )
+        else:
+            logger.warning(
+                "STORAGE_STATE %s -> %s (used=%.2f%% free=%.1fMB)",
+                old_state,
+                new_state,
+                event["used_percent"],
+                event["free_mb"],
+            )
+
+    def pop_storage_transitions(self):
+        """Return and clear pending transitions (RAM only, no disk write)."""
+
+        pending = self._transitions
+        self._transitions = []
+        return pending
+
+    def get_storage_state(self):
+
+        return self.guard.get_state()
 
     # ============================================================
     # WRITE POLICY
@@ -127,7 +224,10 @@ class StorageManager:
     # CAPACITY
     # ============================================================
 
-    def _get_usage_percent(self):
+    @staticmethod
+    def _disk_usage():
+        """Single statvfs sample. On failure storage_ok=False and
+        used_percent=100 so the guard classifies STORAGE_FAILED."""
 
         try:
 
@@ -146,19 +246,29 @@ class StorageManager:
             )
 
             if total <= 0:
-                return 100.0
+                raise ValueError("statvfs total <= 0")
 
-            return (
-                (
-                    total
-                    - free
-                )
-                / total
-            ) * 100
+            return {
+                "used_percent": (
+                    (total - free) / total
+                ) * 100.0,
+                "free_mb": free / (1024 * 1024),
+                "storage_ok": True,
+            }
 
         except Exception:
 
-            return 100.0
+            return {
+                "used_percent": 100.0,
+                "free_mb": 0.0,
+                "storage_ok": False,
+            }
+
+    def _get_usage_percent(self):
+
+        return float(
+            self._disk_usage()["used_percent"]
+        )
 
     # ============================================================
     # CLEANUP
@@ -220,8 +330,14 @@ class StorageManager:
 
     def cleanup_logs_if_needed(self):
 
-        used_percent = (
-            self._get_usage_percent()
+        disk = self._last_disk
+
+        # An unreadable filesystem must not trigger deletions.
+        if not disk["storage_ok"]:
+            return
+
+        used_percent = float(
+            disk["used_percent"]
         )
 
         now = time.monotonic()
@@ -234,7 +350,8 @@ class StorageManager:
         ):
             return
 
-        if used_percent < 80:
+        # CLEANUP_ELIGIBLE band starts at 80% (inclusive).
+        if used_percent < STORAGE_CLEANUP_PERCENT:
             return
 
         self._last_cleanup = now
@@ -255,7 +372,12 @@ class StorageManager:
                 TELEMETRY_RETENTION_DAYS,
             )
 
-            if used_percent >= 90:
+            self._remove_old_files(
+                DIAGNOSTICS_DIR,
+                DIAGNOSTIC_RETENTION_DAYS,
+            )
+
+            if used_percent >= STORAGE_REDUCED_PERCENT:
 
                 self._remove_old_files(
                     LOG_DIR,
@@ -270,7 +392,7 @@ class StorageManager:
                     30,
                 )
 
-            if used_percent >= 95:
+            if used_percent >= STORAGE_PROTECTED_PERCENT:
 
                 self._remove_old_files(
                     LOG_DIR,
@@ -286,10 +408,7 @@ class StorageManager:
                 )
 
                 self._remove_old_files(
-                    os.path.join(
-                        DATA_DIR,
-                        "diagnostics",
-                    ),
+                    DIAGNOSTICS_DIR,
                     7,
                 )
 
@@ -417,9 +536,26 @@ class StorageManager:
 
     def get_status(self):
 
+        disk = self._last_disk
+
         return {
             "resource_state":
                 self.guard.get_state(),
+
+            "storage_state":
+                self.guard.get_state(),
+
+            "write_reduced":
+                self.guard.is_write_reduced(),
+
+            "used_percent":
+                float(disk["used_percent"]),
+
+            "free_mb":
+                float(disk["free_mb"]),
+
+            "storage_ok":
+                bool(disk["storage_ok"]),
 
             "storage":
                 self.io_meter.get_metrics(),

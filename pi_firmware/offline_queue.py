@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import (
     DB_FILE,
@@ -723,10 +723,6 @@ class OfflineQueue:
                 return False
 
     # ============================================================
-    # CLEANUP
-    # ============================================================
-
-    # ============================================================
     # T6 EXECUTION IDENTITY (reported in every sync)
     # ============================================================
 
@@ -761,9 +757,27 @@ class OfflineQueue:
             ).fetchone()
             return row[0] if row else None
 
-    def cleanup_acked(self):
+    # ============================================================
+    # CLEANUP (Phase 0.5 retention)
+    # ============================================================
+
+    # Retain ACKED history for 30 days OR the newest 500 ACKED rows,
+    # whichever keeps MORE. Only ACKED rows ever count or get deleted.
+    ACKED_RETENTION_DAYS = 30
+    ACKED_RETENTION_ROWS = 500
+    CLEANUP_BATCH_LIMIT = 100
+
+    def cleanup_acked(self, now=None):
         """
-        Deletes only acknowledged history.
+        Deletes only acknowledged history beyond the retention policy.
+
+        KEEP an ACKED row if:
+            acked_at >= now - 30 days
+            OR it ranks within the newest 500 ACKED rows.
+
+        Deletion is bounded to CLEANUP_BATCH_LIMIT rows per call so a
+        large backlog drains gradually over hourly runs. Returns the
+        number of rows deleted.
 
         Safety rule:
         NEVER delete DELIVERED / EXECUTING /
@@ -772,62 +786,75 @@ class OfflineQueue:
         """
 
         if not self.storage.is_write_allowed("queue_db"):
-            return
+            return 0
+
+        if now is None:
+            now = datetime.now(timezone.utc)
+
+        cutoff = (
+            now - timedelta(days=self.ACKED_RETENTION_DAYS)
+        ).isoformat()
 
         with self.lock:
             try:
-                self.conn.execute(
+                # acked_at of the 500th-newest ACKED row (NULL when fewer
+                # than 500 exist -> comparison is NULL -> nothing deleted).
+                deleted = self.conn.execute(
                     """
                     DELETE FROM commands
                     WHERE id IN (
                         SELECT id
                         FROM commands
                         WHERE ack_status='ACKED'
+                          AND acked_at IS NOT NULL
+                          AND acked_at < ?
+                          AND acked_at < (
+                              SELECT acked_at
+                              FROM commands
+                              WHERE ack_status='ACKED'
+                                AND acked_at IS NOT NULL
+                              ORDER BY acked_at DESC
+                              LIMIT 1 OFFSET ?
+                          )
                         ORDER BY acked_at ASC
-                        LIMIT 100
+                        LIMIT ?
                     )
-                    """
-                )
-
-                count = self.conn.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM commands
-                    """
-                ).fetchone()[0]
-
-                # 500 is a history target, not a reason
-                # to destroy safety-critical unacked records.
-                if count > 500:
-                    excess = count - 500
-
-                    self.conn.execute(
-                        """
-                        DELETE FROM commands
-                        WHERE id IN (
-                            SELECT id
-                            FROM commands
-                            WHERE ack_status='ACKED'
-                            ORDER BY acked_at ASC
-                            LIMIT ?
-                        )
-                        """,
-                        (excess,),
-                    )
+                    """,
+                    (
+                        cutoff,
+                        self.ACKED_RETENTION_ROWS - 1,
+                        self.CLEANUP_BATCH_LIMIT,
+                    ),
+                ).rowcount
 
                 self.conn.commit()
 
-                # Passive means:
-                # do not force a large blocking checkpoint.
-                self.conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE);"
-                )
+                if deleted > 0:
+                    # Passive means:
+                    # do not force a large blocking checkpoint.
+                    # Only issued when history actually changed.
+                    self.conn.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE);"
+                    )
+
+                return max(0, deleted)
 
             except sqlite3.Error as exc:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
                 logger.error(
                     "Queue cleanup failed: %s",
                     exc,
                 )
+                return 0
+
+    def count_acked(self):
+        with self.lock:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM commands WHERE ack_status='ACKED'"
+            ).fetchone()[0]
 
     # ============================================================
     # SHUTDOWN

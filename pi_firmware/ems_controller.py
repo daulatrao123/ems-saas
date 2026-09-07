@@ -1,6 +1,7 @@
 import signal
 import threading
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 
 from config import (
@@ -82,6 +83,12 @@ class EMSController:
         self._last_usage_day = self.state.last_usage_date
         self._last_telemetry = 0.0
         self._last_queue_cleanup = 0.0
+
+        # Phase 0.5: storage-state transition events awaiting cloud delivery.
+        # RAM only, bounded, deduplicated by eventId (backend ON CONFLICT DO NOTHING).
+        self._pending_events = []
+        self._pending_events_max = 20
+        self._events_in_flight = 0
 
         self._install_signal_handlers()
 
@@ -285,10 +292,39 @@ class EMSController:
             {},
         )
 
-        storage = resource_status.get(
-            "storage",
-            {},
+        storage_ok = bool(
+            resource_status.get(
+                "storage_ok",
+                False,
+            )
         )
+
+        storage_state = str(
+            resource_status.get(
+                "storage_state",
+                "STORAGE_FAILED",
+            )
+        )
+
+        # Explicit sentinel: -1.0 means statvfs failed (never a silent 0).
+        disk_free_mb = (
+            round(
+                float(
+                    resource_status.get(
+                        "free_mb",
+                        0.0,
+                    )
+                ),
+                1,
+            )
+            if storage_ok
+            else -1.0
+        )
+
+        self._collect_storage_events()
+
+        events = list(self._pending_events)
+        self._events_in_flight = len(events)
 
         return {
             "deviceId": DEVICE_ID,
@@ -303,21 +339,60 @@ class EMSController:
                 time.monotonic()
             ),
             "cpuTemp": 0.0,
-            "diskFreeMB": float(
-                storage.get(
-                    "free_mb",
-                    0,
-                )
+            "diskFreeMB": disk_free_mb,
+            "storageState": storage_state,
+            "storageUsedPercent": round(
+                float(
+                    resource_status.get(
+                        "used_percent",
+                        100.0,
+                    )
+                ),
+                2,
             ),
             "bootCount": 0,
             "watchdogEnabled": True,
             "clockSource": "system",
             "slots": slots,
             "memory": memory,
+            "events": events,
             # T6 execution identity: lets the cloud reconcile instead of re-delivering.
             "last_executed_sequence": self.queue.get_last_executed_sequence(),
             "executed_command_ids": self.queue.get_executed_command_ids(),
         }
+
+    # ============================================================
+    # STORAGE EVENTS (Phase 0.5)
+    # ============================================================
+
+    def _collect_storage_events(self):
+        """Turn storage-band transitions into one cloud event each.
+        Staying in the same band produces zero events."""
+
+        for tr in self.storage.pop_storage_transitions():
+            self._pending_events.append(
+                {
+                    "eventId": str(uuid.uuid4()),
+                    "timestamp": tr["timestamp"],
+                    "type": "storage",
+                    "message": (
+                        f"STORAGE_STATE {tr['from']} -> {tr['to']} "
+                        f"used={tr['used_percent']}% free={tr['free_mb']}MB"
+                    ),
+                }
+            )
+
+        if len(self._pending_events) > self._pending_events_max:
+            self._pending_events = (
+                self._pending_events[-self._pending_events_max:]
+            )
+
+    def _ack_sent_events(self):
+        # Cloud accepted the snapshot: drop exactly the events it received.
+        self._pending_events = (
+            self._pending_events[self._events_in_flight:]
+        )
+        self._events_in_flight = 0
 
     # ============================================================
     # DAILY USAGE / MONTHLY RESET
@@ -378,6 +453,7 @@ class EMSController:
         )
 
         if response is None:
+            self._events_in_flight = 0
             if (
                 self.state.system_state
                 != SystemState.FAULT
@@ -390,6 +466,8 @@ class EMSController:
         self._apply_cloud_config(
             response
         )
+
+        self._ack_sent_events()
 
         self._last_sync = time.monotonic()
 
