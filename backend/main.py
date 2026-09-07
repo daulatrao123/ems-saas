@@ -222,6 +222,64 @@ def require_uuid(value, what: str) -> str:
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
+
+# ---------------------------------------------------------------------------
+# Device credential lifecycle (per-device, revocable, rotatable).
+# Verifier = SHA-256 of a 256-bit random secret (or an operator-supplied secret
+# of >= 16 chars); plaintext exists only in the provisioning/rotation response.
+# ---------------------------------------------------------------------------
+MIN_DEVICE_SECRET_LEN = 16
+
+
+def new_device_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def new_key_id() -> str:
+    return "k_" + secrets.token_hex(6)
+
+
+def issue_device_credential(cur, device_id: str, user: dict | None, origin: str, secret: str | None = None,
+                            reason: str | None = None) -> dict:
+    """Inside the caller's transaction: lock device, revoke any active credential,
+    insert the new one. Returns the plaintext secret exactly once."""
+    cur.execute("SELECT id, status FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
+    dev = cur.fetchone()
+    if not dev:
+        raise HTTPException(404, "Device not found")
+    if str(dev["status"]).upper() == "RETIRED":
+        raise HTTPException(409, "Retired device cannot receive credentials")
+    if secret is not None:
+        if not isinstance(secret, str) or len(secret) < MIN_DEVICE_SECRET_LEN or len(secret) > 512:
+            raise HTTPException(400, f"api_key must be a string of {MIN_DEVICE_SECRET_LEN}-512 characters")
+    else:
+        secret = new_device_secret()
+    now = datetime.now(timezone.utc)
+    cur.execute("""UPDATE pi_device_credentials SET status='revoked', revoked_at=%s, revoked_by=%s, revoke_reason=%s
+                   WHERE device_id=%s AND status='active' RETURNING key_id""",
+                (now, (user or {}).get("id"), reason or "ROTATED", device_id))
+    revoked = [r["key_id"] for r in cur.fetchall()]
+    key_id = new_key_id()
+    cur.execute("""INSERT INTO pi_device_credentials (id, device_id, key_id, secret_hash, hash_alg, status, origin, created_at, created_by, rotated_at)
+                   VALUES (%s, %s, %s, %s, 'sha256', 'active', %s, %s, %s, %s)""",
+                (str(uuid.uuid4()), device_id, key_id, hash_api_key(secret), origin, now, (user or {}).get("id"),
+                 now if revoked else None))
+    if user is not None:
+        log_audit(cur, user, 0, "CREDENTIAL_ROTATED" if revoked else "CREDENTIAL_CREATED",
+                  {"device_id": str(device_id), "key_id": key_id, "revoked_key_ids": revoked, "origin": origin})
+    return {"device_id": str(device_id), "key_id": key_id, "api_key": secret, "revoked_key_ids": revoked}
+
+
+def revoke_device_credentials(cur, device_id: str, user: dict | None, reason: str) -> list:
+    now = datetime.now(timezone.utc)
+    cur.execute("""UPDATE pi_device_credentials SET status='revoked', revoked_at=%s, revoked_by=%s, revoke_reason=%s
+                   WHERE device_id=%s AND status='active' RETURNING key_id""",
+                (now, (user or {}).get("id"), reason, device_id))
+    revoked = [r["key_id"] for r in cur.fetchall()]
+    if user is not None and revoked:
+        log_audit(cur, user, 0, "CREDENTIAL_REVOKED", {"device_id": str(device_id), "key_ids": revoked, "reason": reason})
+    return revoked
+
 def log_audit(cur, user: dict, society_id: int, action: str, details: dict):
     cur.execute("""INSERT INTO audit_log (society_id, user_id, action, details, created_at)
                    VALUES (%s, %s, %s, %s, %s)""",
@@ -425,12 +483,20 @@ def authenticate_pi(
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
+            # credential -> device -> pi_devices -> authorization. Only the ACTIVE
+            # credential of THIS device is consulted; pi_devices.api_key_hash is
+            # no longer an authentication path.
             cur.execute(
-                "SELECT id, society_id, status FROM pi_devices WHERE id = %s AND api_key_hash = %s",
-                (device_id, hash_api_key(supplied_key)),
+                """SELECT d.id, d.society_id, d.status, c.secret_hash
+                   FROM pi_devices d
+                   LEFT JOIN pi_device_credentials c ON c.device_id = d.id AND c.status = 'active'
+                   WHERE d.id = %s""",
+                (device_id,),
             )
             dev = cur.fetchone()
-            if not dev:
+            supplied_hash = hash_api_key(supplied_key)
+            # Same response for unknown device / revoked / wrong secret (no enumeration).
+            if not dev or not dev["secret_hash"] or not hmac.compare_digest(supplied_hash, str(dev["secret_hash"])):
                 raise HTTPException(403, "Invalid Pi API key or Device ID.")
             if not dev["society_id"] or str(dev["status"]).upper() != "ASSIGNED":
                 raise HTTPException(403, "Device is not assigned to an active society.")
@@ -489,6 +555,7 @@ def bootstrap(request: Request):
             raw_api_key = str(uuid.uuid4())
             cur.execute("INSERT INTO pi_devices (id, society_id, name, api_key_hash, status, feedback_hardware_installed) VALUES (%s, %s, %s, %s, %s, %s)",
                         (device_id, sid, "Main Controller", hash_api_key(raw_api_key), "ASSIGNED", True))
+            issue_device_credential(cur, device_id, None, "bootstrap", secret=raw_api_key)
 
             cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
                         ("admin@ems.com", "Super Admin", bcrypt.hashpw(bootstrap_pass.encode(), bcrypt.gensalt()).decode(), "super_admin", None))
@@ -771,7 +838,9 @@ def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))
             if not society:
                 raise HTTPException(404, "Society not found")
             cur.execute("UPDATE societies SET status='RETIRED' WHERE id = %s", (sid,))
-            cur.execute("UPDATE pi_devices SET status='RETIRED', society_id=NULL WHERE society_id=%s", (sid,))
+            cur.execute("UPDATE pi_devices SET status='RETIRED', society_id=NULL WHERE society_id=%s RETURNING id", (sid,))
+            for row in cur.fetchall():
+                revoke_device_credentials(cur, str(row["id"]), user, "SOCIETY_RETIRED")
             log_audit(cur, user, sid, "RETIRE_SOCIETY", {})
         conn.commit()
     except Exception as e:
@@ -784,6 +853,61 @@ def delete_society(data: dict, user: dict = Depends(require_role("super_admin"))
 # ================================================================
 # SUPER-ADMIN — DEVICES (Inventory Lifecycle)
 # ================================================================
+
+@app.post("/api/super-admin/devices/{device_id}/credentials/rotate")
+def rotate_device_credential(device_id: str, data: dict | None = None, user: dict = Depends(require_role("super_admin"))):
+    """Atomically revoke the active credential and issue a new one. The plaintext
+    secret is returned ONLY here and must be provisioned onto the Pi out-of-band."""
+    device_id = require_uuid(device_id, "device_id")
+    supplied = (data or {}).get("api_key") if isinstance(data, dict) else None
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            issued = issue_device_credential(cur, device_id, user, "rotate", secret=supplied)
+        conn.commit()
+        return {"message": "Credential rotated", **issued}
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+@app.post("/api/super-admin/devices/{device_id}/credentials/revoke")
+def revoke_device_credential(device_id: str, data: dict | None = None, user: dict = Depends(require_role("super_admin"))):
+    """Immediately block the device credential; the device, its society and its
+    history stay intact. Idempotent."""
+    device_id = require_uuid(device_id, "device_id")
+    reason = str((data or {}).get("reason") or "REVOKED_BY_ADMIN")[:64] if isinstance(data, dict) else "REVOKED_BY_ADMIN"
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
+            if not cur.fetchone():
+                raise HTTPException(404, "Device not found")
+            revoked = revoke_device_credentials(cur, device_id, user, reason)
+        conn.commit()
+        return {"message": "Credential revoked" if revoked else "No active credential", "device_id": device_id, "revoked_key_ids": revoked}
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+@app.get("/api/super-admin/devices/{device_id}/credentials")
+def list_device_credentials(device_id: str, user: dict = Depends(require_role("super_admin"))):
+    device_id = require_uuid(device_id, "device_id")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""SELECT key_id, status, origin, hash_alg, created_at, rotated_at, revoked_at, revoke_reason
+                           FROM pi_device_credentials WHERE device_id=%s ORDER BY created_at DESC""", (device_id,))
+            rows = cur.fetchall()
+            for r in rows:
+                for k in ("created_at", "rotated_at", "revoked_at"):
+                    r[k] = r[k].isoformat() if r.get(k) else None
+            return {"device_id": device_id, "credentials": rows}
+    finally:
+        conn.close()
 
 @app.get("/api/super-admin/devices")
 def get_devices(user: dict = Depends(require_role("super_admin"))):
@@ -832,26 +956,27 @@ def save_device(data: dict, user: dict = Depends(require_role("super_admin"))):
                 if str(existing["status"]).upper() == "RETIRED":
                     raise HTTPException(409, "Retired device cannot be edited; create a new device")
                 if data.get("api_key"):
-                    api_key_hash = hash_api_key(data["api_key"])
-                    cur.execute("UPDATE pi_devices SET name=%s, society_id=%s, status=%s, api_key_hash=%s WHERE id=%s",
-                                (name, society_id, status, api_key_hash, device_id))
+                    cur.execute("UPDATE pi_devices SET name=%s, society_id=%s, status=%s WHERE id=%s",
+                                (name, society_id, status, device_id))
+                    issued = issue_device_credential(cur, device_id, user, "admin_save", secret=data["api_key"])
                 else:
                     cur.execute("UPDATE pi_devices SET name=%s, society_id=%s, status=%s WHERE id=%s",
                                 (name, society_id, status, device_id))
+                    issued = None
                 log_audit(cur, user, society_id if society_id else 0, "UPDATE_DEVICE", {"device_id": device_id, "name": name})
                 conn.commit()
-                return {"message": "Device updated"}
+                return {"message": "Device updated", **({"key_id": issued["key_id"]} if issued else {})}
             else:
                 device_id = str(uuid.uuid4())
-                raw_api_key = data.get("api_key") or str(uuid.uuid4())
-                api_key_hash = hash_api_key(raw_api_key)
+                raw_api_key = data.get("api_key") or new_device_secret()
 
                 cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status)
                                VALUES (%s, %s, %s, %s, %s)""",
-                            (device_id, society_id, name, api_key_hash, status))
+                            (device_id, society_id, name, hash_api_key(raw_api_key), status))
+                issued = issue_device_credential(cur, device_id, user, "admin_create", secret=raw_api_key)
                 log_audit(cur, user, society_id if society_id else 0, "CREATE_DEVICE", {"device_id": device_id, "name": name})
                 conn.commit()
-                return {"message": "Device created", "device_id": device_id, "api_key": raw_api_key}
+                return {"message": "Device created", "device_id": device_id, "api_key": raw_api_key, "key_id": issued["key_id"]}
     except Exception as e:
         conn.rollback()
         raise e
@@ -863,9 +988,10 @@ def delete_device(data: dict, user: dict = Depends(require_role("super_admin")))
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            device_id = data.get("id")
+            device_id = require_uuid(data.get("id"), "id")
             # RED 3 Fix: Do not DELETE. Retire to preserve history & audit logs.
             cur.execute("UPDATE pi_devices SET status='RETIRED', society_id=NULL WHERE id = %s", (device_id,))
+            revoke_device_credentials(cur, device_id, user, "DEVICE_RETIRED")
             log_audit(cur, user, 0, "RETIRE_DEVICE", {"device_id": device_id})
         conn.commit()
     except Exception as e:
