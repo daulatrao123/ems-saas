@@ -182,14 +182,39 @@ VALID_ROLES = {"super_admin", "society_admin", "member"}
 
 POSITIVE_VERIFICATION = {"VERIFIED_ON", "VERIFIED_OFF", "GPIO_CONFIRMED"}
 
-def resolve_ack_path(current: str, target: str, verification: str) -> list[str] | None:
+# Two completion contracts (P0-1):
+#  A) HARDWARE_COMMANDS: completed == physical state positively verified (POSITIVE_VERIFICATION).
+#  B) SOFTWARE_RESULTS:  completed == the Pi validated/applied/persisted the requested software operation.
+#     Each command has an explicit allowlisted result token; none of them is proof of physical state,
+#     and a software command can never pass through `hardware_verified`.
+HARDWARE_COMMANDS = {"set_active_slot", "off_slot", "off_all"}
+SOFTWARE_RESULTS = {
+    "set_days": {"CONFIG_ACCEPTED"}, "set_reset_day": {"CONFIG_ACCEPTED"},
+    "reset_days": {"STATE_RESET"}, "lcd_display": {"DISPLAY_UPDATED"},
+    "restart": {"RESTART_SCHEDULED"}, "reboot": {"REBOOT_SCHEDULED"},
+}
+
+def resolve_ack_path(current: str, target: str, verification: str, command: str = "") -> list[str] | None:
     """Return the FSM hops an ACK implies (current excluded, target included), or None if illegal.
 
     Direct edges come from COMMAND_TRANSITIONS. A Pi that executed offline and lost its
     intermediate ACKs may report only the terminal status; terminal ACKs therefore fast-forward
-    through the implied hops. Reaching `completed` still requires positive hardware verification,
-    and no path may pass through or leave a terminal/acked state.
+    through the implied hops. Hardware commands reach `completed` only with positive hardware
+    verification; software commands reach `completed` only with their allowlisted result token
+    and never via `hardware_verified`. No path may pass through or leave a terminal/acked state.
     """
+    if command in SOFTWARE_RESULTS:
+        if target == "hardware_verified":
+            return None
+        if target == "completed" and verification not in SOFTWARE_RESULTS[command]:
+            return None
+        if target in COMMAND_TRANSITIONS.get(current, set()):
+            return [target]
+        return {
+            ("executing", "completed"): ["completed"],
+            ("delivered", "completed"): ["executing", "completed"],
+            ("delivered", "failed"): ["executing", "failed"],
+        }.get((current, target))
     if target in COMMAND_TRANSITIONS.get(current, set()):
         return [target]
     fast_forward = {
@@ -1662,7 +1687,7 @@ def pi_command_ack(
             if status == current:
                 # Idempotent repeat of an already-applied status is harmless.
                 return {"success": True, "status": current, "idempotent": True}
-            path = resolve_ack_path(current, status, verification)
+            path = resolve_ack_path(current, status, verification, str(cmd["command"]))
             if path is None:
                 raise HTTPException(409, f"Invalid command transition {current} -> {status}")
 
@@ -1808,6 +1833,11 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
+            # P0-3: society-level reset_day (single source: societies.reset_day) for the authorized tenant only.
+            cur.execute("SELECT reset_day FROM societies WHERE id = %s", (sid,))
+            soc = cur.fetchone()
+            if not soc:
+                raise HTTPException(404, "Society not found")
             cur.execute("SELECT id, name FROM pi_devices WHERE society_id = %s ORDER BY name ASC", (sid,))
             devs = cur.fetchall()
 
@@ -1850,7 +1880,7 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "storage_state": ("FAILED" if pi.get("disk_free_mb", 0) < 0 else "OK") if pi and pi.get("disk_free_mb") is not None else "UNKNOWN",
                 })
 
-            return { "society_id": sid, "devices": devices_data }
+            return { "society_id": sid, "reset_day": soc["reset_day"] if soc["reset_day"] is not None else DEFAULT_RESET_DAY, "devices": devices_data }
     finally:
         conn.close()
 

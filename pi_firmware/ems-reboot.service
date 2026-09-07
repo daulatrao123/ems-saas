@@ -1,0 +1,10 @@
+[Unit]
+Description=EMS controller requested OS reboot
+RequiresMountsFor=/mnt/ems-data
+
+[Service]
+Type=oneshot
+# Marker content is ignored; it is removed BEFORE rebooting so it can never fire twice.
+ExecStart=/bin/rm -f /mnt/ems-data/reboot.request
+ExecStart=/bin/sync
+ExecStart=/bin/systemctl reboot

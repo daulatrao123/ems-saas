@@ -1,0 +1,10 @@
+[Unit]
+Description=EMS controller reboot request watcher (fixed operation, no command input)
+RequiresMountsFor=/mnt/ems-data
+
+[Path]
+PathExists=/mnt/ems-data/reboot.request
+Unit=ems-reboot.service
+
+[Install]
+WantedBy=multi-user.target

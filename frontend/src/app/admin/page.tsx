@@ -21,6 +21,7 @@ export default function AdminDashboard() {
   const [session, setSession] = useState<Session | null>(null);
   const [devices, setDevices] = useState<DashboardDevice[]>([]);
   const [registry, setRegistry] = useState<SocietyDevice[]>([]);
+  const [resetDay, setResetDay] = useState<number | null>(null);
   const [societyId, setSocietyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -34,6 +35,7 @@ export default function AdminDashboard() {
     try {
       const res = await api.get(`/api/admin/dashboard?society_id=${sid}`);
       setDevices(res.data.devices || []);
+      setResetDay(typeof res.data.reset_day === "number" ? res.data.reset_day : null);
     } catch {
       showToast("Failed to load dashboard", false);
     }
@@ -172,7 +174,7 @@ export default function AdminDashboard() {
               })}
             </div>
 
-            <OperationalControls deviceId={dev.id} queue={queueCommand}
+            <OperationalControls deviceId={dev.id} queue={queueCommand} resetDay={resetDay}
               slots={["A", "B", "C", "D"].filter((c) => dev.slots[c]).map((c) => ({ code: c, name: dev.slots[c].display_name || `Slot ${c}`, disabled: dev.slots[c].disabled }))} />
           </div>
         ))}

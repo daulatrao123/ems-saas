@@ -32,6 +32,19 @@ from offline_queue import OfflineQueue
 from gpio_manager import GPIOManager
 from api_client import ApiClient
 import ota_manager
+import config as _cfg
+
+# P0-1 software completion contract (mirrors backend SOFTWARE_RESULTS). A software result is
+# never a claim about physical GPIO state; software commands never enter the hardware queue/FSM.
+SOFTWARE_RESULT = {
+    "set_days": "CONFIG_ACCEPTED",
+    "set_reset_day": "CONFIG_ACCEPTED",
+    "reset_days": "STATE_RESET",
+    "lcd_display": "DISPLAY_UPDATED",
+    "restart": "RESTART_SCHEDULED",
+    "reboot": "REBOOT_SCHEDULED",
+}
+REBOOT_REQUEST_FILE = "reboot.request"
 
 
 # Phase 0.5.1: how often the (cheap, read-only) "is today's telemetry
@@ -112,6 +125,8 @@ class EMSController:
         self._boot_confirmed = False
         self._ota_requested = None
         self._restart_for_ota = False
+        self._restart_requested = False   # `restart` command: exit(3) -> systemd restarts us
+        self._reboot_requested = False    # `reboot` command: marker -> root path unit reboots OS
         self._ota_status = self._read_ota_status()
 
         self._last_sync = 0.0
@@ -185,6 +200,7 @@ class EMSController:
             return False
 
         self._recover_interrupted_commands()
+        self._clear_stale_reboot_request()
 
         if self.state.system_state != SystemState.FAULT:
             self.state.system_state = (
@@ -713,6 +729,94 @@ class EMSController:
     # COMMAND ACCEPTANCE
     # ============================================================
 
+    def _validate_software_command(self, command, slot, params):
+        """Deterministic Pi-side validation. Returns an error code or None (= accepted)."""
+        params = params if isinstance(params, dict) else {}
+        if command == "set_days":
+            if slot not in SUPPORTED_SLOTS:
+                return "INVALID_SLOT"
+            try:
+                days = int(params.get("days"))
+            except (TypeError, ValueError):
+                return "INVALID_TARGET_DAYS"
+            return None if 1 <= days <= 31 else "INVALID_TARGET_DAYS"
+        if command == "set_reset_day":
+            try:
+                day = int(params.get("day"))
+            except (TypeError, ValueError):
+                return "INVALID_RESET_DAY"
+            return None if 1 <= day <= 28 else "INVALID_RESET_DAY"
+        if command == "lcd_display":
+            # This firmware build has no display driver: never claim DISPLAY_UPDATED.
+            return "DISPLAY_UNAVAILABLE"
+        if command in ("reset_days", "restart", "reboot"):
+            return None
+        return "UNSUPPORTED_COMMAND"
+
+    def _run_software_command(self, command_id, command, slot, params, attempt):
+        if not self.api.push_ack(command_id, "EXECUTING", "PENDING", attempt=attempt):
+            return  # nothing mutated; the cloud re-delivers or expires the command
+        error = self._validate_software_command(command, slot, params)
+        if error is None and command == "reset_days":
+            # Real Pi-side mutation, persisted immediately (one state write). Re-delivery within the
+            # 5-minute command expiry re-zeroes counters that are already zero -> harmless.
+            self.state.reset_days(immediate=False)
+            if not self.state.save_state(immediate=True):
+                error = "CONFIG_PERSIST_FAILED"
+        elif error is None and command in ("restart", "reboot"):
+            error = self._restart_precondition_error()
+        if error:
+            self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", error, attempt=attempt)
+            return
+        result = SOFTWARE_RESULT[command]
+        if self.api.push_ack(command_id, "COMPLETED", result, attempt=attempt) and \
+                self.api.push_ack(command_id, "ACKED", result, attempt=attempt):
+            # Flag only once the cloud holds the terminal state: it can never re-deliver this
+            # command, so a restart/reboot can never loop.
+            if command == "restart":
+                self._restart_requested = True
+            elif command == "reboot":
+                self._reboot_requested = True
+
+    def _restart_precondition_error(self):
+        """RESTART = controller process exit(3) -> systemd Restart -> ota_boot.sh (existing OTA path).
+        REBOOT  = marker file consumed by the root-owned ems-reboot.path unit (fixed `systemctl reboot`).
+        Both are refused while an OTA boot is unconfirmed (a restart there would be read as a
+        failed health check and trigger rollback), and both wait for the hardware queue to be
+        fully ACKed before acting (same rule as OTA activation)."""
+        info = ota_manager.active_info()
+        if info and info.get("boot_confirmed") is False:
+            return "OTA_HEALTH_CHECK_IN_PROGRESS"
+        return None
+
+    def _reboot_request_path(self):
+        return os.path.join(_cfg.DATA_DIR, REBOOT_REQUEST_FILE)
+
+    def _clear_stale_reboot_request(self):
+        """A marker that survived a boot must never trigger a second reboot."""
+        try:
+            os.unlink(self._reboot_request_path())
+            logger.warning("Removed stale reboot request marker at boot.")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.critical("Could not remove stale reboot marker: %s", exc)
+
+    def write_reboot_request(self):
+        """Durable, content-free marker (one small write); the root path unit performs the reboot."""
+        path = self._reboot_request_path()
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+            try:
+                os.write(fd, b"reboot\n")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return True
+        except OSError as exc:
+            logger.critical("Reboot request could not be persisted: %s", exc)
+            return False
+
     def _accept_cloud_command(
         self,
         response: dict,
@@ -727,6 +831,14 @@ class EMSController:
             self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "INVALID_SLOT")
             return
 
+        if command in SOFTWARE_RESULT:
+            # Software operations never touch GPIO and never enter the hardware queue/FSM: validate,
+            # apply the (idempotent, bounded-by-command-expiry) Pi-side effect if any, then report the
+            # explicit software result. Config commits happen cloud-side on COMPLETED (T7 converges).
+            self._run_software_command(command_id, command, slot, response.get("params") or {},
+                                       response.get("attempt"))
+            return
+
         normalized = {
             "set_active_slot": "ACTIVATE",
             "off_slot": "DEACTIVATE",
@@ -734,14 +846,9 @@ class EMSController:
         }.get(command)
 
         if normalized is None:
-            logger.warning("Command %s is non-hardware or unsupported on Pi: %s", command_id, command)
-            if command in {"set_days", "set_reset_day", "reset_days", "lcd_display"}:
-                if self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE"):
-                    if self.api.push_ack(command_id, "COMPLETED", "NOT_AVAILABLE"):
-                        self.api.push_ack(command_id, "ACKED", "NOT_AVAILABLE")
-            else:
-                self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE")
-                self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "UNSUPPORTED_COMMAND")
+            logger.warning("Command %s is unsupported on Pi: %s", command_id, command)
+            self.api.push_ack(command_id, "EXECUTING", "NOT_AVAILABLE")
+            self.api.push_ack(command_id, "FAILED", "NOT_AVAILABLE", "UNSUPPORTED_COMMAND")
             return
 
         now = datetime.now(timezone.utc)
@@ -1105,6 +1212,12 @@ class EMSController:
                 if self._ota_requested and not self.queue.get_unacked():
                     self._run_ota_if_requested()
 
+                if (self._restart_requested or self._reboot_requested) and not self.queue.get_unacked():
+                    # Command is terminal AND acknowledged by the cloud -> no re-delivery, no loop.
+                    logger.critical("%s requested by cloud command; stopping controller.",
+                                    "Reboot" if self._reboot_requested else "Restart")
+                    self.running = False
+
                 time.sleep(0.25)
 
             except Exception as exc:
@@ -1149,7 +1262,12 @@ class EMSController:
 def main():
     controller = EMSController()
     controller.run()
-    if controller._restart_for_ota:
+    if controller._reboot_requested:
+        # Marker is consumed by ems-reboot.path (root) which runs a fixed `systemctl reboot`.
+        # We still exit(3) so the controller is back under systemd if the reboot never happens.
+        controller.write_reboot_request()
+        raise SystemExit(3)
+    if controller._restart_for_ota or controller._restart_requested:
         # Non-zero exit -> systemd restarts the service -> ota_boot.sh execs the
         # newly activated slot; an unconfirmed boot there is rolled back automatically.
         raise SystemExit(3)

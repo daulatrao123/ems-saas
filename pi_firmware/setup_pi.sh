@@ -62,7 +62,12 @@ chown root:pi "$DATA_MOUNT"
 chmod 0770 "$DATA_MOUNT"
 
 install -m 0644 "$(dirname "$0")/ems-controller.service" /etc/systemd/system/ems-controller.service
+# Reboot-on-request: root-owned path unit runs a FIXED `systemctl reboot` when the controller
+# (user pi, NoNewPrivileges) drops the content-free marker /mnt/ems-data/reboot.request.
+install -m 0644 "$(dirname "$0")/ems-reboot.path" /etc/systemd/system/ems-reboot.path
+install -m 0644 "$(dirname "$0")/ems-reboot.service" /etc/systemd/system/ems-reboot.service
 systemctl daemon-reload
+systemctl enable ems-reboot.path || true
 systemctl restart systemd-journald || true
 mount "$DATA_MOUNT" 2>/dev/null || mount -a
 

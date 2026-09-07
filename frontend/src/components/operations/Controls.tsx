@@ -42,9 +42,12 @@ export function SystemControls({ deviceId, queue }: { deviceId: string; queue: Q
   );
 }
 
-// Monthly reset day (1-28) -> set_reset_day {day}. Current value is not exposed by /api/admin/dashboard (backend untouched).
-export function ResetDayControl({ deviceId, queue }: { deviceId: string; queue: QueueFn }) {
-  const [day, setDay] = useState("1"); const [busy, setBusy] = useState(false);
+// Monthly reset day (1-28) -> set_reset_day {day}; pre-filled from the dashboard's society reset_day.
+export function ResetDayControl({ deviceId, current, queue }: { deviceId: string; current: number | null; queue: QueueFn }) {
+  const [day, setDay] = useState(String(current ?? 1));
+  const [seen, setSeen] = useState(current);
+  if (current !== seen) { setSeen(current); if (current != null) setDay(String(current)); }  // adjust when the prop changes
+  const [busy, setBusy] = useState(false);
   const n = Number(day); const valid = Number.isInteger(n) && n >= 1 && n <= 28;
   const submit = async () => {
     if (!window.confirm(`Set monthly reset day to ${n}?`)) return;
@@ -53,8 +56,9 @@ export function ResetDayControl({ deviceId, queue }: { deviceId: string; queue: 
   return (
     <div className="flex items-center gap-2" data-testid={`reset-day-control-${deviceId}`}>
       <span className="text-[10px] uppercase tracking-wide text-gray-500">Monthly reset day</span>
+      {current != null && <span data-testid={`reset-day-current-${deviceId}`} className="text-[10px] font-mono text-gray-300">current: {current}</span>}
       <input data-testid={`reset-day-input-${deviceId}`} type="number" min={1} max={28} value={day} onChange={(e) => setDay(e.target.value)} className={`${ctlInput} w-16`} />
-      <button data-testid={`cmd-set_reset_day-${deviceId}`} onClick={submit} disabled={busy || !valid} className={`${ctlBtn} ${tone.amber}`}>SET RESET DAY</button>
+      <button data-testid={`cmd-set_reset_day-${deviceId}`} onClick={submit} disabled={busy || !valid || n === current} className={`${ctlBtn} ${tone.amber}`}>SET RESET DAY</button>
     </div>
   );
 }
