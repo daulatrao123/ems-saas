@@ -357,6 +357,22 @@ def revoke_device_credentials(cur, device_id: str, user: dict | None, reason: st
         log_audit(cur, user, 0, "CREDENTIAL_REVOKED", {"device_id": str(device_id), "key_ids": revoked, "reason": reason})
     return revoked
 
+def assert_society_name_available(cur, name: str, exclude_id: int | None = None) -> None:
+    """P1 business rule (== migration 0008 index): lower(btrim(name)) unique among non-RETIRED societies."""
+    cur.execute("""SELECT id FROM societies
+                   WHERE status <> 'RETIRED' AND lower(btrim(name)) = lower(btrim(%s)) AND id IS DISTINCT FROM %s
+                   LIMIT 1""", (name, exclude_id))
+    if cur.fetchone():
+        raise HTTPException(409, "A society with this name already exists")
+
+
+def society_conflict_or_raise(exc: Exception):
+    """DB unique-index backstop (concurrent inserts): map the violation to the same 409."""
+    if isinstance(exc, psycopg.errors.UniqueViolation) and "ux_societies_active_normalized_name" in str(exc):
+        raise HTTPException(409, "A society with this name already exists")
+    raise exc
+
+
 def log_audit(cur, user: dict, society_id: int, action: str, details: dict):
     metric_inc("audit_rows")
     cur.execute("""INSERT INTO audit_log (society_id, user_id, action, details, created_at)
@@ -844,10 +860,14 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
             }
 
             if sid:
+                assert_society_name_available(cur, society["name"], exclude_id=int(sid))
                 cur.execute("""UPDATE societies SET name=%s, location=%s, reset_day=%s, config_version=config_version+1 WHERE id=%s""",
                             (society["name"], society["location"], society["reset_day"], sid))
                 new_sid = int(sid)
             else:
+                if not society["name"].strip():
+                    raise HTTPException(400, "name required")
+                assert_society_name_available(cur, society["name"])
                 cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code, config_version, reset_day)
                                VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s) RETURNING id""",
                             (society["name"], society["location"], society["plan"], society["status"],
@@ -903,7 +923,7 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
         conn.commit()
     except Exception as e:
         conn.rollback()
-        raise e
+        society_conflict_or_raise(e)
     finally:
         conn.close()
     return {"message": "Saved"}
@@ -1032,6 +1052,7 @@ def create_society(data: dict, user: dict = Depends(require_role("super_admin"))
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            assert_society_name_available(cur, name)
             cur.execute("""INSERT INTO societies (name, location, plan, status, tailscale_ip, pi_port, society_code, config_version, reset_day)
                            VALUES (%s, %s, 'Basic', 'active', '', 5000, %s, 1, %s) RETURNING id""",
                         (name, location, f"SOC-{name[:4].upper()}", reset_day))
@@ -1039,7 +1060,7 @@ def create_society(data: dict, user: dict = Depends(require_role("super_admin"))
             log_audit(cur, user, sid, "CREATE_SOCIETY", {"name": name, "location": location, "reset_day": reset_day, "origin": "provisioning"})
         conn.commit()
     except Exception as e:
-        conn.rollback(); raise e
+        conn.rollback(); society_conflict_or_raise(e)
     finally:
         conn.close()
     return {"message": "Society created", "society_id": sid, "name": name, "location": location, "reset_day": reset_day}
