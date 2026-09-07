@@ -195,22 +195,62 @@ class EMSController:
     # ============================================================
 
     def _restore_applied_config(self):
-        """Boot: run the last durably applied configuration (offline-safe)."""
+        """Boot: restore the last durably applied configuration as DATA only.
+
+        Safety boundary: GPIOManager() has already driven every relay output to
+        its safe OFF startup state before this runs, and nothing in this path
+        touches hardware. Restored data only shapes later decisions (slot
+        visibility, feedback verification, reconciliation); relays are energised
+        exclusively through the command path (transition_slot) after boot().
+
+        The stored blob is re-validated through the same canonicaliser as cloud
+        config (schema, ranges, known hardware profile, feedback clamp), must
+        re-hash to the stored hash, and must match the profile the GPIO layer
+        was initialised with. Any failure -> keep safe defaults, record ONE
+        bounded error code (reported in sync, cleared by the next good apply).
+        """
         stored = self.queue.get_applied_config()
         if not stored:
             return
+
         try:
-            canonical = json.loads(stored["json"])
+            loaded = json.loads(stored["json"])
+            if not isinstance(loaded, dict):
+                raise ConfigError("UNKNOWN_CONFIG_ERROR")
+            canonical = canonical_device_config(
+                loaded.get("hardware_profile"),
+                loaded.get("feedback_hardware_installed"),
+                loaded.get("reset_day"),
+                loaded.get("slots"),
+                known_profiles=HARDWARE_PROFILES,
+            )
             if config_hash(canonical) != stored["hash"]:
-                logger.critical("Stored applied config hash mismatch; ignoring stored config.")
-                return
-        except (ValueError, TypeError) as exc:
-            logger.critical("Stored applied config unreadable: %s", exc)
+                raise ConfigError("CONFIG_HASH_FAILED")
+            self._require_gpio_profile(canonical)
+        except ConfigError as exc:
+            code = exc.code
+        except (ValueError, TypeError):
+            code = "UNKNOWN_CONFIG_ERROR"
+        else:
+            self._install_effective_config(canonical)
+            self._applied_version = stored["version"]
+            self._applied_hash = stored["hash"]
+            self._applied_at = stored["at"]
             return
-        self._install_effective_config(canonical)
-        self._applied_version = stored["version"]
-        self._applied_hash = stored["hash"]
-        self._applied_at = stored["at"]
+
+        # Rejected: hardware stays in the safe startup state, defaults remain
+        # active, cloud sync continues and can re-apply the desired revision.
+        self._config_error = code
+        logger.critical(
+            "Stored applied config rejected at boot (%s); running safe defaults until cloud sync.",
+            code,
+        )
+
+    def _require_gpio_profile(self, canonical):
+        """A configuration may only be installed for the hardware profile the
+        GPIO layer was initialised with (pins are bound at construction)."""
+        if HARDWARE_PROFILES.get(canonical["hardware_profile"]) != self.gpio.profile:
+            raise ConfigError("INVALID_HARDWARE_PROFILE")
 
     def _install_effective_config(self, canonical):
         # Mutate in place: GPIOManager holds a reference to this dict.
@@ -246,6 +286,7 @@ class EMSController:
                 response.get("slots"),
                 known_profiles=HARDWARE_PROFILES,
             )
+            self._require_gpio_profile(canonical)
             new_hash = config_hash(canonical)
         except ConfigError as exc:
             self._config_error = exc.code
