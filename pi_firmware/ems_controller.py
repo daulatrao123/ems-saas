@@ -33,6 +33,7 @@ from gpio_manager import GPIOManager
 from api_client import ApiClient
 import ota_manager
 import config as _cfg
+from smart_health import SmartHealthMonitor
 
 # P0-1 software completion contract (mirrors backend SOFTWARE_RESULTS). A software result is
 # never a claim about physical GPIO state; software commands never enter the hardware queue/FSM.
@@ -127,6 +128,9 @@ class EMSController:
         self._restart_for_ota = False
         self._restart_requested = False   # `restart` command: exit(3) -> systemd restarts us
         self._reboot_requested = False    # `reboot` command: marker -> root path unit reboots OS
+        # Best-effort SMART/NAND diagnostics: hourly, read-only, persists only on state change.
+        self.smart = SmartHealthMonitor(os.environ.get("EMS_DATA_DEVICE", "/dev/mmcblk0"),
+                                        os.path.join(_cfg.HEALTH_DIR, "smart.json"), logger)
         self._ota_status = self._read_ota_status()
 
         self._last_sync = 0.0
@@ -1211,6 +1215,8 @@ class EMSController:
 
                 if self._ota_requested and not self.queue.get_unacked():
                     self._run_ota_if_requested()
+
+                self.smart.maybe_collect()
 
                 if (self._restart_requested or self._reboot_requested) and not self.queue.get_unacked():
                     # Command is terminal AND acknowledged by the cloud -> no re-delivery, no loop.

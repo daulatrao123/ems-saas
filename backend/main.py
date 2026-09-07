@@ -999,6 +999,23 @@ def revoke_device_credential(device_id: str, data: dict | None = None, user: dic
     finally:
         conn.close()
 
+@app.get("/api/super-admin/audit")
+def get_audit(limit: int = 50, society_id: int | None = None, device_id: str | None = None, user: dict = Depends(require_role("super_admin"))):
+    """Read-only operator audit trail (newest first, bounded). audit_log never contains secrets by design."""
+    limit = max(1, min(int(limit), 200))
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            q = "SELECT a.id, a.created_at, a.action, a.society_id, a.details, u.email AS actor FROM audit_log a LEFT JOIN users u ON u.id = a.user_id WHERE 1=1"
+            params: list = []
+            if society_id is not None: q += " AND a.society_id = %s"; params.append(society_id)
+            if device_id: q += " AND (a.device_id = %s OR a.details->>'device_id' = %s)"; d = require_uuid(device_id, "device_id"); params += [d, d]
+            cur.execute(q + " ORDER BY a.id DESC LIMIT %s", (*params, limit))
+            return {"events": [{"id": r["id"], "ts": r["created_at"].isoformat() if r["created_at"] else None, "action": r["action"],
+                                "society_id": r["society_id"], "actor": r["actor"], "details": r["details"]} for r in cur.fetchall()]}
+    finally:
+        conn.close()
+
 @app.post("/api/super-admin/devices/{device_id}/provisioning-package")
 def provisioning_package(device_id: str, request: Request, user: dict = Depends(require_role("super_admin"))):
     """Rotate the device credential (old key stops working) and return a ZIP installer containing the
