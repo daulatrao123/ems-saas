@@ -1855,11 +1855,11 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             # P0-3: society-level reset_day (single source: societies.reset_day) for the authorized tenant only.
-            cur.execute("SELECT reset_day FROM societies WHERE id = %s", (sid,))
+            cur.execute("SELECT name, location, plan, society_code, status, reset_day FROM societies WHERE id = %s", (sid,))
             soc = cur.fetchone()
             if not soc:
                 raise HTTPException(404, "Society not found")
-            cur.execute("SELECT id, name FROM pi_devices WHERE society_id = %s ORDER BY name ASC", (sid,))
+            cur.execute("SELECT id, name, firmware_version FROM pi_devices WHERE society_id = %s ORDER BY name ASC", (sid,))
             devs = cur.fetchall()
 
             devices_data = []
@@ -1899,9 +1899,46 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "config_error": pi.get("config_error") if pi else None,
                     "ota_state": pi.get("ota_state") if pi else None,
                     "storage_state": ("FAILED" if pi.get("disk_free_mb", 0) < 0 else "OK") if pi and pi.get("disk_free_mb") is not None else "UNKNOWN",
+                    # Real Pi-reported telemetry already stored by /api/pi/sync (read-only exposure; None = never reported)
+                    "firmware_version": dev.get("firmware_version"),
+                    "last_sync": pi["last_sync"].isoformat() if pi and pi.get("last_sync") else None,
+                    "telemetry": {
+                        "cpu_temp": pi.get("cpu_temp") if pi else None,
+                        "uptime_seconds": pi.get("uptime_seconds") if pi else None,
+                        "boot_count": pi.get("boot_count") if pi else None,
+                    },
                 })
 
-            return { "society_id": sid, "reset_day": soc["reset_day"] if soc["reset_day"] is not None else DEFAULT_RESET_DAY, "devices": devices_data }
+            return {
+                "society_id": sid,
+                "society": {"name": soc["name"], "location": soc["location"], "plan": soc["plan"], "society_code": soc["society_code"], "status": soc["status"]},
+                "reset_day": soc["reset_day"] if soc["reset_day"] is not None else DEFAULT_RESET_DAY,
+                "devices": devices_data,
+            }
+    finally:
+        conn.close()
+
+@app.get("/api/admin/pi-commands")
+def get_pi_commands(society_id: str, device_id: str, limit: int = 25, user: dict = Depends(require_society_access)):
+    """Read-only, tenant-scoped command history (newest first, bounded) for Last Response / logs."""
+    sid = int(society_id); limit = max(1, min(int(limit), 50))
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""SELECT c.id, c.command, c.slot, c.params, c.sequence_no, c.status, c.result, c.error, c.attempt_count,
+                                  c.created_at, c.delivered_at, c.executing_at, c.hardware_verified_at, c.completed_at, c.acked_at, c.expires_at
+                           FROM pi_commands c JOIN pi_devices d ON d.id = c.device_id
+                           WHERE d.society_id = %s AND c.device_id = %s
+                           ORDER BY c.sequence_no DESC LIMIT %s""", (sid, device_id, limit))
+            rows = cur.fetchall()
+        iso = lambda v: v.isoformat() if v else None
+        return {"commands": [{
+            "id": str(r["id"]), "command": r["command"], "slot": r["slot"] or "", "params": r["params"] or {},
+            "sequence_no": r["sequence_no"], "status": r["status"], "result": r["result"], "error": r["error"], "attempt_count": r["attempt_count"],
+            "created_at": iso(r["created_at"]), "delivered_at": iso(r["delivered_at"]), "executing_at": iso(r["executing_at"]),
+            "hardware_verified_at": iso(r["hardware_verified_at"]), "completed_at": iso(r["completed_at"]), "acked_at": iso(r["acked_at"]),
+            "expires_at": iso(r["expires_at"]),
+        } for r in rows]}
     finally:
         conn.close()
 
@@ -1921,7 +1958,8 @@ def map_events(raw):
     return out
 
 @app.get("/api/admin/pi-events")
-def get_pi_events(society_id: str, device_id: str = None, last_id: int = 0, user: dict = Depends(require_society_access)):
+def get_pi_events(society_id: str, device_id: str = None, last_id: int = 0, latest: int = 0, user: dict = Depends(require_society_access)):
+    """Default: incremental oldest-first after last_id (unchanged). latest=N (1..100): newest N first, bounded."""
     sid = int(society_id)
     conn = get_db()
     try:
@@ -1931,12 +1969,16 @@ def get_pi_events(society_id: str, device_id: str = None, last_id: int = 0, user
             if device_id:
                 query += " AND e.device_id = %s"
                 params.append(device_id)
-            query += " ORDER BY e.id ASC LIMIT 100"
+            if latest:
+                query += " ORDER BY e.id DESC LIMIT %s"
+                params.append(max(1, min(int(latest), 100)))
+            else:
+                query += " ORDER BY e.id ASC LIMIT 100"
 
             cur.execute(query, params)
             events = cur.fetchall()
             mapped = map_events(events)
-            return {"events": mapped, "last_id": mapped[-1]["id"] if mapped else last_id}
+            return {"events": mapped, "last_id": (max(e["id"] for e in mapped) if mapped else last_id)}
     finally:
         conn.close()
 

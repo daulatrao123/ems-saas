@@ -7,7 +7,8 @@ import { logout } from "@/lib/auth";
 export default function Sidebar({ role, name = "" }: { role: string; name?: string }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
-  useEffect(() => { setOpen(false); }, [pathname]);
+  const [seenPath, setSeenPath] = useState(pathname);
+  if (pathname !== seenPath) { setSeenPath(pathname); setOpen(false); }  // close drawer on navigation
   useEffect(() => { document.body.style.overflow = open ? "hidden" : ""; return () => { document.body.style.overflow = ""; }; }, [open]);
 
   const superAdminLinks = [{ href: "/super-admin", label: "All Societies", icon: "\uD83C\uDFE2" }];
