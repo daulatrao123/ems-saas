@@ -174,6 +174,27 @@ class ApiClient:
             return False
 
     # ============================================================
+    # FIRMWARE MANIFEST (signed; verified by ota_manager, never trusted here)
+    # ============================================================
+
+    def download_firmware(self, version: str):
+        try:
+            response = self.session.get(
+                f"{self.base_url}/pi/firmware-download",
+                params={"version": str(version)},
+                timeout=max(API_TIMEOUT_S, 60),
+            )
+            if response.status_code != 200:
+                return None
+            if len(response.content) > 3 * 1024 * 1024:
+                return None
+            data = response.json()
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.error("Firmware manifest download failed: %s", exc)
+            return None
+
+    # ============================================================
     # CONNECTION TEST
     # ============================================================
 

@@ -73,6 +73,8 @@ EXECUTED_IDS_MAX = 50  # bound on executed_command_ids[] accepted per sync (T6)
 # ---------------------------------------------------------------------------
 import json as _json
 CONFIG_STATES = ("DESIRED", "PENDING_APPLY", "APPLIED", "DRIFTED", "FAILED")
+OTA_STATES = ("ACTIVE", "DOWNLOADING", "VERIFIED", "STAGED", "ACTIVATING", "HEALTH_CHECK", "FAILED", "ROLLED_BACK")
+OTA_MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 CONFIG_ERROR_CODES = ("INVALID_HARDWARE_PROFILE", "INVALID_SLOT", "INVALID_TARGET_DAYS", "INVALID_RESET_DAY",
                       "INVALID_FEEDBACK_CONFIGURATION", "INVALID_DISPLAY_NAME", "CONFIG_PERSIST_FAILED",
                       "CONFIG_HASH_FAILED", "UNKNOWN_CONFIG_ERROR")
@@ -1082,20 +1084,36 @@ def save_firmware_version(data: dict, user: dict = Depends(require_role("super_a
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            version = data.get("version", "").strip()
+            version = str(data.get("version", "")).strip()
             code = data.get("code", "")
             changelog = data.get("changelog", "")
-            forced = data.get("forced", False)
-            if not version or not code:
+            forced = bool(data.get("forced", False))
+            if not version or not isinstance(code, str) or not code:
                 raise HTTPException(400, "Version and code required")
-
+            if len(code.encode("utf-8")) > OTA_MAX_ARTIFACT_BYTES:
+                raise HTTPException(413, "Firmware artifact too large")
+            # Signed release metadata (signature produced OFFLINE with the private key; the
+            # backend never signs). sha256 is recomputed here and must match if supplied.
+            sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
+            supplied_sha = str(data.get("sha256") or "").strip().lower()
+            if supplied_sha and supplied_sha != sha256:
+                raise HTTPException(400, "sha256 does not match code")
+            signature = data.get("signature"); key_id = data.get("key_id"); min_fw = data.get("min_firmware_version")
+            for name, val in (("signature", signature), ("key_id", key_id), ("min_firmware_version", min_fw)):
+                if val is not None and (not isinstance(val, str) or len(val) > 512):
+                    raise HTTPException(400, f"{name} must be a string")
+            if forced and not (signature and key_id):
+                raise HTTPException(400, "Only signed releases (signature + key_id) can be forced to devices")
+            now = datetime.now(timezone.utc)
             if forced:
                 cur.execute("UPDATE firmware_versions SET forced = FALSE")
-
-            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at)
-                           VALUES (%s, %s, %s, %s, %s, %s)
-                           ON CONFLICT (version) DO UPDATE SET code=%s, changelog=%s, forced=%s, updated_at=%s""",
-                        (version, code, changelog, forced, datetime.now(timezone.utc), datetime.now(timezone.utc), code, changelog, forced, datetime.now(timezone.utc)))
+            cur.execute("""INSERT INTO firmware_versions (version, code, changelog, forced, created_at, updated_at, sha256, signature, key_id, min_firmware_version)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (version) DO UPDATE SET code=EXCLUDED.code, changelog=EXCLUDED.changelog, forced=EXCLUDED.forced,
+                               updated_at=EXCLUDED.updated_at, sha256=EXCLUDED.sha256, signature=EXCLUDED.signature,
+                               key_id=EXCLUDED.key_id, min_firmware_version=EXCLUDED.min_firmware_version""",
+                        (version, code, changelog, forced, now, now, sha256, signature, key_id, min_fw))
+            log_audit(cur, user, 0, "FIRMWARE_RELEASE_SAVED", {"version": version, "sha256": sha256, "key_id": key_id, "forced": forced, "signed": bool(signature)})
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1123,6 +1141,12 @@ def force_firmware(data: dict, user: dict = Depends(require_role("super_admin"))
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT signature, key_id FROM firmware_versions WHERE version = %s", (data.get("version"),))
+            rel = cur.fetchone()
+            if not rel:
+                raise HTTPException(404, "Version not found")
+            if not (rel["signature"] and rel["key_id"]):
+                raise HTTPException(400, "Only signed releases can be forced to devices")
             cur.execute("UPDATE firmware_versions SET forced = FALSE")
             cur.execute("UPDATE firmware_versions SET forced = TRUE WHERE version = %s", (data.get("version"),))
         conn.commit()
@@ -1143,11 +1167,17 @@ def download_firmware(
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT code FROM firmware_versions WHERE version = %s", (version,))
+            cur.execute("SELECT version, code, sha256, signature, key_id, min_firmware_version FROM firmware_versions WHERE version = %s", (version,))
             fv = cur.fetchone()
             if not fv:
                 raise HTTPException(404, "Version not found")
-            return PlainTextResponse(fv["code"], media_type="text/plain", headers={"X-EMS-Device-ID": str(device_id)})
+            if not (fv["signature"] and fv["key_id"]):
+                raise HTTPException(409, "Release is not signed; refusing to serve to devices")
+            return JSONResponse({"version": fv["version"], "code": fv["code"],
+                                 "sha256": fv["sha256"] or hashlib.sha256(fv["code"].encode("utf-8")).hexdigest(),
+                                 "signature": fv["signature"], "key_id": fv["key_id"],
+                                 "min_firmware_version": fv["min_firmware_version"]},
+                                headers={"X-EMS-Device-ID": str(device_id)})
     finally:
         conn.close()
 
@@ -1226,8 +1256,30 @@ def pi_sync(
             if raw_err is not None and raw_err not in CONFIG_ERROR_CODES:
                 raise HTTPException(400, "config_apply_error must be a known code")
 
-            cur.execute("SELECT applied_config_version, applied_config_hash, applied_config_at FROM pi_state WHERE device_id=%s", (device_id,))
+            # --- Signed OTA: desired = the single forced SIGNED release; Pi-reported state validated.
+            cur.execute("SELECT version FROM firmware_versions WHERE forced = TRUE AND signature IS NOT NULL AND key_id IS NOT NULL LIMIT 1")
+            forced_row = cur.fetchone()
+            ota_desired = forced_row["version"] if forced_row else None
+            ota_state = payload.get("otaState")
+            if ota_state is not None and ota_state not in OTA_STATES:
+                raise HTTPException(400, "otaState must be a known OTA state")
+            for f in ("otaVersion", "otaError", "lastGoodFirmwareVersion", "firmwareVersion"):
+                if payload.get(f) is not None and (not isinstance(payload.get(f), str) or len(payload[f]) > 128):
+                    raise HTTPException(400, f"{f} must be a short string")
+            ota_attempts = payload.get("otaAttempts")
+            if ota_attempts is not None and (isinstance(ota_attempts, bool) or not isinstance(ota_attempts, int) or ota_attempts < 0):
+                raise HTTPException(400, "otaAttempts must be a non-negative integer")
+
+            cur.execute("SELECT applied_config_version, applied_config_hash, applied_config_at, ota_state, ota_version, ota_attempts, ota_last_error, ota_updated_at, last_good_firmware_version FROM pi_state WHERE device_id=%s", (device_id,))
             prev = cur.fetchone() or {}
+            ota_changed = ota_state is not None and (ota_state != prev.get("ota_state") or payload.get("otaVersion") != prev.get("ota_version")
+                                                     or payload.get("otaError") != prev.get("ota_last_error"))
+            eff_ota_state = ota_state if ota_state is not None else prev.get("ota_state")
+            eff_ota_version = payload.get("otaVersion") if ota_state is not None else prev.get("ota_version")
+            eff_ota_attempts = ota_attempts if ota_state is not None else prev.get("ota_attempts")
+            eff_ota_error = payload.get("otaError") if ota_state is not None else prev.get("ota_last_error")
+            eff_ota_updated = now if ota_changed else prev.get("ota_updated_at")
+            eff_last_good = payload.get("lastGoodFirmwareVersion") if ota_state is not None else prev.get("last_good_firmware_version")
             # Legacy sync (no fields) must never erase stored convergence evidence.
             eff_av = raw_av if reports_applied else prev.get("applied_config_version")
             eff_ah = raw_ah if reports_applied else prev.get("applied_config_hash")
@@ -1235,8 +1287,9 @@ def pi_sync(
             config_state = derive_config_state(cloud_config_version, desired_hash, eff_av, eff_ah, raw_err)
 
             cur.execute("""INSERT INTO pi_state (device_id, active_slot, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason, config_version,
-                                                 desired_config_hash, applied_config_version, applied_config_hash, applied_config_at, config_state, config_error)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                                 desired_config_hash, applied_config_version, applied_config_hash, applied_config_at, config_state, config_error,
+                                                 ota_desired_version, ota_state, ota_version, ota_attempts, ota_last_error, ota_updated_at, last_good_firmware_version)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (device_id) DO UPDATE SET
                            active_slot=EXCLUDED.active_slot, reset_day=EXCLUDED.reset_day, emergency_stop=EXCLUDED.emergency_stop,
                            uptime_seconds=EXCLUDED.uptime_seconds, cpu_temp=EXCLUDED.cpu_temp, disk_free_mb=EXCLUDED.disk_free_mb,
@@ -1244,13 +1297,17 @@ def pi_sync(
                            clock_source=EXCLUDED.clock_source, watchdog_enabled=EXCLUDED.watchdog_enabled, last_reboot_reason=EXCLUDED.last_reboot_reason,
                            config_version=EXCLUDED.config_version, desired_config_hash=EXCLUDED.desired_config_hash,
                            applied_config_version=EXCLUDED.applied_config_version, applied_config_hash=EXCLUDED.applied_config_hash,
-                           applied_config_at=EXCLUDED.applied_config_at, config_state=EXCLUDED.config_state, config_error=EXCLUDED.config_error""",
+                           applied_config_at=EXCLUDED.applied_config_at, config_state=EXCLUDED.config_state, config_error=EXCLUDED.config_error,
+                           ota_desired_version=EXCLUDED.ota_desired_version, ota_state=EXCLUDED.ota_state, ota_version=EXCLUDED.ota_version,
+                           ota_attempts=EXCLUDED.ota_attempts, ota_last_error=EXCLUDED.ota_last_error, ota_updated_at=EXCLUDED.ota_updated_at,
+                           last_good_firmware_version=EXCLUDED.last_good_firmware_version""",
                         (device_id, payload.get("active_slot", payload.get("activeWing")), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
                          bool(payload.get("emergencyStop", False)), int(payload.get("uptimeSeconds", 0)),
                          float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
                          payload.get("lastRebootReason", ""), cloud_config_version,
-                         desired_hash, eff_av, eff_ah, eff_at, config_state, raw_err))
+                         desired_hash, eff_av, eff_ah, eff_at, config_state, raw_err,
+                         ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good))
 
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
@@ -1309,6 +1366,7 @@ def pi_sync(
                 "config_version": cloud_config_version,
                 "config_hash": desired_hash,
                 "config_state": config_state,
+                "firmware_desired_version": ota_desired,
                 "device_id": device_id,
                 "hardware_profile": dev_info["hardware_profile"],
                 "feedback_hardware_installed": dev_info["feedback_hardware_installed"],

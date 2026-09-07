@@ -31,11 +31,16 @@ from storage_manager import StorageManager
 from offline_queue import OfflineQueue
 from gpio_manager import GPIOManager
 from api_client import ApiClient
+import ota_manager
 
 
 # Phase 0.5.1: how often the (cheap, read-only) "is today's telemetry
 # recorded?" check runs. The calendar-day CSV itself is the durable identity.
 TELEMETRY_CHECK_INTERVAL_S = 3600.0
+
+# Baseline version of THIS artifact. A staged slot reports its own version via
+# ota_manager.active_info(); the baseline is used when no OTA slot is active.
+FIRMWARE_VERSION = "7.0.0"
 
 
 class EMSController:
@@ -100,6 +105,13 @@ class EMSController:
         self._applied_at = None
         self._config_error = None
         self._restore_applied_config()
+
+        # Signed OTA (A/B slots managed by ota_manager; activation = process restart).
+        self.firmware_version = ota_manager.running_version(FIRMWARE_VERSION)
+        self._boot_confirmed = False
+        self._ota_requested = None
+        self._restart_for_ota = False
+        self._ota_status = self._read_ota_status()
 
         self._last_sync = 0.0
         self._last_usage_day = self.state.last_usage_date
@@ -390,7 +402,13 @@ class EMSController:
 
         return {
             "deviceId": DEVICE_ID,
-            "firmwareVersion": "7.0.0",
+            "firmwareVersion": self.firmware_version,
+            # Signed OTA state (RAM cache refreshed on OTA events only).
+            "otaState": self._ota_status.get("state"),
+            "otaVersion": self._ota_status.get("version"),
+            "otaError": self._ota_status.get("error"),
+            "otaAttempts": self._ota_status.get("attempts", 0),
+            "lastGoodFirmwareVersion": self._ota_status.get("last_good"),
             "active_slot": self.state.active_slot,
             "resetDay": int(self.device_config.get("reset_day", 15)),
             "emergencyStop": (
@@ -460,6 +478,70 @@ class EMSController:
             self._pending_events[self._events_in_flight:]
         )
         self._events_in_flight = 0
+
+    # ============================================================
+    # SIGNED OTA (verify -> stage inactive slot -> activate -> restart -> health check)
+    # ============================================================
+
+    def _read_ota_status(self):
+        pending = ota_manager.pending_info()
+        active = ota_manager.active_info()
+        state = pending.get("state")
+        if active and active.get("boot_confirmed") is False:
+            state = "HEALTH_CHECK"  # running the new slot, not yet confirmed by boot()+sync
+        elif not state:
+            state = "ROLLED_BACK" if active.get("rolled_back_from") else "ACTIVE"
+        return {
+            "state": state,
+            "version": pending.get("version") or active.get("rolled_back_from") or self.firmware_version,
+            "error": pending.get("error"),
+            "attempts": int(pending.get("attempts", 0) or 0),
+            "last_good": active.get("previous_version") or self.firmware_version,
+        }
+
+    def _consider_firmware(self, response: dict):
+        desired = response.get("firmware_desired_version")
+        if not isinstance(desired, str) or not desired.strip():
+            return
+        desired = desired.strip()
+        if desired == self.firmware_version or self._restart_for_ota:
+            return
+        if ota_manager.exhausted(desired):
+            return  # bounded: MAX_ATTEMPTS_PER_VERSION failures -> wait for a new release
+        if not self._boot_confirmed:
+            return  # never chain an OTA onto an unconfirmed boot
+        self._ota_requested = desired
+
+    def _run_ota_if_requested(self):
+        """Runs from the main loop only when no command is executing. One attempt per call."""
+        version = self._ota_requested
+        if not version:
+            return
+        self._ota_requested = None
+        if self.state.system_state != SystemState.READY:
+            return
+        try:
+            manifest = self.api.download_firmware(version)
+            if manifest is None:
+                raise ota_manager.OTAVerificationError("DOWNLOAD_FAILED")
+            ota_manager.stage_signed_firmware(manifest, self.firmware_version)
+            if not ota_manager.activate_staged(self.firmware_version):
+                raise ota_manager.OTAVerificationError("ACTIVATION_FAILED")
+        except ota_manager.OTAVerificationError as exc:
+            ota_manager.record_failure(version, str(exc))
+            self._ota_status = self._read_ota_status()
+            logger.critical("OTA %s rejected: %s (attempt %s/%s)", version, exc,
+                            ota_manager.attempts_for(version), ota_manager.MAX_ATTEMPTS_PER_VERSION)
+            return
+        except Exception as exc:
+            ota_manager.record_failure(version, "STAGING_FAILED")
+            self._ota_status = self._read_ota_status()
+            logger.critical("OTA %s staging failed: %s", version, exc)
+            return
+        self._ota_status = self._read_ota_status()
+        logger.critical("OTA %s staged and activated; restarting for health check.", version)
+        self._restart_for_ota = True
+        self.running = False
 
     # ============================================================
     # DAILY TELEMETRY (Phase 0.5.1)
@@ -569,6 +651,16 @@ class EMSController:
         self._apply_cloud_config(
             response
         )
+
+        # OTA health check = boot() succeeded AND cloud sync succeeded on this firmware.
+        if not self._boot_confirmed:
+            self._boot_confirmed = True
+            if ota_manager.confirm_boot():
+                self.firmware_version = ota_manager.running_version(FIRMWARE_VERSION)
+                self._ota_status = self._read_ota_status()
+                logger.info("OTA firmware %s confirmed healthy.", self.firmware_version)
+
+        self._consider_firmware(response)
 
         self._ack_sent_events()
 
@@ -989,6 +1081,9 @@ class EMSController:
                     self._record_daily_telemetry_if_needed()
                     self._last_telemetry = now
 
+                if self._ota_requested and not self.queue.get_unacked():
+                    self._run_ota_if_requested()
+
                 time.sleep(0.25)
 
             except Exception as exc:
@@ -1033,6 +1128,10 @@ class EMSController:
 def main():
     controller = EMSController()
     controller.run()
+    if controller._restart_for_ota:
+        # Non-zero exit -> systemd restarts the service -> ota_boot.sh execs the
+        # newly activated slot; an unconfirmed boot there is rolled back automatically.
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
