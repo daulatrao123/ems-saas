@@ -46,6 +46,7 @@ export default function AdminDashboard() {
     if (!societyId) return;
     try {
       await api.post("/api/admin/pi-command", {
+        idempotency_key: crypto.randomUUID(), // one logical click = one command, even if retried
         society_id: societyId,
         device_id: deviceId,
         slot: slot,

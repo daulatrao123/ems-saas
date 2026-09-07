@@ -122,6 +122,7 @@ class ApiClient:
         status: str,
         verification: str = "UNKNOWN",
         error: str = None,
+        attempt=None,
     ) -> bool:
         """
         Acknowledge a command.
@@ -139,6 +140,7 @@ class ApiClient:
                 else "UNKNOWN"
             ),
             "error": error,
+            "attempt": attempt,
         }
 
         try:

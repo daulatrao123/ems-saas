@@ -65,6 +65,7 @@ SLOTS = ["A", "B", "C", "D"] # Strict 4-slot architecture
 PI_ONLINE_THRESHOLD_SECONDS = 120
 COMMAND_EXPIRY_SECONDS = 300
 COMMAND_DELIVERY_LEASE_SECONDS = 120
+EXECUTED_IDS_MAX = 50  # bound on executed_command_ids[] accepted per sync (T6)
 
 COMMAND_TRANSITIONS = {
     "queued": {"delivered", "expired"},
@@ -78,6 +79,29 @@ COMMAND_TRANSITIONS = {
     "acked": set(),
 }
 VALID_ROLES = {"super_admin", "society_admin", "member"}
+
+POSITIVE_VERIFICATION = {"VERIFIED_ON", "VERIFIED_OFF", "GPIO_CONFIRMED"}
+
+def resolve_ack_path(current: str, target: str, verification: str) -> list[str] | None:
+    """Return the FSM hops an ACK implies (current excluded, target included), or None if illegal.
+
+    Direct edges come from COMMAND_TRANSITIONS. A Pi that executed offline and lost its
+    intermediate ACKs may report only the terminal status; terminal ACKs therefore fast-forward
+    through the implied hops. Reaching `completed` still requires positive hardware verification,
+    and no path may pass through or leave a terminal/acked state.
+    """
+    if target in COMMAND_TRANSITIONS.get(current, set()):
+        return [target]
+    fast_forward = {
+        ("delivered", "hardware_verified"): ["executing", "hardware_verified"],
+        ("delivered", "completed"): ["executing", "hardware_verified", "completed"],
+        ("executing", "completed"): ["hardware_verified", "completed"],
+        ("delivered", "failed"): ["executing", "failed"],
+    }
+    path = fast_forward.get((current, target))
+    if path and target == "completed" and verification not in POSITIVE_VERIFICATION:
+        return None
+    return path
 
 VALID_COMMANDS = {
     "set_active_slot", "set_days", "set_reset_day", "restart",
@@ -1011,6 +1035,29 @@ def pi_sync(
                                ON CONFLICT (event_id) DO NOTHING""",
                             (device_id, ev_id, event.get("timestamp", now), event.get("type", "system"), event.get("message", "")))
 
+            # --- T6 reconciliation: what the Pi says it actually executed -----------
+            # Sequence is primary evidence; the bounded id list is secondary evidence.
+            try:
+                last_exec_seq = int(payload.get("last_executed_sequence") or 0)
+            except (TypeError, ValueError):
+                last_exec_seq = 0
+            executed_ids = [str(i) for i in (payload.get("executed_command_ids") or [])[:EXECUTED_IDS_MAX]]
+            reconciled = 0
+            if executed_ids:
+                # Delivered (or lease-reclaimed) commands the Pi has executed: promote to
+                # executing so they are never re-delivered; the Pi's ACK brings the terminal state.
+                cur.execute("""UPDATE pi_commands SET status='delivered', delivered_at=COALESCE(delivered_at, %s)
+                               WHERE device_id=%s AND status='queued' AND id::text = ANY(%s)""", (now, device_id, executed_ids))
+                cur.execute("""UPDATE pi_commands SET status='executing', executing_at=COALESCE(executing_at, %s)
+                               WHERE device_id=%s AND status='delivered' AND id::text = ANY(%s)""", (now, device_id, executed_ids))
+                reconciled += cur.rowcount
+            if last_exec_seq > 0:
+                # Older delivered commands not in the id list: outcome unknown, never re-run.
+                cur.execute("""UPDATE pi_commands SET status='unknown_after_reboot', error='SEQUENCE_SUPERSEDED'
+                               WHERE device_id=%s AND status='delivered' AND sequence_no IS NOT NULL AND sequence_no <= %s
+                               AND NOT (id::text = ANY(%s))""", (device_id, last_exec_seq, executed_ids))
+                reconciled += cur.rowcount
+
             # Reclaim a delivery lease, but never extend the absolute command expiry.
             cur.execute(
                 "UPDATE pi_commands SET status='queued', delivered_at=NULL WHERE device_id=%s AND status='delivered' AND delivered_at < %s AND expires_at > %s",
@@ -1021,7 +1068,7 @@ def pi_sync(
                 (device_id, now),
             )
 
-            cur.execute("SELECT * FROM pi_commands WHERE device_id = %s AND status = 'queued' ORDER BY created_at ASC LIMIT 1", (device_id,))
+            cur.execute("SELECT * FROM pi_commands WHERE device_id = %s AND status = 'queued' ORDER BY sequence_no ASC NULLS FIRST, created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED", (device_id,))
             cmd = cur.fetchone()
 
             cur.execute("SELECT reset_day FROM societies WHERE id=%s", (society_id,))
@@ -1037,14 +1084,22 @@ def pi_sync(
                 "hardware_profile": dev_info["hardware_profile"],
                 "feedback_hardware_installed": dev_info["feedback_hardware_installed"],
                 "slots": slot_configs,
-                "resetDay": canonical_reset_day
+                "resetDay": canonical_reset_day,
+                "reconciled_commands": reconciled,
             }
             if cmd:
-                cur.execute("UPDATE pi_commands SET status = 'delivered', delivered_at = %s WHERE id = %s", (now, cmd["id"]))
-                reply["command"] = cmd["command"]
-                reply["command_id"] = str(cmd["id"])
-                if cmd.get("slot"): reply["slot"] = cmd["slot"]
-                reply["params"] = cmd.get("params", {})
+                # CAS delivery: only the worker that flips queued->delivered owns this attempt.
+                cur.execute("""UPDATE pi_commands SET status='delivered', delivered_at=%s, attempt_count=attempt_count+1
+                               WHERE id=%s AND status='queued' RETURNING attempt_count""", (now, cmd["id"]))
+                delivered = cur.fetchone()
+                if delivered:
+                    reply["command"] = cmd["command"]
+                    reply["command_id"] = str(cmd["id"])
+                    reply["sequence_no"] = cmd.get("sequence_no")
+                    reply["attempt"] = delivered["attempt_count"]
+                    reply["expires_at"] = cmd["expires_at"].isoformat() if cmd.get("expires_at") else None
+                    if cmd.get("slot"): reply["slot"] = cmd["slot"]
+                    reply["params"] = cmd.get("params", {})
 
         conn.commit()
     except Exception as e:
@@ -1080,7 +1135,7 @@ def pi_command_ack(
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, command, slot, params, status FROM pi_commands WHERE id = %s AND device_id = %s FOR UPDATE",
+                "SELECT id, command, slot, params, status, attempt_count FROM pi_commands WHERE id = %s AND device_id = %s FOR UPDATE",
                 (command_id, device_id),
             )
             cmd = cur.fetchone()
@@ -1088,11 +1143,17 @@ def pi_command_ack(
                 return {"success": True, "status": "unknown"}
 
             current = str(cmd["status"] or "queued").lower()
-            if status != current and status not in COMMAND_TRANSITIONS.get(current, set()):
+            if status == current:
                 # Idempotent repeat of an already-applied status is harmless.
-                if status == current:
-                    return {"success": True, "status": current}
+                return {"success": True, "status": current, "idempotent": True}
+            path = resolve_ack_path(current, status, verification)
+            if path is None:
                 raise HTTPException(409, f"Invalid command transition {current} -> {status}")
+
+            # Lease/attempt identity: a stale worker (older delivery attempt) may not commit.
+            attempt = payload.get("attempt")
+            if attempt is not None and int(attempt) != int(cmd["attempt_count"]):
+                raise HTTPException(409, f"Stale command attempt {attempt}; current attempt is {cmd['attempt_count']}")
 
             now = datetime.now(timezone.utc)
 
@@ -1126,16 +1187,19 @@ def pi_command_ack(
                         (day, society_id),
                     )
 
-            if status == "acked":
-                cur.execute(
-                    "UPDATE pi_commands SET status='acked', acked_at=%s, result=%s, error=%s WHERE id=%s AND device_id=%s AND status IN ('completed','failed','expired')",
-                    (now, verification, error, command_id, device_id),
-                )
-            else:
-                cur.execute(
-                    "UPDATE pi_commands SET status=%s, acked_at=NULL, error=%s, result=%s WHERE id=%s AND device_id=%s AND status=%s",
-                    (status, error, verification, command_id, device_id, current),
-                )
+            ts_map = {"executing": "executing_at", "hardware_verified": "hardware_verified_at",
+                      "completed": "completed_at", "failed": "completed_at", "acked": "acked_at"}
+            # Every hop the ACK implies gets its lifecycle timestamp (fast-forwarded hops included).
+            ts_cols = [ts_map[s] for s in path if s in ts_map]
+            ts_sql = "".join(f", {c}=COALESCE({c}, %s)" for c in ts_cols)
+            ts_args = tuple(now for _ in ts_cols)
+            # Compare-and-set on the status we observed under lock; rowcount proves the transition.
+            cur.execute(
+                f"UPDATE pi_commands SET status=%s, error=%s, result=%s, attempt_count=%s{ts_sql} WHERE id=%s AND device_id=%s AND status=%s",
+                (status, error, verification, cmd["attempt_count"], *ts_args, command_id, device_id, current),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(409, f"Command state changed concurrently (expected {current})")
 
         conn.commit()
     except Exception:
@@ -1164,24 +1228,47 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     slot = str(data.get("slot", ""))
     device_id = data.get("device_id")
     params = dict(data.get("params", {}))
+    idempotency_key = data.get("idempotency_key")
+    idempotency_key = str(idempotency_key).strip()[:128] if idempotency_key else None
 
     validate_command(command, params, slot)
 
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, status FROM pi_devices WHERE id=%s AND society_id=%s", (device_id, sid))
+            # The locked device row is the serialization point for both the
+            # idempotency check and the per-device sequence allocation.
+            cur.execute("SELECT id, status, next_command_sequence FROM pi_devices WHERE id=%s AND society_id=%s FOR UPDATE", (device_id, sid))
             dev = cur.fetchone()
             if not dev or str(dev["status"]).upper() != "ASSIGNED":
                 raise HTTPException(404, "Active device not found in this society")
 
+            if idempotency_key:
+                cur.execute("SELECT id, command, slot, params, sequence_no FROM pi_commands WHERE device_id=%s AND idempotency_key=%s",
+                            (device_id, idempotency_key))
+                existing = cur.fetchone()
+                if existing:
+                    same = (existing["command"] == command and (existing["slot"] or "") == slot
+                            and (existing["params"] or {}) == params)
+                    if not same:
+                        raise HTTPException(409, "idempotency_key already used for a different command")
+                    conn.rollback()
+                    return {"success": True, "message": "Command already queued", "command": command,
+                            "command_id": str(existing["id"]), "sequence_no": existing["sequence_no"], "duplicate": True}
+
+            sequence_no = int(dev["next_command_sequence"]) + 1
+            cur.execute("UPDATE pi_devices SET next_command_sequence=%s WHERE id=%s", (sequence_no, device_id))
+
             command_id = str(uuid.uuid4())
             created = datetime.now(timezone.utc)
-            cur.execute("""INSERT INTO pi_commands (id, device_id, command, slot, params, status, created_at, expires_at)
-                           VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s)""",
-                        (command_id, device_id, command, slot, psycopg.types.json.Json(params), created, created + timedelta(seconds=COMMAND_EXPIRY_SECONDS)))
+            cur.execute("""INSERT INTO pi_commands (id, device_id, command, slot, params, status, created_at, expires_at, idempotency_key, sequence_no)
+                           VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s, %s, %s)""",
+                        (command_id, device_id, command, slot, psycopg.types.json.Json(params), created,
+                         created + timedelta(seconds=COMMAND_EXPIRY_SECONDS), idempotency_key, sequence_no))
 
-            log_audit(cur, user, sid, "QUEUE_COMMAND", {"command": command, "slot": slot, "device_id": device_id})
+            log_audit(cur, user, sid, "QUEUE_COMMAND", {"command": command, "slot": slot, "device_id": device_id,
+                                                        "command_id": command_id, "sequence_no": sequence_no,
+                                                        "idempotency_key": idempotency_key})
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1189,7 +1276,8 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     finally:
         conn.close()
 
-    return {"success": True, "message": "Command queued", "command": command, "command_id": command_id}
+    return {"success": True, "message": "Command queued", "command": command, "command_id": command_id,
+            "sequence_no": sequence_no, "duplicate": False}
 
 @app.get("/api/admin/dashboard")
 def admin_dashboard(society_id: str, user: dict = Depends(require_society_access)):

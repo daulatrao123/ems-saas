@@ -204,12 +204,19 @@ class OfflineQueue:
                 "config_version": "TEXT",
                 "hardware_verification": "TEXT",
                 "ack_status": "TEXT NOT NULL DEFAULT 'PENDING'",
+                "sequence_no": "INTEGER",
+                "cloud_attempt": "INTEGER",
             }
             for column, definition in migrations.items():
                 if column not in existing_columns:
                     self.conn.execute(
                         f"ALTER TABLE commands ADD COLUMN {column} {definition}"
                     )
+
+            # T6: durable execution identity that survives reboot and acked-history cleanup.
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS execution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
 
             self.conn.execute(
                 """
@@ -249,6 +256,8 @@ class OfflineQueue:
         created_at,
         expires_at,
         config_version=None,
+        sequence_no=None,
+        cloud_attempt=None,
     ):
         if not self.storage.is_write_allowed("queue_db"):
             logger.critical(
@@ -273,13 +282,15 @@ class OfflineQueue:
                         created_at,
                         delivered_at,
                         expires_at,
-                        config_version
+                        config_version,
+                        sequence_no,
+                        cloud_attempt
                     )
                     VALUES
                     (
                         ?, ?, ?,
                         'DELIVERED',
-                        ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
@@ -294,6 +305,8 @@ class OfflineQueue:
                             if config_version is not None
                             else None
                         ),
+                        int(sequence_no) if sequence_no is not None else None,
+                        int(cloud_attempt) if cloud_attempt is not None else None,
                     ),
                 )
 
@@ -301,7 +314,9 @@ class OfflineQueue:
                 return True
 
             except sqlite3.IntegrityError:
-                # Duplicate delivery.
+                # Duplicate delivery. Roll back the failed INSERT so the implicit
+                # transaction does not poison the next atomic claim.
+                self.conn.rollback()
                 # Verify that the duplicate is actually
                 # the same command, rather than silently
                 # accepting a conflicting command ID.
@@ -439,6 +454,23 @@ class OfflineQueue:
                 if updated != 1:
                     self.conn.rollback()
                     return None
+
+                # T6: durable "I executed up to sequence N" written atomically with the claim.
+                seq_row = self.conn.execute(
+                    "SELECT sequence_no FROM commands WHERE id=?", (cmd_id,)
+                ).fetchone()
+                if seq_row and seq_row[0] is not None:
+                    self.conn.execute(
+                        """
+                        INSERT INTO execution_meta (key, value)
+                        VALUES ('last_executed_sequence', ?)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value = CASE
+                                WHEN CAST(excluded.value AS INTEGER) > CAST(value AS INTEGER)
+                                THEN excluded.value ELSE value END
+                        """,
+                        (str(int(seq_row[0])),),
+                    )
 
                 self.conn.commit()
 
@@ -693,6 +725,41 @@ class OfflineQueue:
     # ============================================================
     # CLEANUP
     # ============================================================
+
+    # ============================================================
+    # T6 EXECUTION IDENTITY (reported in every sync)
+    # ============================================================
+
+    EXECUTED_IDS_MAX = 50
+
+    def get_last_executed_sequence(self):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT value FROM execution_meta WHERE key='last_executed_sequence'"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def get_executed_command_ids(self, limit=EXECUTED_IDS_MAX):
+        """Bounded, most-recent-first list of commands that reached GPIO execution."""
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                SELECT id FROM commands
+                WHERE status IN ('EXECUTING', 'HARDWARE_VERIFIED', 'COMPLETED',
+                                 'FAILED', 'UNKNOWN_AFTER_REBOOT')
+                ORDER BY COALESCE(started_at, delivered_at) DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            return [r[0] for r in cur.fetchall()]
+
+    def get_cloud_attempt(self, cmd_id):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT cloud_attempt FROM commands WHERE id=?", (str(cmd_id),)
+            ).fetchone()
+            return row[0] if row else None
 
     def cleanup_acked(self):
         """

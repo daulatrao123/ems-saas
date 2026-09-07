@@ -314,6 +314,9 @@ class EMSController:
             "clockSource": "system",
             "slots": slots,
             "memory": memory,
+            # T6 execution identity: lets the cloud reconcile instead of re-delivering.
+            "last_executed_sequence": self.queue.get_last_executed_sequence(),
+            "executed_command_ids": self.queue.get_executed_command_ids(),
         }
 
     # ============================================================
@@ -449,8 +452,24 @@ class EMSController:
 
         now = datetime.now(timezone.utc)
         expires_at = (now + timedelta(minutes=5)).isoformat()
+        cloud_expires = response.get("expires_at")
+        if cloud_expires:
+            # Absolute cloud expiry wins; never extend it locally.
+            try:
+                cloud_dt = datetime.fromisoformat(str(cloud_expires).replace("Z", "+00:00"))
+                if cloud_dt.tzinfo is None:
+                    cloud_dt = cloud_dt.replace(tzinfo=timezone.utc)
+                if cloud_dt <= now:
+                    logger.warning("Rejecting already-expired command %s", command_id)
+                    self.api.push_ack(command_id, "EXPIRED", "NOT_AVAILABLE", "COMMAND_EXPIRED",
+                                      attempt=response.get("attempt"))
+                    return
+                expires_at = min(cloud_dt, now + timedelta(minutes=5)).isoformat()
+            except ValueError:
+                pass
         if not self.queue.add_command(
-            command_id, slot, normalized, now.isoformat(), expires_at, response.get("config_version")
+            command_id, slot, normalized, now.isoformat(), expires_at, response.get("config_version"),
+            sequence_no=response.get("sequence_no"), cloud_attempt=response.get("attempt"),
         ):
             logger.critical("Unable to durably persist cloud command %s", command_id)
 
@@ -495,7 +514,7 @@ class EMSController:
 
         # Best-effort cloud lifecycle notification. Local durable state remains
         # authoritative when the cloud is unavailable.
-        self.api.push_ack(command_id, "EXECUTING", "PENDING")
+        self.api.push_ack(command_id, "EXECUTING", "PENDING", attempt=self.queue.get_cloud_attempt(command_id))
 
         try:
             if action == "ACTIVATE":
@@ -728,17 +747,20 @@ class EMSController:
             error,
         ) in rows:
             try:
+                attempt = self.queue.get_cloud_attempt(command_id)
                 terminal_sent = self.api.push_ack(
                     command_id,
                     status,
                     verification or "UNKNOWN",
                     error,
+                    attempt=attempt,
                 )
                 if terminal_sent and self.api.push_ack(
                     command_id,
                     "ACKED",
                     verification or "UNKNOWN",
                     error,
+                    attempt=attempt,
                 ):
                     self.queue.mark_acked(command_id)
             except Exception as exc:
