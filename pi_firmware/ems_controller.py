@@ -1,3 +1,4 @@
+import os
 import signal
 import threading
 import time
@@ -8,6 +9,7 @@ from config import (
     DEVICE_ID,
     SUPPORTED_SLOTS,
     SYNC_INTERVAL_S,
+    TELEMETRY_DIR,
 )
 
 from logger import logger
@@ -21,6 +23,11 @@ from storage_manager import StorageManager
 from offline_queue import OfflineQueue
 from gpio_manager import GPIOManager
 from api_client import ApiClient
+
+
+# Phase 0.5.1: how often the (cheap, read-only) "is today's telemetry
+# recorded?" check runs. The calendar-day CSV itself is the durable identity.
+TELEMETRY_CHECK_INTERVAL_S = 3600.0
 
 
 class EMSController:
@@ -82,6 +89,7 @@ class EMSController:
         self._last_sync = 0.0
         self._last_usage_day = self.state.last_usage_date
         self._last_telemetry = 0.0
+        self._telemetry_done_day = None  # RAM memo only; disk CSV is the source of truth
         self._last_queue_cleanup = 0.0
 
         # Phase 0.5: storage-state transition events awaiting cloud delivery.
@@ -393,6 +401,42 @@ class EMSController:
             self._pending_events[self._events_in_flight:]
         )
         self._events_in_flight = 0
+
+    # ============================================================
+    # DAILY TELEMETRY (Phase 0.5.1)
+    # ============================================================
+
+    @staticmethod
+    def _daily_telemetry_recorded(day):
+        """True if daily_<day>.csv holds at least one data row after the header."""
+        path = os.path.join(TELEMETRY_DIR, f"daily_{day}.csv")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                next(fh)  # header
+                for line in fh:
+                    if line.strip():
+                        return True
+        except (OSError, StopIteration):
+            pass
+        return False
+
+    def _record_daily_telemetry_if_needed(self):
+        """At most one telemetry row per calendar day; never retroactive.
+        Failure/denial just leaves it for the next hourly opportunity."""
+        day = datetime.now().strftime("%Y-%m-%d")
+
+        if self._telemetry_done_day == day:
+            return False
+
+        if self._daily_telemetry_recorded(day):
+            self._telemetry_done_day = day
+            return False
+
+        if self.storage.save_daily_telemetry():
+            self._telemetry_done_day = day
+            return True
+
+        return False
 
     # ============================================================
     # DAILY USAGE / MONTHLY RESET
@@ -878,6 +922,13 @@ class EMSController:
                 ):
                     self.queue.cleanup_acked()
                     self._last_queue_cleanup = now
+
+                if (
+                    now - self._last_telemetry
+                    >= TELEMETRY_CHECK_INTERVAL_S
+                ):
+                    self._record_daily_telemetry_if_needed()
+                    self._last_telemetry = now
 
                 time.sleep(0.25)
 
