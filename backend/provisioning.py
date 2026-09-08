@@ -21,6 +21,10 @@ REQUIRED_SERVICE_LINES = (
     "Environment=GPIOZERO_PIN_FACTORY=lgpio",
 )
 
+# Field-diagnosed: any DeviceAllow= line makes lgpio fail with "can not open gpiochip" for User=pi.
+# Device access comes from SupplementaryGroups=gpio i2c; never re-add DeviceAllow.
+FORBIDDEN_SERVICE_PREFIXES = ("DeviceAllow=",)
+
 # Runtime files required by the EMS controller and OTA/runtime scripts.
 #
 # IMPORTANT:
@@ -167,6 +171,12 @@ done
 
 if grep -qxF "WorkingDirectory=/opt/ems/pi_firmware" "$HERE/systemd/ems-controller.service"; then
   echo "ERROR: systemd/ems-controller.service still uses WorkingDirectory=/opt/ems/pi_firmware (crash-loop config)." >&2
+  exit 3
+fi
+
+if grep -qE '^\s*DeviceAllow=' "$HERE/systemd/ems-controller.service"; then
+  echo "ERROR: systemd/ems-controller.service contains DeviceAllow= (breaks lgpio: 'can not open gpiochip')." >&2
+  echo "This package was generated from a stale backend. Do NOT install it." >&2
   exit 3
 fi
 
@@ -442,6 +452,11 @@ Expected output (both lines, nothing else for WorkingDirectory):
   WorkingDirectory=/mnt/ems-data
   Environment=GPIOZERO_PIN_FACTORY=lgpio
 
+The unit must contain NO DeviceAllow= lines (they break lgpio for User=pi):
+
+  unzip -p ems-pi-provisioning-*.zip ems-pi-provisioning/systemd/ems-controller.service \\
+    | grep -c '^DeviceAllow='        # must print 0
+
 Compare the sha256 above with the unit in the repository:
 
   sha256sum pi_firmware/ems-controller.service
@@ -567,11 +582,12 @@ def _validate_service_unit(text: str) -> None:
     lines = {ln.strip() for ln in text.splitlines()}
     missing = [req for req in REQUIRED_SERVICE_LINES if req not in lines]
     working_dirs = sorted(ln for ln in lines if ln.startswith("WorkingDirectory="))
+    forbidden = sorted(ln for ln in lines if ln.startswith(FORBIDDEN_SERVICE_PREFIXES))
 
-    if missing or working_dirs != ["WorkingDirectory=/mnt/ems-data"]:
+    if missing or forbidden or working_dirs != ["WorkingDirectory=/mnt/ems-data"]:
         raise RuntimeError(
             "Refusing to build Pi provisioning package: pi_firmware/ems-controller.service is stale. "
-            f"missing={missing} WorkingDirectory={working_dirs}"
+            f"missing={missing} forbidden={forbidden} WorkingDirectory={working_dirs}"
         )
 
 
