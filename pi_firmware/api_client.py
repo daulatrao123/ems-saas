@@ -1,6 +1,7 @@
 import requests
 
 from config import (
+    API_KEY_ID,
     API_BASE_URL,
     API_TIMEOUT_S,
     DEVICE_ID,
@@ -37,11 +38,13 @@ class ApiClient:
         self.last_ack_http = None
         self.last_ack_code = None
         self.last_retry_after = None
+        self.last_sync_http = None
 
         self.session.headers.update(
             {
                 "X-Device-ID": self.device_id,
                 "X-API-Key": self.api_key,
+                "X-Key-Id": API_KEY_ID,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
@@ -63,6 +66,7 @@ class ApiClient:
         payload = dict(snapshot)
 
         payload["deviceId"] = self.device_id
+        self.last_sync_http = None
 
         try:
             response = self.session.post(
@@ -70,6 +74,7 @@ class ApiClient:
                 json=payload,
                 timeout=API_TIMEOUT_S,
             )
+            self.last_sync_http = response.status_code
 
             if response.status_code != 200:
                 logger.error(

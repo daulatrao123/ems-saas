@@ -147,6 +147,7 @@ class EMSController:
         self.lcd.start()
 
         self._last_sync = 0.0
+        self._auth_rejected_logged = False
         self._last_usage_day = self.state.last_usage_date
         self._last_telemetry = 0.0
         self._telemetry_done_day = None  # RAM memo only; disk CSV is the source of truth
@@ -705,7 +706,20 @@ class EMSController:
             snapshot
         )
 
+        # The attempt itself schedules the next one: a failing cloud must never turn the 60 s
+        # sync cadence into a 0.25 s retry storm.
+        self._last_sync = time.monotonic()
+
         if response is None:
+            if getattr(self.api, "last_sync_http", None) in (401, 403):
+                # Permanent credential problem (revoked/rotated key, unassigned device). Retrying
+                # faster cannot fix it: hold for AUTH_REJECT_HOLD_S, keep local operation, log once.
+                self._last_sync += self.AUTH_REJECT_HOLD_S - SYNC_INTERVAL_S
+                if not self._auth_rejected_logged:
+                    self._auth_rejected_logged = True
+                    logger.critical("Cloud rejected device credentials (HTTP %s). Re-provision this Pi "
+                                    "(download a NEW ZIP and install it) — next attempt in %ds.",
+                                    getattr(self.api, "last_sync_http", None), self.AUTH_REJECT_HOLD_S)
             self._events_in_flight = 0
             if (
                 self.state.system_state
@@ -733,8 +747,7 @@ class EMSController:
         self._consider_firmware(response)
 
         self._ack_sent_events()
-
-        self._last_sync = time.monotonic()
+        self._auth_rejected_logged = False
 
         if self.state.system_state == (
             SystemState.CLOUD_OFFLINE
@@ -1319,6 +1332,7 @@ class EMSController:
     # ACK (bounded: 409 = never retried, 429/network = exponential backoff)
     # ============================================================
 
+    AUTH_REJECT_HOLD_S = 300.0
     ACK_BACKOFF_MIN_S = 2.0
     ACK_BACKOFF_MAX_S = 300.0
     # Pacing even when the cloud is healthy: one queued command (<= 2 POSTs) per pass, one pass per

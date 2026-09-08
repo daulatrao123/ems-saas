@@ -618,6 +618,7 @@ def build_provisioning_zip(
         f"EMS_API_URL={api_url}\n"
         f"EMS_DEVICE_ID={device_id}\n"
         f"EMS_API_KEY={api_key}\n"
+        f"EMS_KEY_ID={key_id}\n"
     )
 
     buf = io.BytesIO()

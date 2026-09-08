@@ -591,6 +591,7 @@ def authenticate_pi(
     payload: dict,
     x_device_id: str | None = Header(None, alias="X-Device-ID"),
     x_api_key: str | None = Header(None, alias="X-Api-Key"),
+    x_key_id: str | None = Header(None, alias="X-Key-Id"),
 ) -> tuple:
     # Header credentials are canonical. Body credentials remain accepted only
     # for backward compatibility with older Pi firmware.
@@ -612,7 +613,7 @@ def authenticate_pi(
             # credential of THIS device is consulted; pi_devices.api_key_hash is
             # no longer an authentication path.
             cur.execute(
-                """SELECT d.id, d.society_id, d.status, c.secret_hash
+                """SELECT d.id, d.society_id, d.status, c.secret_hash, c.key_id
                    FROM pi_devices d
                    LEFT JOIN pi_device_credentials c ON c.device_id = d.id AND c.status = 'active'
                    WHERE d.id = %s""",
@@ -620,9 +621,18 @@ def authenticate_pi(
             )
             dev = cur.fetchone()
             supplied_hash = hash_api_key(supplied_key)
-            # Same response for unknown device / revoked / wrong secret (no enumeration).
+            # Same response for unknown device / revoked / wrong secret (no enumeration). The security
+            # log (never the client) distinguishes the cases so a stale/rotated key is diagnosable.
             if not dev or not dev["secret_hash"] or not hmac.compare_digest(supplied_hash, str(dev["secret_hash"])):
-                _seclog.warning("PI_AUTH_REJECTED device_id=%s reason=bad_credential", x_device_id)
+                if not dev:
+                    reason = "unknown_device"
+                elif not dev["secret_hash"]:
+                    reason = "no_active_credential"
+                elif x_key_id and dev["key_id"] and str(x_key_id).strip() != str(dev["key_id"]):
+                    reason = f"stale_key_id pi_key_id={str(x_key_id).strip()[:40]} active_key_id={dev['key_id']}"
+                else:
+                    reason = "bad_secret"
+                _seclog.warning("PI_AUTH_REJECTED device_id=%s reason=%s", x_device_id, reason)
                 raise HTTPException(403, "Invalid Pi API key or Device ID.")
             if not dev["society_id"] or str(dev["status"]).upper() != "ASSIGNED":
                 _seclog.warning("PI_AUTH_REJECTED device_id=%s reason=not_assigned", x_device_id)

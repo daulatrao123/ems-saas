@@ -296,6 +296,7 @@ DEVICE_ID = os.environ.get(
     "EMS_DEVICE_ID"
 )
 
+API_KEY_ID = os.environ.get("EMS_KEY_ID", "")  # non-secret credential identifier (diagnostics only)
 API_KEY = os.environ.get(
     "EMS_API_KEY"
 )
