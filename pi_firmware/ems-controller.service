@@ -9,14 +9,21 @@ Type=simple
 User=pi
 Group=pi
 SupplementaryGroups=gpio i2c
-WorkingDirectory=/opt/ems/pi_firmware
+
+WorkingDirectory=/mnt/ems-data
+
+Environment=GPIOZERO_PIN_FACTORY=lgpio
 EnvironmentFile=-/etc/ems/ems-controller.env
+
 ExecStart=/bin/bash /opt/ems/pi_firmware/ota_boot.sh
+
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
+
 NoNewPrivileges=true
 PrivateTmp=true
+
 ProtectSystem=full
 ProtectHome=true
 ProtectKernelTunables=true
@@ -25,7 +32,9 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictRealtime=true
+
 ReadWritePaths=/mnt/ems-data
+
 DeviceAllow=/dev/gpiomem rw
 DeviceAllow=/dev/gpiochip* rw
 DeviceAllow=/dev/i2c-* rw
