@@ -3,6 +3,7 @@ the existing systemd units and a generated /etc/ems/ems-controller.env into an i
 The plaintext API key exists only inside the returned ZIP bytes: never logged, never persisted.
 """
 
+import hashlib
 import io
 import zipfile
 from datetime import datetime, timezone
@@ -10,6 +11,15 @@ from pathlib import Path
 
 
 FIRMWARE_DIR = Path(__file__).resolve().parent.parent / "pi_firmware"
+
+# The controller unit MUST run from the writable data mount with the lgpio pin factory:
+# lgpio creates its notification pipe in the working directory, and /opt/ems/pi_firmware is
+# read-only for the `pi` user. Without these lines the service crash-loops on GPIO init.
+# A package is REFUSED (HTTP 500, credential NOT rotated) if the source unit lacks any of them.
+REQUIRED_SERVICE_LINES = (
+    "WorkingDirectory=/mnt/ems-data",
+    "Environment=GPIOZERO_PIN_FACTORY=lgpio",
+)
 
 # Runtime files required by the EMS controller and OTA/runtime scripts.
 #
@@ -119,6 +129,48 @@ for f in "${REQUIRED_FILES[@]}"; do
     exit 3
   fi
 done
+
+
+# ------------------------------------------------------------
+# Package integrity (MANIFEST.sha256 written by the generator)
+# ------------------------------------------------------------
+
+if [[ ! -f "$HERE/MANIFEST.sha256" ]]; then
+  echo "ERROR: package has no MANIFEST.sha256 (stale generator?)." >&2
+  exit 3
+fi
+
+if ! (cd "$HERE" && sha256sum --quiet -c MANIFEST.sha256); then
+  echo "ERROR: package integrity check FAILED (see mismatches above). Do not install." >&2
+  exit 3
+fi
+
+echo "Package integrity: OK"
+
+
+# ------------------------------------------------------------
+# Service unit sanity (refuse the known crash-loop configuration)
+# ------------------------------------------------------------
+
+REQUIRED_SERVICE_LINES=(
+  "WorkingDirectory=/mnt/ems-data"
+  "Environment=GPIOZERO_PIN_FACTORY=lgpio"
+)
+
+for line in "${REQUIRED_SERVICE_LINES[@]}"; do
+  if ! grep -qxF "$line" "$HERE/systemd/ems-controller.service"; then
+    echo "ERROR: systemd/ems-controller.service is missing required line: $line" >&2
+    echo "This package was generated from a stale backend. Do NOT install it." >&2
+    exit 3
+  fi
+done
+
+if grep -qxF "WorkingDirectory=/opt/ems/pi_firmware" "$HERE/systemd/ems-controller.service"; then
+  echo "ERROR: systemd/ems-controller.service still uses WorkingDirectory=/opt/ems/pi_firmware (crash-loop config)." >&2
+  exit 3
+fi
+
+echo "Service unit validation: OK"
 
 
 # ------------------------------------------------------------
@@ -265,23 +317,29 @@ if [[ "$SKIP_SYSTEMD" != "1" ]]; then
   echo "Starting EMS controller ..."
   systemctl restart ems-controller.service
 
-  echo "Waiting for a stable EMS controller ..."
+  STABLE_WINDOW="${EMS_STABLE_WINDOW:-30}"
+  echo "Waiting ${STABLE_WINDOW}s for a stable EMS controller (must stay active with NRestarts=0) ..."
 
-  SERVICE_STATE="FAILED"
+  # A momentary "active" is NOT success: the unit must stay active for the whole window
+  # without a single automatic restart. Any exit/restart inside the window = FAILED.
+  SERVICE_STATE="ACTIVE"
 
-  for i in {1..10}; do
+  for ((i = 1; i <= STABLE_WINDOW; i++)); do
 
     sleep 1
 
-    if systemctl is-active --quiet ems-controller.service; then
+    if ! systemctl is-active --quiet ems-controller.service; then
+      SERVICE_STATE="FAILED"
+      echo "Controller is not active after ${i}s." >&2
+      break
+    fi
 
-      RESTARTS="$(systemctl show ems-controller.service -p NRestarts --value)"
+    RESTARTS="$(systemctl show ems-controller.service -p NRestarts --value)"
 
-      if [[ "$RESTARTS" == "0" ]]; then
-        SERVICE_STATE="ACTIVE"
-        break
-      fi
-
+    if [[ "$RESTARTS" != "0" ]]; then
+      SERVICE_STATE="FAILED"
+      echo "Controller restarted (NRestarts=$RESTARTS) within ${i}s." >&2
+      break
     fi
 
   done
@@ -319,13 +377,18 @@ if [[ "$SKIP_SYSTEMD" != "1" ]]; then
   # ----------------------------------------------------------
 
   echo
-  echo "EMS controller reached a stable running state."
+  echo "EMS controller stayed active for ${STABLE_WINDOW}s with NRestarts=0."
 
   systemctl \
     --no-pager \
     --lines=10 \
     status ems-controller.service \
     || true
+
+  echo
+  echo "Check cloud registration with:"
+  echo "  journalctl -u ems-controller.service -f"
+  echo "  systemctl show ems-controller.service -p NRestarts --value"
 
 fi
 
@@ -363,6 +426,28 @@ Device:    {name}
 Device ID: {device_id}
 Key ID:    {key_id}
 API URL:   {api_url}
+
+Service unit sha256 (systemd/ems-controller.service): {service_sha256}
+
+VERIFY BEFORE INSTALLING (mandatory)
+------------------------------------
+
+Do NOT run install.sh until the packaged service unit is confirmed:
+
+  unzip -p ems-pi-provisioning-*.zip ems-pi-provisioning/systemd/ems-controller.service \\
+    | grep -E '^(WorkingDirectory|Environment=GPIOZERO_PIN_FACTORY)='
+
+Expected output (both lines, nothing else for WorkingDirectory):
+
+  WorkingDirectory=/mnt/ems-data
+  Environment=GPIOZERO_PIN_FACTORY=lgpio
+
+Compare the sha256 above with the unit in the repository:
+
+  sha256sum pi_firmware/ems-controller.service
+
+install.sh repeats these checks (plus MANIFEST.sha256) and refuses to install
+a stale or tampered package.
 
 IMPORTANT SECURITY INFORMATION
 ------------------------------
@@ -422,6 +507,7 @@ PACKAGE CONTENTS
 install.sh
 ems-controller.env
 README.txt
+MANIFEST.sha256
 
 firmware/
   ems_controller.py
@@ -472,6 +558,26 @@ def _validate_source_files() -> None:
             + "\n".join(f"  - {item}" for item in missing)
         )
 
+    _validate_service_unit((FIRMWARE_DIR / "ems-controller.service").read_text())
+
+
+def _validate_service_unit(text: str) -> None:
+    """Refuse to package a controller unit that would crash-loop on the Pi."""
+
+    lines = {ln.strip() for ln in text.splitlines()}
+    missing = [req for req in REQUIRED_SERVICE_LINES if req not in lines]
+    working_dirs = sorted(ln for ln in lines if ln.startswith("WorkingDirectory="))
+
+    if missing or working_dirs != ["WorkingDirectory=/mnt/ems-data"]:
+        raise RuntimeError(
+            "Refusing to build Pi provisioning package: pi_firmware/ems-controller.service is stale. "
+            f"missing={missing} WorkingDirectory={working_dirs}"
+        )
+
+
+def service_unit_sha256() -> str:
+    return hashlib.sha256((FIRMWARE_DIR / "ems-controller.service").read_bytes()).hexdigest()
+
 
 def build_provisioning_zip(
     device_id: str,
@@ -496,6 +602,7 @@ def build_provisioning_zip(
     )
 
     buf = io.BytesIO()
+    manifest: list[str] = []
 
     with zipfile.ZipFile(
         buf,
@@ -508,6 +615,8 @@ def build_provisioning_zip(
             data: bytes,
             mode: int = 0o644,
         ) -> None:
+
+            manifest.append(f"{hashlib.sha256(data).hexdigest()}  {arcname}")
 
             info = zipfile.ZipInfo(
                 f"{ROOT}/{arcname}",
@@ -549,6 +658,7 @@ def build_provisioning_zip(
                 device_id=device_id,
                 key_id=key_id,
                 api_url=api_url,
+                service_sha256=service_unit_sha256(),
             ).encode(),
         )
 
@@ -578,5 +688,8 @@ def build_provisioning_zip(
                 f"systemd/{filename}",
                 source.read_bytes(),
             )
+
+        # Written last so install.sh can `sha256sum -c` every other file in the package.
+        z.writestr(f"{ROOT}/MANIFEST.sha256", "\n".join(manifest) + "\n")
 
     return buf.getvalue()

@@ -8,8 +8,10 @@ Effective feedback = device `feedback_hardware_installed` AND slot `feedback_ena
 
 | # | Step | Expected evidence | Pass |
 |---|------|-------------------|------|
-| 1 | Super Admin → society → Provisioning Center → DOWNLOAD PI PROVISIONING ZIP (confirm rotation) | ZIP downloaded; audit `PROVISIONING_PACKAGE` has device_id + key_id only | ☐ |
-| 2 | On the Pi: unzip; `EMS_DATA_DEVICE=/dev/disk/by-id/<ext4> sudo -E ./install.sh` | Prints Device ID, API `https://ems-saass.onrender.com/api`, `Credential: CONFIGURED`, `Service: ACTIVE`; key never printed | ☐ |
+| 1 | Super Admin → society → Provisioning Center → DOWNLOAD PI PROVISIONING ZIP (confirm rotation) | ZIP downloaded; audit `PROVISIONING_PACKAGE` has device_id + key_id + service_sha256 only | ☐ |
+| 1b | **Before copying to the Pi:** `unzip -p ems-pi-provisioning-*.zip ems-pi-provisioning/systemd/ems-controller.service \| grep -E '^(WorkingDirectory\|Environment=GPIOZERO_PIN_FACTORY)='` | Exactly `WorkingDirectory=/mnt/ems-data` and `Environment=GPIOZERO_PIN_FACTORY=lgpio`. Anything else (e.g. `/opt/ems/pi_firmware`) = stale backend → STOP, redeploy backend, re-download | ☐ |
+| 2 | On the Pi: unzip; `EMS_DATA_DEVICE=/dev/disk/by-id/<ext4> sudo -E ./install.sh` | Prints `Package integrity: OK`, `Service unit validation: OK`, Device ID, API `https://ems-saass.onrender.com/api`, `Credential: CONFIGURED`, `Service: ACTIVE` after the 30 s stability window; key never printed | ☐ |
+| 2b | `systemctl is-active ems-controller; systemctl show ems-controller -p NRestarts --value` (repeat after 2 min) | `active` and `0` both times; `journalctl -u ems-controller` shows no gpiozero fallback / `/sys/class/gpio` errors | ☐ |
 | 3 | `cat /etc/ems/ems-controller.env` (root) | `EMS_DEVICE_ID` equals the registered UUID; file mode 0600 | ☐ |
 | 4 | `journalctl -u ems-controller -n 50` | First `/api/pi/sync` HTTP 200; no `PI_AUTH_REJECTED` for this device in backend logs | ☐ |
 | 5 | Website → society → Operations | Device card ONLINE, `Last sync` seconds ago | ☐ |

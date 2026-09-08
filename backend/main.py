@@ -13,7 +13,7 @@ import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
-from provisioning import build_provisioning_zip
+from provisioning import build_provisioning_zip, service_unit_sha256
 import logging
 _seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
 from fastapi.middleware.cors import CORSMiddleware
@@ -1030,9 +1030,10 @@ def provisioning_package(device_id: str, request: Request, user: dict = Depends(
             if not dev:
                 raise HTTPException(404, "Device not found")
             issued = issue_device_credential(cur, device_id, user, "provisioning")
-            log_audit(cur, user, dev["society_id"] or 0, "PROVISIONING_PACKAGE",
-                      {"device_id": device_id, "key_id": issued["key_id"], "api_url": api_url})
             payload = build_provisioning_zip(device_id, dev["name"], issued["key_id"], issued["api_key"], api_url)
+            log_audit(cur, user, dev["society_id"] or 0, "PROVISIONING_PACKAGE",
+                      {"device_id": device_id, "key_id": issued["key_id"], "api_url": api_url,
+                       "service_sha256": service_unit_sha256()})
         conn.commit()
     except Exception as e:
         conn.rollback(); raise e
