@@ -28,6 +28,8 @@ from state import (
     VerificationState,
 )
 from storage_manager import StorageManager
+from lcd_display import LcdDisplay, message_is_live
+from storage_health import collect_storage_health
 from offline_queue import OfflineQueue
 from gpio_manager import GPIOManager
 from api_client import ApiClient
@@ -132,6 +134,17 @@ class EMSController:
         self.smart = SmartHealthMonitor(os.environ.get("EMS_DATA_DEVICE", "/dev/mmcblk0"),
                                         os.path.join(_cfg.HEALTH_DIR, "smart.json"), logger)
         self._ota_status = self._read_ota_status()
+        # Storage health snapshot (read-only + tiny write probe) refreshed at most every 5 minutes.
+        self._storage_health = None
+        self._storage_health_next = 0.0
+        # Website -> LCD message: cached on disk so it survives reboot / cloud outage until expiry.
+        self._lcd_message_path = os.path.join(_cfg.HEALTH_DIR, "lcd_message.json")
+        self.lcd_message = self._load_lcd_message()
+        # LCD is display-only: it gets a read-only view dict, never a reference to gpio/queue/state.
+        self.lcd = LcdDisplay(self.lcd_view, logger,
+                              rotation_interval_s=float(os.environ.get("LCD_ROTATION_INTERVAL_S", "5")),
+                              enabled=os.environ.get("EMS_LCD_ENABLED", "1") != "0")
+        self.lcd.start()
 
         self._last_sync = 0.0
         self._last_usage_day = self.state.last_usage_date
@@ -471,6 +484,9 @@ class EMSController:
             # feedback (slots[*].physical_toggle) and from logical slot enable (cloud config).
             "toggle_input": self.gpio.toggle_inputs(),
             "hardware_fault": self.gpio.hardware_fault,
+            "storage_health": self._storage_health_snapshot(),
+            "lcd": {"available": self.lcd.available, "error": self.lcd.init_error,
+                    "message_id": (self.lcd_message or {}).get("id") if message_is_live(self.lcd_message) else None},
             "memory": memory,
             "events": events,
             # T7 applied configuration identity (RAM; persisted on change only).
@@ -703,6 +719,8 @@ class EMSController:
         self._apply_cloud_config(
             response
         )
+        if "lcd_message" in response:
+            self._store_lcd_message(response.get("lcd_message"))
 
         # OTA health check = boot() succeeded AND cloud sync succeeded on this firmware.
         if not self._boot_confirmed:
@@ -1039,6 +1057,70 @@ class EMSController:
         return True
 
     # ============================================================
+    # LCD (display-only view) + STORAGE HEALTH (read-only diagnostics)
+    # ============================================================
+
+    def lcd_view(self):
+        """Plain-data view for the LCD. Facts only; the LCD cannot act on anything."""
+        toggles = self.gpio.toggle_inputs()
+        slots = {}
+        for slot in SUPPORTED_SLOTS:
+            cfg = self.device_config.get("slots", {}).get(slot, {})
+            st = self.state.slots.get(slot)
+            fb = st.feedback_state.value if st else "UNKNOWN"
+            slots[slot] = {
+                "disabled": bool(cfg.get("disabled", True)),
+                "used_days": int(st.used_days) if st else None,
+                "target_days": cfg.get("target_days"),
+                "contactor": fb if fb in ("ON", "OFF") else "UNKNOWN",
+                "toggle": toggles.get(slot),
+            }
+        return {
+            "system_state": self.state.system_state.value,
+            "active_slot": self.state.active_slot,
+            "hardware_fault": self.gpio.hardware_fault,
+            "slots": slots,
+            "message": self.lcd_message if message_is_live(self.lcd_message) else None,
+        }
+
+    def _load_lcd_message(self):
+        try:
+            with open(self._lcd_message_path) as fh:
+                msg = json.load(fh)
+            return msg if isinstance(msg, dict) and message_is_live(msg) else None
+        except (OSError, ValueError):
+            return None
+
+    def _store_lcd_message(self, msg):
+        if msg is not None and not (isinstance(msg, dict) and isinstance(msg.get("message"), str)
+                                    and 0 < len(msg["message"].strip()) <= 80):
+            logger.warning("Ignoring invalid LCD message from cloud.")
+            return
+        self.lcd_message = msg
+        if not self.storage.is_write_allowed("diagnostics"):
+            return
+        try:
+            os.makedirs(os.path.dirname(self._lcd_message_path), exist_ok=True)
+            tmp = self._lcd_message_path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(msg, fh)
+            os.replace(tmp, self._lcd_message_path)
+        except OSError as exc:
+            logger.warning("LCD message cache not persisted: %s", exc)
+
+    def _storage_health_snapshot(self):
+        now = time.monotonic()
+        if self._storage_health is None or now >= self._storage_health_next:
+            self._storage_health_next = now + 300.0
+            probe = None if self.storage.is_write_allowed("diagnostics") else (lambda _d: (False, "writes suspended by storage guard"))
+            try:
+                self._storage_health = collect_storage_health(
+                    _cfg.DATA_DIR, os.environ.get("EMS_DATA_DEVICE"), self.smart.last_result, probe=probe)
+            except Exception as exc:
+                self._storage_health = {"health": "FAILED", "error": f"{type(exc).__name__}: {exc}", "smart": "UNAVAILABLE", "smart_available": False}
+        return self._storage_health
+
+    # ============================================================
     # PHYSICAL TOGGLES (local requests through the same gate as cloud commands)
     # ============================================================
 
@@ -1362,6 +1444,10 @@ class EMSController:
         logger.info(
             "EMS controller shutting down."
         )
+        try:
+            self.lcd.stop()
+        except Exception:
+            pass
 
         try:
             self.queue.close()

@@ -37,6 +37,8 @@ FIRMWARE_FILES = (
     "config_hash.py",
     "gpio_manager.py",
     "gpio_input_diag.py",
+    "lcd_display.py",
+    "storage_health.py",
     "logger.py",
     "memory_manager.py",
     "offline_queue.py",

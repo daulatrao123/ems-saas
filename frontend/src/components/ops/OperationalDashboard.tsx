@@ -3,6 +3,8 @@ import { useState } from "react";
 import { useOperations } from "./useOperations";
 import { DashboardHeader, btn, panel, tone } from "./DashboardHeader";
 import { StatusStrip } from "./StatusStrip";
+import { StoragePanel } from "./StoragePanel";
+import { LcdMessagePanel } from "./LcdMessagePanel";
 import { SlotCard } from "./SlotCard";
 import { SystemControls, ResetDayControl } from "./SystemControls";
 import { UnitAllotment } from "./UnitAllotment";
@@ -35,6 +37,12 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
         </div>
       )}
       <StatusStrip device={device} resetDay={ops.dash.reset_day} />
+      {device && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <StoragePanel device={device} />
+          {societyId && <LcdMessagePanel societyId={societyId} device={device} readOnly={readOnly} />}
+        </div>
+      )}
       {device?.hardware_fault && (
         <div data-testid="hardware-fault-banner" className="border border-red-500/60 bg-red-500/10 px-4 py-3 font-mono text-xs text-red-300">
           <b>HARDWARE FAULT (Pi-reported)</b> — {device.hardware_fault}. GPIO layer unavailable: relays are held OFF, controller is in FAULT. Run <code>gpio_input_diag.py</code> on the Pi.

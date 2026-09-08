@@ -101,7 +101,7 @@ class SmartHealthMonitor:
     """Hourly collector; persists ONLY when the summarised state changes (one tiny file, low frequency)."""
     def __init__(self, device, history_path, logger, interval_s=COLLECT_INTERVAL_S, runner=None):
         self.device, self.path, self.logger, self.interval, self.runner = device, history_path, logger, interval_s, runner
-        self._next = 0.0; self.last = None
+        self._next = 0.0; self.last = None; self.last_result = None
 
     def maybe_collect(self, now=None):
         now = time.monotonic() if now is None else now
@@ -112,6 +112,7 @@ class SmartHealthMonitor:
             result = collect(self.device, self.runner)
         except Exception as exc:  # diagnostics must never take the controller down
             result = {"smart": "ERROR", "health": "UNKNOWN", "device": self.device, "error": str(exc), "attributes": None, "reasons": []}
+        self.last_result = result
         summary = (result["smart"], result["health"], tuple(result["reasons"]))
         if self.last != summary:
             self.last = summary

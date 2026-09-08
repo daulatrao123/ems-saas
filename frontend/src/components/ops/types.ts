@@ -6,6 +6,7 @@ export type Device = {
   id: string; name: string; connected: boolean; active_slot: string | null; slots: Record<string, Slot>;
   config_state?: string | null; config_error?: string | null; ota_state?: string | null; storage_state?: string | null;
   firmware_version?: string | null; last_sync?: string | null; telemetry?: Telemetry; hardware_fault?: string | null;
+  storage_health?: StorageHealth | null; lcd?: { available?: boolean; error?: string | null; message_id?: number | null } | null;
 };
 export type SocietyMeta = { name: string; location: string | null; plan: string | null; society_code: string | null; status: string | null };
 export type Dashboard = { society_id: number; society: SocietyMeta; reset_day: number; devices: Device[] };
@@ -54,3 +55,11 @@ export const errorText = (err: unknown): { http: number | null; detail: string }
     || (http === 401 ? "Session expired — sign in again" : http === 403 ? "Forbidden for this tenant/role" : http === 404 ? "Not found" : http === 409 ? "Conflict" : http && http >= 500 ? "Backend error" : e?.code === "ECONNABORTED" ? "Request timed out" : "Network error");
   return { http, detail };
 };
+
+// Pi-reported data-volume health (read-only). smart UNAVAILABLE is distinct from PASSED; health GOOD needs SMART evidence.
+export type StorageHealth = {
+  device?: string | null; device_type?: string | null; mounted: boolean; mount_point?: string | null; filesystem?: string | null;
+  total_bytes?: number | null; used_bytes?: number | null; free_bytes?: number | null; used_percent?: number | null;
+  readable: boolean; writable: boolean; health: string; smart: string; smart_available: boolean; error?: string | null;
+};
+export type LcdMessage = { id: number; device_id: string; message: string; active: boolean; created_by?: string | null; created_at?: string | null; expires_at?: string | null; deactivated_at?: string | null; delivered_at?: string | null; expired: boolean };

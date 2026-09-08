@@ -4,6 +4,8 @@ EMS SaaS Backend v6.2.3 — Industrial Production (Strict Multi-Pi & 4-Slot Cont
 
 import os
 import re
+import html
+from psycopg.types.json import Json
 import time
 import uuid
 import hmac
@@ -1591,6 +1593,8 @@ def pi_sync(
                             (device_id, slot_code, physical_toggle, toggle_input, int(w.get("used_days", w.get("usedDays", 0))), int(w.get("clicks", 0))))
             hardware_fault = payload.get("hardware_fault")
             hardware_fault = str(hardware_fault)[:500] if hardware_fault else None
+            storage_health = payload.get("storage_health")
+            storage_health = Json(normalize_storage_health(storage_health)) if isinstance(storage_health, dict) else None
 
             cur.execute("SELECT config_version, reset_day FROM societies WHERE id = %s", (society_id,))
             soc = cur.fetchone()
@@ -1664,8 +1668,8 @@ def pi_sync(
 
             cur.execute("""INSERT INTO pi_state (device_id, active_slot, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason, config_version,
                                                  desired_config_hash, applied_config_version, applied_config_hash, applied_config_at, config_state, config_error,
-                                                 ota_desired_version, ota_state, ota_version, ota_attempts, ota_last_error, ota_updated_at, last_good_firmware_version, hardware_fault)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                                 ota_desired_version, ota_state, ota_version, ota_attempts, ota_last_error, ota_updated_at, last_good_firmware_version, hardware_fault, storage_health)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (device_id) DO UPDATE SET
                            active_slot=EXCLUDED.active_slot, reset_day=EXCLUDED.reset_day, emergency_stop=EXCLUDED.emergency_stop,
                            uptime_seconds=EXCLUDED.uptime_seconds, cpu_temp=EXCLUDED.cpu_temp, disk_free_mb=EXCLUDED.disk_free_mb,
@@ -1676,14 +1680,15 @@ def pi_sync(
                            applied_config_at=EXCLUDED.applied_config_at, config_state=EXCLUDED.config_state, config_error=EXCLUDED.config_error,
                            ota_desired_version=EXCLUDED.ota_desired_version, ota_state=EXCLUDED.ota_state, ota_version=EXCLUDED.ota_version,
                            ota_attempts=EXCLUDED.ota_attempts, ota_last_error=EXCLUDED.ota_last_error, ota_updated_at=EXCLUDED.ota_updated_at,
-                           last_good_firmware_version=EXCLUDED.last_good_firmware_version, hardware_fault=EXCLUDED.hardware_fault""",
+                           last_good_firmware_version=EXCLUDED.last_good_firmware_version, hardware_fault=EXCLUDED.hardware_fault,
+                           storage_health=COALESCE(EXCLUDED.storage_health, pi_state.storage_health)""",
                         (device_id, payload.get("active_slot", payload.get("activeWing")), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
                          bool(payload.get("emergencyStop", False)), int(payload.get("uptimeSeconds", 0)),
                          float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
                          payload.get("lastRebootReason", ""), cloud_config_version,
                          desired_hash, eff_av, eff_ah, eff_at, config_state, raw_err,
-                         ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good, hardware_fault))
+                         ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good, hardware_fault, storage_health))
 
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
@@ -1750,6 +1755,7 @@ def pi_sync(
                 "slots": slot_configs,
                 "resetDay": canonical_reset_day,
                 "reconciled_commands": reconciled,
+                "lcd_message": active_lcd_message(cur, device_id, now),
             }
             if cmd:
                 # CAS delivery: only the worker that flips queued->delivered owns this attempt.
@@ -1967,6 +1973,123 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     return {"success": True, "message": "Command queued", "command": command, "command_id": command_id,
             "sequence_no": sequence_no, "duplicate": False}
 
+STORAGE_HEALTH_STATES = {"GOOD", "WARNING", "FAILED", "UNAVAILABLE"}
+SMART_STATES = {"PASSED", "WARNING", "FAILED", "UNAVAILABLE"}
+
+def normalize_storage_health(raw: dict) -> dict:
+    """Pi telemetry, bounded and typed. UNAVAILABLE is never coerced into GOOD/PASSED."""
+    def num(v):
+        try: return float(v) if v is not None else None
+        except (TypeError, ValueError): return None
+    health = str(raw.get("health", "UNAVAILABLE")).upper(); smart = str(raw.get("smart", "UNAVAILABLE")).upper()
+    return {"device": (str(raw["device"])[:80] if raw.get("device") else None), "device_type": (str(raw["device_type"])[:32] if raw.get("device_type") else None),
+            "mounted": bool(raw.get("mounted")), "mount_point": (str(raw["mount_point"])[:120] if raw.get("mount_point") else None),
+            "filesystem": (str(raw["filesystem"])[:32] if raw.get("filesystem") else None),
+            "total_bytes": num(raw.get("total_bytes")), "used_bytes": num(raw.get("used_bytes")), "free_bytes": num(raw.get("free_bytes")),
+            "used_percent": num(raw.get("used_percent")), "readable": bool(raw.get("readable")), "writable": bool(raw.get("writable")),
+            "health": health if health in STORAGE_HEALTH_STATES else "UNAVAILABLE", "smart": smart if smart in SMART_STATES else "UNAVAILABLE",
+            "smart_available": bool(raw.get("smart_available")) and smart in ("PASSED", "WARNING", "FAILED"),
+            "error": (str(raw["error"])[:300] if raw.get("error") else None), "checked_at": num(raw.get("checked_at"))}
+
+def active_lcd_message(cur, device_id: str, now: datetime):
+    """Newest active, unexpired message for the Pi; marks first delivery. Display-only payload."""
+    cur.execute("""SELECT id, message, created_at, expires_at FROM lcd_messages
+                   WHERE device_id=%s AND active AND (expires_at IS NULL OR expires_at > %s)
+                   ORDER BY created_at DESC LIMIT 1""", (device_id, now))
+    row = cur.fetchone()
+    if not row: return None
+    cur.execute("UPDATE lcd_messages SET delivered_at=COALESCE(delivered_at, %s) WHERE id=%s", (now, row["id"]))
+    return {"id": row["id"], "message": row["message"], "active": True,
+            "created_at": row["created_at"].isoformat(), "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None}
+
+def _lcd_row(r: dict) -> dict:
+    return {"id": r["id"], "device_id": str(r["device_id"]), "message": r["message"], "active": r["active"],
+            "created_by": r.get("created_by_email"), "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+            "deactivated_at": r["deactivated_at"].isoformat() if r.get("deactivated_at") else None,
+            "delivered_at": r["delivered_at"].isoformat() if r.get("delivered_at") else None,
+            "expired": bool(r["expires_at"] and r["expires_at"] <= datetime.now(timezone.utc))}
+
+def _lcd_access(user: dict, data_or_sid) -> int:
+    if user.get("role") not in {"super_admin", "society_admin"}:
+        raise HTTPException(403, "Only super_admin or society_admin may manage LCD messages")
+    try: sid = int(data_or_sid)
+    except (TypeError, ValueError): raise HTTPException(400, "Invalid society_id")
+    if user.get("role") != "super_admin" and str(user.get("society_id")) != str(sid):
+        raise HTTPException(403, "Cannot access other society data")
+    return sid
+
+@app.post("/api/admin/lcd-messages")
+@limiter.limit("30/minute")
+def create_lcd_message(request: Request, data: dict, user: dict = Depends(get_current_user)):
+    """Website -> Pi display text (plain text, <= 80 chars). One active message per device."""
+    sid = _lcd_access(user, data.get("society_id"))
+    device_id = require_uuid(data.get("device_id"), "device_id")
+    message = html.unescape(re.sub(r"<[^>]*>", "", str(data.get("message") or ""))).replace("\r", " ").replace("\n", " ")
+    message = " ".join(message.split())
+    message = "".join(ch for ch in message if ch.isprintable())
+    if not message: raise HTTPException(400, "Message is required")
+    if len(message) > 80: raise HTTPException(400, "Message must be at most 80 characters")
+    expires_at = None
+    if data.get("expires_at"):
+        try: expires_at = datetime.fromisoformat(str(data["expires_at"]).replace("Z", "+00:00"))
+        except ValueError: raise HTTPException(400, "expires_at must be ISO-8601")
+        if expires_at.tzinfo is None: expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc): raise HTTPException(400, "expires_at must be in the future")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM pi_devices WHERE id=%s AND society_id=%s AND status='ASSIGNED'", (device_id, sid))
+            if not cur.fetchone(): raise HTTPException(404, "Active device not found in this society")
+            cur.execute("UPDATE lcd_messages SET active=FALSE, deactivated_at=NOW() WHERE device_id=%s AND active", (device_id,))
+            cur.execute("""INSERT INTO lcd_messages (device_id, message, expires_at, created_by) VALUES (%s, %s, %s, %s)
+                           RETURNING id, device_id, message, active, created_at, expires_at, deactivated_at, delivered_at""",
+                        (device_id, message, expires_at, user.get("id")))
+            row = dict(cur.fetchone()); row["created_by_email"] = user.get("email")
+            log_audit(cur, user, sid, "LCD_MESSAGE_CREATE", {"device_id": device_id, "id": row["id"], "len": len(message), "expires_at": expires_at.isoformat() if expires_at else None})
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    return {"success": True, "message": _lcd_row(row)}
+
+@app.get("/api/admin/lcd-messages")
+def list_lcd_messages(society_id: str, device_id: str, limit: int = 20, user: dict = Depends(get_current_user)):
+    sid = _lcd_access(user, society_id); device_id = require_uuid(device_id, "device_id")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM pi_devices WHERE id=%s AND society_id=%s", (device_id, sid))
+            if not cur.fetchone(): raise HTTPException(404, "Device not found in this society")
+            cur.execute("""SELECT m.*, u.email AS created_by_email FROM lcd_messages m LEFT JOIN users u ON u.id=m.created_by
+                           WHERE m.device_id=%s ORDER BY m.created_at DESC LIMIT %s""", (device_id, max(1, min(int(limit), 100))))
+            rows = [_lcd_row(dict(r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    active = next((r for r in rows if r["active"] and not r["expired"]), None)
+    return {"messages": rows, "active": active}
+
+@app.post("/api/admin/lcd-messages/{message_id}/deactivate")
+@limiter.limit("30/minute")
+def deactivate_lcd_message(request: Request, message_id: int, data: dict, user: dict = Depends(get_current_user)):
+    sid = _lcd_access(user, data.get("society_id"))
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""UPDATE lcd_messages m SET active=FALSE, deactivated_at=COALESCE(m.deactivated_at, NOW())
+                           FROM pi_devices d WHERE m.id=%s AND d.id=m.device_id AND d.society_id=%s
+                           RETURNING m.id, m.device_id, m.message, m.active, m.created_at, m.expires_at, m.deactivated_at, m.delivered_at""", (message_id, sid))
+            row = cur.fetchone()
+            if not row: raise HTTPException(404, "Message not found in this society")
+            log_audit(cur, user, sid, "LCD_MESSAGE_DEACTIVATE", {"id": message_id, "device_id": str(row["device_id"])})
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    return {"success": True, "message": _lcd_row(dict(row))}
+
 @app.post("/api/admin/slot-config")
 @limiter.limit("30/minute")
 def set_slot_config(request: Request, data: dict, user: dict = Depends(get_current_user)):
@@ -2067,6 +2190,7 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "active_slot": pi.get("active_slot") if pi else None,
                     "slots": slots_data,
                     "hardware_fault": pi.get("hardware_fault") if pi else None,
+                    "storage_health": pi.get("storage_health") if pi else None,
                     # T7 convergence evidence (read-only exposure; no UI yet)
                     "config_version": pi.get("config_version") if pi else None,
                     "desired_config_hash": pi.get("desired_config_hash") if pi else None,
