@@ -3,6 +3,7 @@ EMS SaaS Backend v6.2.3 — Industrial Production (Strict Multi-Pi & 4-Slot Cont
 """
 
 import os
+import re
 import time
 import uuid
 import hmac
@@ -111,7 +112,19 @@ def archive_terminal_commands(cur, batch_size: int = 500) -> dict:
     return {"archived": cur.rowcount, "batch_size": batch_size}
 app = FastAPI(title="EMS SaaS API", version="6.4.0-targeted")
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+_PERIOD_SECONDS = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}
+
+def _retry_after_seconds(detail: str) -> int:
+    """Upper bound of the limit window ('120 per 1 minute' -> 60) so clients back off, never busy-retry."""
+    m = re.search(r"per\s+(\d+)\s*(second|minute|hour|day)", str(detail))
+    return int(m.group(1)) * _PERIOD_SECONDS[m.group(2)] if m else 60
+
+async def _rate_limited(request: Request, exc: RateLimitExceeded):
+    response = _rate_limit_exceeded_handler(request, exc)
+    response.headers["Retry-After"] = str(_retry_after_seconds(exc.detail))
+    return response
+
+app.add_exception_handler(RateLimitExceeded, _rate_limited)
 
 DEFAULT_RESET_DAY = 15
 SLOTS = ["A", "B", "C", "D"] # Strict 4-slot architecture

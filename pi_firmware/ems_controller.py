@@ -146,6 +146,7 @@ class EMSController:
         self._events_in_flight = 0
         self._ack_backoff_s = 0.0
         self._ack_backoff_until = 0.0
+        self._ack_last_flush = -1e9
 
         self._install_signal_handlers()
 
@@ -1238,6 +1239,10 @@ class EMSController:
 
     ACK_BACKOFF_MIN_S = 2.0
     ACK_BACKOFF_MAX_S = 300.0
+    # Pacing even when the cloud is healthy: one queued command (<= 2 POSTs) per pass, one pass per
+    # ACK_FLUSH_INTERVAL_S -> <= 80 req/min, under the backend's 120/min ACK limit with sync headroom.
+    ACK_FLUSH_INTERVAL_S = 1.5
+    ACK_ROWS_PER_FLUSH = 1
 
     def _ack_defer(self, retry_after=None):
         self._ack_backoff_s = min(
@@ -1251,10 +1256,12 @@ class EMSController:
         logger.warning("ACK delivery deferred %.0fs (HTTP %s).", wait, self.api.last_ack_http)
 
     def flush_acks(self):
-        if time.monotonic() < self._ack_backoff_until:
+        now = time.monotonic()
+        if now < self._ack_backoff_until or now - self._ack_last_flush < self.ACK_FLUSH_INTERVAL_S:
             return
+        self._ack_last_flush = now
 
-        for command_id, status, verification, error in self.queue.get_unacked():
+        for command_id, status, verification, error in self.queue.get_unacked()[: self.ACK_ROWS_PER_FLUSH]:
             try:
                 attempt = self.queue.get_cloud_attempt(command_id)
                 self.queue.count_ack_attempt(command_id)
@@ -1270,7 +1277,10 @@ class EMSController:
                     # Genuine conflict: the cloud will never accept this ACK. Retrying is pure load.
                     code = self.api.last_ack_code or "CONFLICT"
                     logger.critical("ACK %s rejected by cloud (%s); not retrying.", command_id, code)
-                    self.queue.mark_ack_rejected(command_id, code)
+                    if not self.queue.mark_ack_rejected(command_id, code):
+                        # Could not persist REJECTED (e.g. read-only storage): still never hammer the cloud.
+                        self._ack_defer()
+                        return
                     self._emit_event("ack_rejected", f"command={command_id} status={status} code={code}")
                     continue
 
