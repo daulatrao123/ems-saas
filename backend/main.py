@@ -397,7 +397,9 @@ def _cors_headers(origin: str) -> dict:
 
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=_cors_headers(request.headers.get("origin", "")))
+    headers = _cors_headers(request.headers.get("origin", ""))
+    headers.update(exc.headers or {})  # e.g. X-EMS-Ack-Code on genuine ACK conflicts
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=headers)
 
 @app.exception_handler(Exception)
 async def unhandled_exc_handler(request: Request, exc: Exception):
@@ -494,6 +496,17 @@ def is_pi_online(pi_state: dict) -> bool:
         except (TypeError, ValueError): return False
     if last_sync.tzinfo is None: last_sync = last_sync.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - last_sync).total_seconds() <= PI_ONLINE_THRESHOLD_SECONDS
+
+def normalize_toggle_input(value) -> str:
+    """Pi telemetry only: True/False/None (or ON/OFF/UNKNOWN strings) -> ON/OFF/UNKNOWN."""
+    if isinstance(value, bool): return "ON" if value else "OFF"
+    v = str(value).upper() if value is not None else "UNKNOWN"
+    return v if v in ("ON", "OFF") else "UNKNOWN"
+
+# Ordering of the command FSM used to tell a REPLAY (older hop repeated after a lost response)
+# from a genuinely illegal transition. Terminal outcomes share one rank; `acked` is final.
+ACK_STATUS_RANK = {"queued": 0, "delivered": 1, "executing": 2, "unknown_after_reboot": 2,
+                   "hardware_verified": 3, "completed": 4, "failed": 4, "expired": 4, "acked": 5}
 
 def slot_is_visible(config: dict, state: dict) -> bool:
     physical = str(state.get("physical_toggle", "UNKNOWN")).upper()
@@ -1545,18 +1558,26 @@ def pi_sync(
                         (now, payload.get("firmwareVersion", "unknown"), device_id))
 
             slots_payload = payload.get("slots", payload.get("wings", {}))
+            # Physical toggle inputs (top-level, additive): true/false/null per slot; absent -> UNKNOWN.
+            toggle_payload = payload.get("toggle_input")
+            toggle_payload = toggle_payload if isinstance(toggle_payload, dict) else {}
             for slot_code, w in slots_payload.items():
                 if slot_code not in SLOTS: continue
+                # `physical_toggle` is the CONTACTOR FEEDBACK state (historical column name).
                 physical_toggle = w.get("physical_toggle", w.get("physicalToggle", "UNKNOWN"))
                 if isinstance(physical_toggle, bool): physical_toggle = "ON" if physical_toggle else "OFF"
                 physical_toggle = str(physical_toggle).upper()
                 if physical_toggle not in ("ON", "OFF", "UNKNOWN"): physical_toggle = "UNKNOWN"
+                toggle_input = normalize_toggle_input(toggle_payload.get(slot_code))
 
-                cur.execute("""INSERT INTO slot_state (device_id, slot, physical_toggle, used_days, clicks)
-                               VALUES (%s, %s, %s, %s, %s)
+                cur.execute("""INSERT INTO slot_state (device_id, slot, physical_toggle, toggle_input, used_days, clicks)
+                               VALUES (%s, %s, %s, %s, %s, %s)
                                ON CONFLICT (device_id, slot) DO UPDATE SET
-                               physical_toggle=EXCLUDED.physical_toggle, used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks""",
-                            (device_id, slot_code, physical_toggle, int(w.get("used_days", w.get("usedDays", 0))), int(w.get("clicks", 0))))
+                               physical_toggle=EXCLUDED.physical_toggle, toggle_input=EXCLUDED.toggle_input,
+                               used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks""",
+                            (device_id, slot_code, physical_toggle, toggle_input, int(w.get("used_days", w.get("usedDays", 0))), int(w.get("clicks", 0))))
+            hardware_fault = payload.get("hardware_fault")
+            hardware_fault = str(hardware_fault)[:500] if hardware_fault else None
 
             cur.execute("SELECT config_version, reset_day FROM societies WHERE id = %s", (society_id,))
             soc = cur.fetchone()
@@ -1630,8 +1651,8 @@ def pi_sync(
 
             cur.execute("""INSERT INTO pi_state (device_id, active_slot, reset_day, emergency_stop, uptime_seconds, cpu_temp, disk_free_mb, last_sync, boot_count, last_shutdown_reason, clock_source, watchdog_enabled, last_reboot_reason, config_version,
                                                  desired_config_hash, applied_config_version, applied_config_hash, applied_config_at, config_state, config_error,
-                                                 ota_desired_version, ota_state, ota_version, ota_attempts, ota_last_error, ota_updated_at, last_good_firmware_version)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                                 ota_desired_version, ota_state, ota_version, ota_attempts, ota_last_error, ota_updated_at, last_good_firmware_version, hardware_fault)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (device_id) DO UPDATE SET
                            active_slot=EXCLUDED.active_slot, reset_day=EXCLUDED.reset_day, emergency_stop=EXCLUDED.emergency_stop,
                            uptime_seconds=EXCLUDED.uptime_seconds, cpu_temp=EXCLUDED.cpu_temp, disk_free_mb=EXCLUDED.disk_free_mb,
@@ -1642,14 +1663,14 @@ def pi_sync(
                            applied_config_at=EXCLUDED.applied_config_at, config_state=EXCLUDED.config_state, config_error=EXCLUDED.config_error,
                            ota_desired_version=EXCLUDED.ota_desired_version, ota_state=EXCLUDED.ota_state, ota_version=EXCLUDED.ota_version,
                            ota_attempts=EXCLUDED.ota_attempts, ota_last_error=EXCLUDED.ota_last_error, ota_updated_at=EXCLUDED.ota_updated_at,
-                           last_good_firmware_version=EXCLUDED.last_good_firmware_version""",
+                           last_good_firmware_version=EXCLUDED.last_good_firmware_version, hardware_fault=EXCLUDED.hardware_fault""",
                         (device_id, payload.get("active_slot", payload.get("activeWing")), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
                          bool(payload.get("emergencyStop", False)), int(payload.get("uptimeSeconds", 0)),
                          float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
                          payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
                          payload.get("lastRebootReason", ""), cloud_config_version,
                          desired_hash, eff_av, eff_ah, eff_at, config_state, raw_err,
-                         ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good))
+                         ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good, hardware_fault))
 
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
@@ -1782,20 +1803,32 @@ def pi_command_ack(
             if status == current:
                 # Idempotent repeat of an already-applied status is harmless.
                 return {"success": True, "status": current, "idempotent": True}
+            # REPLAY: the Pi repeats an OLDER hop (typically COMPLETED after the ACKED response was
+            # lost) or anything after `acked`. Nothing can change -> 200, no mutation, no retry storm.
+            # A DIFFERENT terminal outcome than the stored one is not a replay (409 CONFLICTING_TERMINAL).
+            cur_rank, new_rank = ACK_STATUS_RANK[current], ACK_STATUS_RANK[status]
+            if current == "acked" or new_rank < cur_rank:
+                return {"success": True, "status": current, "idempotent": True, "replay": True}
+            if new_rank == cur_rank == 4:
+                raise HTTPException(409, f"Conflicting terminal outcome {current} vs {status}",
+                                    headers={"X-EMS-Ack-Code": "CONFLICTING_TERMINAL"})
             path = resolve_ack_path(current, status, verification, str(cmd["command"]))
             if path is None:
-                raise HTTPException(409, f"Invalid command transition {current} -> {status}")
+                raise HTTPException(409, f"Invalid command transition {current} -> {status}",
+                                    headers={"X-EMS-Ack-Code": "ILLEGAL_TRANSITION"})
 
             # Lease/attempt identity: a stale worker (older delivery attempt) may not commit.
             if attempt is not None and attempt != int(cmd["attempt_count"]):
-                raise HTTPException(409, f"Stale command attempt {attempt}; current attempt is {cmd['attempt_count']}")
+                raise HTTPException(409, f"Stale command attempt {attempt}; current attempt is {cmd['attempt_count']}",
+                                    headers={"X-EMS-Ack-Code": "STALE_ATTEMPT"})
 
             now = datetime.now(timezone.utc)
 
             if status == "hardware_verified" and verification not in {
                 "VERIFIED_ON", "VERIFIED_OFF", "GPIO_CONFIRMED"
             }:
-                raise HTTPException(409, "HARDWARE_VERIFIED requires positive hardware verification")
+                raise HTTPException(409, "HARDWARE_VERIFIED requires positive hardware verification",
+                                    headers={"X-EMS-Ack-Code": "VERIFICATION_REQUIRED"})
 
             # Configuration commands are committed only after the Pi reports
             # terminal completion. Hardware commands never mutate configuration.
@@ -1804,7 +1837,7 @@ def pi_command_ack(
                     slot = cmd["slot"]
                     days = int((cmd["params"] or {}).get("days", 0))
                     if slot not in SLOTS or not 1 <= days <= 31:
-                        raise HTTPException(409, "Invalid set_days command data")
+                        raise HTTPException(409, "Invalid set_days command data", headers={"X-EMS-Ack-Code": "INVALID_COMMAND_DATA"})
                     cur.execute(
                         "UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s",
                         (days, device_id, slot),
@@ -1816,7 +1849,7 @@ def pi_command_ack(
                 elif cmd["command"] == "set_reset_day":
                     day = int((cmd["params"] or {}).get("day", DEFAULT_RESET_DAY))
                     if not 1 <= day <= 28:
-                        raise HTTPException(409, "Invalid reset day")
+                        raise HTTPException(409, "Invalid reset day", headers={"X-EMS-Ack-Code": "INVALID_COMMAND_DATA"})
                     cur.execute(
                         "UPDATE societies SET reset_day=%s, config_version=config_version+1 WHERE id=%s",
                         (day, society_id),
@@ -1834,7 +1867,8 @@ def pi_command_ack(
                 (status, error, verification, cmd["attempt_count"], *ts_args, command_id, device_id, current),
             )
             if cur.rowcount != 1:
-                raise HTTPException(409, f"Command state changed concurrently (expected {current})")
+                raise HTTPException(409, f"Command state changed concurrently (expected {current})",
+                                    headers={"X-EMS-Ack-Code": "CONCURRENT_CHANGE"})
 
         conn.commit()
     except Exception:
@@ -1920,6 +1954,61 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
     return {"success": True, "message": "Command queued", "command": command, "command_id": command_id,
             "sequence_no": sequence_no, "duplicate": False}
 
+@app.post("/api/admin/slot-config")
+@limiter.limit("30/minute")
+def set_slot_config(request: Request, data: dict, user: dict = Depends(get_current_user)):
+    """LOGICAL slot enable/disable (+ display name). Business configuration only: this never touches
+    GPIO mapping, toggle state or contactor feedback, which are Pi-reported telemetry. Bumps the
+    society config_version so the device converges on the new configuration at its next sync."""
+    if user.get("role") not in {"super_admin", "society_admin"}:
+        raise HTTPException(403, "Only super_admin or society_admin may change slot configuration")
+    try: sid = int(data.get("society_id"))
+    except (TypeError, ValueError): raise HTTPException(400, "Invalid society_id")
+    if user.get("role") != "super_admin" and str(user.get("society_id")) != str(sid):
+        raise HTTPException(403, "Cannot access other society data")
+    device_id = require_uuid(data.get("device_id"), "device_id")
+    slot = str(data.get("slot", ""))
+    if slot not in SLOTS:
+        raise HTTPException(400, f"Valid slot ({', '.join(SLOTS)}) is required")
+    disabled = data.get("disabled")
+    display_name = data.get("display_name")
+    if disabled is None and display_name is None:
+        raise HTTPException(400, "Provide disabled and/or display_name")
+    if disabled is not None and not isinstance(disabled, bool):
+        raise HTTPException(400, "disabled must be a boolean")
+    if display_name is not None:
+        display_name = str(display_name).strip()[:40]
+        if not display_name:
+            raise HTTPException(400, "display_name cannot be empty")
+
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id, status FROM pi_devices WHERE id=%s AND society_id=%s FOR UPDATE", (device_id, sid))
+            dev = cur.fetchone()
+            if not dev or str(dev["status"]).upper() != "ASSIGNED":
+                raise HTTPException(404, "Active device not found in this society")
+            cur.execute("""INSERT INTO slot_configs (device_id, slot, display_name, target_days, disabled, feedback_enabled)
+                           VALUES (%s, %s, %s, 0, %s, FALSE)
+                           ON CONFLICT (device_id, slot) DO UPDATE SET
+                           disabled=COALESCE(%s, slot_configs.disabled),
+                           display_name=COALESCE(%s, slot_configs.display_name)
+                           RETURNING slot, disabled, display_name, target_days""",
+                        (device_id, slot, display_name or f"Slot {slot}", True if disabled is None else disabled,
+                         disabled, display_name))
+            row = cur.fetchone()
+            cur.execute("UPDATE societies SET config_version = config_version + 1 WHERE id = %s RETURNING config_version", (sid,))
+            version = cur.fetchone()["config_version"]
+            log_audit(cur, user, sid, "SLOT_CONFIG", {"device_id": device_id, "slot": slot,
+                                                      "disabled": row["disabled"], "display_name": row["display_name"]})
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    return {"success": True, "slot": row["slot"], "disabled": row["disabled"], "display_name": row["display_name"],
+            "target_days": row["target_days"], "config_version": version}
+
 @app.get("/api/admin/dashboard")
 def admin_dashboard(society_id: str, user: dict = Depends(require_society_access)):
     if not society_id: raise HTTPException(400, "society_id required")
@@ -1953,7 +2042,8 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                         "status": "ACTIVE" if pi and pi.get("active_slot") == c["slot"] else "IDLE",
                         "display_name": c["display_name"],
                         "disabled": c["disabled"],
-                        "physical_toggle": st.get("physical_toggle", "UNKNOWN"),
+                        "physical_toggle": st.get("physical_toggle", "UNKNOWN"),  # contactor feedback
+                        "toggle_input": st.get("toggle_input") or "UNKNOWN",      # physical toggle (Pi telemetry)
                         "visible": slot_is_visible(c, st),
                     }
 
@@ -1963,6 +2053,7 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "connected": is_pi_online(pi),
                     "active_slot": pi.get("active_slot") if pi else None,
                     "slots": slots_data,
+                    "hardware_fault": pi.get("hardware_fault") if pi else None,
                     # T7 convergence evidence (read-only exposure; no UI yet)
                     "config_version": pi.get("config_version") if pi else None,
                     "desired_config_hash": pi.get("desired_config_hash") if pi else None,
@@ -2085,6 +2176,7 @@ def member_dashboard(user: dict = Depends(get_current_user)):
                         "target_days": c["target_days"],
                         "display_name": c["display_name"],
                         "physical_toggle": st.get("physical_toggle", "UNKNOWN"),
+                        "toggle_input": st.get("toggle_input") or "UNKNOWN",
                     }
 
                 devices_data.append({
@@ -2092,7 +2184,8 @@ def member_dashboard(user: dict = Depends(get_current_user)):
                     "name": dev["name"],
                     "connected": is_pi_online(pi),
                     "active_slot": pi.get("active_slot") if pi else None,
-                    "slots": slots_data
+                    "slots": slots_data,
+                    "hardware_fault": pi.get("hardware_fault") if pi else None,
                 })
 
             return { "devices": devices_data, "reset_day": DEFAULT_RESET_DAY }

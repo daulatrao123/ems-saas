@@ -35,13 +35,18 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
         </div>
       )}
       <StatusStrip device={device} resetDay={ops.dash.reset_day} />
+      {device?.hardware_fault && (
+        <div data-testid="hardware-fault-banner" className="border border-red-500/60 bg-red-500/10 px-4 py-3 font-mono text-xs text-red-300">
+          <b>HARDWARE FAULT (Pi-reported)</b> — {device.hardware_fault}. GPIO layer unavailable: relays are held OFF, controller is in FAULT. Run <code>gpio_input_diag.py</code> on the Pi.
+        </div>
+      )}
       {!device ? <div className={`${panel} p-8 text-center text-gray-500 font-mono text-sm`}>NO PI DEVICE REGISTERED FOR THIS SOCIETY</div> : (
         <>
           <div className="grid gap-3 xl:grid-cols-[1fr_360px]">
             <div>
               <div className="mb-2 text-[10px] uppercase tracking-[0.14em] text-gray-500">Slots · {device.name} <span className="font-mono text-gray-600">{device.id}</span></div>
               <div data-testid="slot-grid" className="grid gap-3 sm:grid-cols-2">
-                {SLOT_CODES.filter((c) => device.slots[c]).map((c) => <SlotCard key={c} device={device} code={c} slot={device.slots[c]} queue={ops.queue} isPending={ops.isPending} readOnly={readOnly} lastCmd={lastFor(c)} />)}
+                {SLOT_CODES.filter((c) => device.slots[c]).map((c) => <SlotCard key={c} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={ops.setSlotConfig} isPending={ops.isPending} readOnly={readOnly} lastCmd={lastFor(c)} />)}
                 {SLOT_CODES.every((c) => !device.slots[c]) && <div className={`${panel} p-6 text-gray-500 text-sm sm:col-span-2`}>No slots configured for this device yet.</div>}
               </div>
             </div>

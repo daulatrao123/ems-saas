@@ -144,6 +144,8 @@ class EMSController:
         self._pending_events = []
         self._pending_events_max = 20
         self._events_in_flight = 0
+        self._ack_backoff_s = 0.0
+        self._ack_backoff_until = 0.0
 
         self._install_signal_handlers()
 
@@ -190,6 +192,10 @@ class EMSController:
         self.state.save_state(
             immediate=True
         )
+
+        if self.gpio.hardware_fault:
+            # GPIO layer unavailable: no relay exists to drive, stay alive to report.
+            self._emit_event("hardware_fault", self.gpio.hardware_fault)
 
         if not self.gpio.reconcile_hardware_state():
             logger.critical(
@@ -376,7 +382,6 @@ class EMSController:
 
             slots[slot] = {
                 "physical_toggle": physical,
-                "toggle_input": self.gpio.toggle_input_state(slot),
                 "used_days": int(slot_state.used_days),
                 "clicks": int(slot_state.clicks),
             }
@@ -461,6 +466,10 @@ class EMSController:
             "watchdogEnabled": True,
             "clockSource": "system",
             "slots": slots,
+            # Physical toggle inputs (HIGH = ON). null = GPIO unavailable. Separate from contactor
+            # feedback (slots[*].physical_toggle) and from logical slot enable (cloud config).
+            "toggle_input": self.gpio.toggle_inputs(),
+            "hardware_fault": self.gpio.hardware_fault,
             "memory": memory,
             "events": events,
             # T7 applied configuration identity (RAM; persisted on change only).
@@ -1045,34 +1054,40 @@ class EMSController:
             self._pending_events = self._pending_events[-self._pending_events_max:]
 
     def process_toggle_events(self):
-        """Drain debounced toggle transitions. ON -> ACTIVATE slot (break-before-make handled by
+        """Drain debounced toggle edges (never levels). ON -> ACTIVATE slot (break-before-make in
         GPIOManager); OFF -> DEACTIVATE only if that slot is active (otherwise silent no-op).
-        Never runs in FAULT (rejected + toggle_rejected event). Returns number of hardware actions."""
+        Same gate as cloud commands: FAULT / non-READY / logically disabled slot -> toggle_rejected.
+        Returns number of hardware actions."""
         actions = 0
         for ev in self.gpio.pop_toggle_events():
             slot, on = ev["slot"], bool(ev["on"])
             if slot not in self.state.slots:
                 continue
 
+            def rejected(reason):
+                logger.warning("Toggle %s GPIO%s %s rejected: %s", slot, ev.get("gpio"), "ON" if on else "OFF", reason)
+                self._emit_event("toggle_rejected", self._toggle_message(ev, "REJECTED", reason=reason))
+
             if self.state.system_state == SystemState.FAULT:
-                logger.critical("Toggle %s=%s rejected: system in FAULT.", slot, "ON" if on else "OFF")
-                self._emit_event("toggle_rejected", f"TOGGLE {slot} {'ON' if on else 'OFF'} rejected: FAULT")
+                rejected("FAULT")
+                continue
+
+            if bool(self.device_config.get("slots", {}).get(slot, {}).get("disabled", True)):
+                rejected("SLOT_DISABLED")
                 continue
 
             if not on and self.state.active_slot != slot:
                 continue
 
             if self.state.system_state not in (SystemState.READY, SystemState.CLOUD_OFFLINE):
-                logger.warning("Toggle %s=%s ignored: system %s.", slot, on, self.state.system_state)
-                self._emit_event("toggle_rejected", f"TOGGLE {slot} {'ON' if on else 'OFF'} rejected: {self.state.system_state.value}")
+                rejected(f"SYSTEM_{self.state.system_state.value}")
                 continue
 
             prior_state = self.state.system_state
             self.state.system_state = SystemState.EXECUTING
             if not self.state.save_state(immediate=True):
-                logger.critical("Refusing toggle %s: EXECUTING state could not be persisted.", slot)
                 self.state.system_state = SystemState.FAULT
-                self._emit_event("toggle_rejected", f"TOGGLE {slot} rejected: STATE_PERSIST_FAILED")
+                rejected("STATE_PERSIST_FAILED")
                 continue
 
             success = False
@@ -1088,13 +1103,25 @@ class EMSController:
                     self.state.system_state = prior_state
                 self.state.save_state(immediate=True)
 
-            verification = self.state.slots[slot].verification_state.value
-            self._emit_event(
-                "toggle",
-                f"TOGGLE {slot} {'ON' if on else 'OFF'} -> {'OK' if success else 'FAILED'} {verification}",
-            )
+            self._emit_event("toggle", self._toggle_message(ev, "OK" if success else "FAILED"))
             actions += 1
         return actions
+
+    def _toggle_message(self, ev, result, reason=None):
+        slot = ev["slot"]
+        fmt = lambda v: "UNKNOWN" if v is None else ("ON" if v else "OFF")  # noqa: E731
+        edge_ts = datetime.fromtimestamp(float(ev.get("ts", time.time())), timezone.utc).isoformat()
+        parts = [
+            f"TOGGLE {slot}", f"gpio={ev.get('gpio')}", f"edge={fmt(ev.get('old'))}->{fmt(ev.get('on'))}",
+            f"edge_ts={edge_ts}", f"result={result}",
+        ]
+        if reason:
+            parts.append(f"reason={reason}")
+        parts += [
+            f"system={self.state.system_state.value}", f"active={self.state.active_slot or 'NONE'}",
+            f"verification={self.state.slots[slot].verification_state.value}",
+        ]
+        return " ".join(parts)
 
     # ============================================================
     # DEACTIVATE ALL
@@ -1206,42 +1233,54 @@ class EMSController:
                 )
 
     # ============================================================
-    # ACK
+    # ACK (bounded: 409 = never retried, 429/network = exponential backoff)
     # ============================================================
 
-    def flush_acks(self):
-        rows = (
-            self.queue.get_unacked()
-        )
+    ACK_BACKOFF_MIN_S = 2.0
+    ACK_BACKOFF_MAX_S = 300.0
 
-        for (
-            command_id,
-            status,
-            verification,
-            error,
-        ) in rows:
+    def _ack_defer(self, retry_after=None):
+        self._ack_backoff_s = min(
+            self.ACK_BACKOFF_MAX_S,
+            max(self.ACK_BACKOFF_MIN_S, self._ack_backoff_s * 2 if self._ack_backoff_s else self.ACK_BACKOFF_MIN_S),
+        )
+        wait = self._ack_backoff_s
+        if retry_after:
+            wait = min(self.ACK_BACKOFF_MAX_S, max(wait, float(retry_after)))
+        self._ack_backoff_until = time.monotonic() + wait
+        logger.warning("ACK delivery deferred %.0fs (HTTP %s).", wait, self.api.last_ack_http)
+
+    def flush_acks(self):
+        if time.monotonic() < self._ack_backoff_until:
+            return
+
+        for command_id, status, verification, error in self.queue.get_unacked():
             try:
                 attempt = self.queue.get_cloud_attempt(command_id)
-                terminal_sent = self.api.push_ack(
-                    command_id,
-                    status,
-                    verification or "UNKNOWN",
-                    error,
-                    attempt=attempt,
-                )
-                if terminal_sent and self.api.push_ack(
-                    command_id,
-                    "ACKED",
-                    verification or "UNKNOWN",
-                    error,
-                    attempt=attempt,
-                ):
+                self.queue.count_ack_attempt(command_id)
+                ok = self.api.push_ack(command_id, status, verification or "UNKNOWN", error, attempt=attempt)
+                if ok:
+                    ok = self.api.push_ack(command_id, "ACKED", verification or "UNKNOWN", error, attempt=attempt)
+                if ok:
                     self.queue.mark_acked(command_id)
+                    self._ack_backoff_s = 0.0
+                    continue
+
+                if self.api.last_ack_http == 409:
+                    # Genuine conflict: the cloud will never accept this ACK. Retrying is pure load.
+                    code = self.api.last_ack_code or "CONFLICT"
+                    logger.critical("ACK %s rejected by cloud (%s); not retrying.", command_id, code)
+                    self.queue.mark_ack_rejected(command_id, code)
+                    self._emit_event("ack_rejected", f"command={command_id} status={status} code={code}")
+                    continue
+
+                # 429 / 5xx / network: back off everything, resume later.
+                self._ack_defer(self.api.last_retry_after)
+                return
             except Exception as exc:
-                logger.warning(
-                    "ACK retry failed: %s",
-                    exc,
-                )
+                logger.warning("ACK retry failed: %s", exc)
+                self._ack_defer()
+                return
 
     # ============================================================
     # MAIN LOOP

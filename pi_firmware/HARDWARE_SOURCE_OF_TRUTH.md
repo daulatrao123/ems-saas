@@ -101,33 +101,41 @@ All relays MUST start OFF.
 
 # 4. TOGGLE INPUT
 
-Toggle inputs are logically ACTIVE-LOW.
+Toggle inputs are logically ACTIVE-HIGH.
 
 Expected electrical arrangement:
 
 GPIO input
 +
-internal pull-up
+internal pull-down
 +
-external switch/contact to GND
+external switch/contact to 3V3 (through a series resistor / protection)
 
 Therefore:
 
-GPIO HIGH -> toggle OFF
-GPIO LOW  -> toggle ON
+GPIO LOW  -> toggle OFF
+GPIO HIGH -> toggle ON
 
-Firmware should use:
+Firmware MUST use:
 
 Button(
     pin,
-    pull_up=True,
+    pull_up=False,
     bounce_time=0.05
 )
 
-Toggle polarity MUST remain independent from relay polarity.
+(gpiozero: pull_up=False selects the internal pull-down; the input is "pressed"
+when HIGH.)
 
-A relay being active-low does NOT mean the toggle must automatically
-use the same GPIO polarity.
+Toggle polarity is independent from relay polarity (relays stay ACTIVE-LOW) and
+from detect polarity (detect stays ACTIVE-LOW).
+
+Boot rule: the level present at initialisation is REPORTED but is NOT an edge.
+Only transitions after initialisation generate toggle requests. A toggle that is
+already HIGH at boot does not energise anything.
+
+Presence rule: a LOW toggle input means "OFF or not wired". A digital input
+CANNOT tell a present-but-OFF wing from an absent one; see §17.
 
 ---
 
@@ -357,7 +365,7 @@ HARDWARE_PROFILES = {
             },
         },
         "relay_active_low": True,
-        "toggle_active_low": True,
+        "toggle_active_low": False,
         "detect_active_low": True,
     }
 }
@@ -450,8 +458,35 @@ Firmware tests MUST cover:
 - failed feedback ON confirmation => FAULT
 - failed feedback OFF confirmation => FAULT
 - break-before-make is enforced
+- toggle active-high (GPIO HIGH -> ON, LOW -> OFF)
+- boot: already-HIGH toggle generates no edge / no relay action
+- GPIO initialisation failure -> FAULT, relays untouched, hardware_fault reported
+- logically disabled slot toggle -> rejected SLOT_DISABLED
 
-Implemented by `test_reports/hw_source_of_truth_test.py` (mock gpiozero; run alone).
+Implemented by `test_reports/hw_source_of_truth_test.py` and `test_reports/hw_truth_v2_test.py` (mock gpiozero; run alone).
+
+---
+
+# 17. PHYSICAL PRESENCE (NOT DETECTABLE WITH THIS MAP)
+
+The 12-GPIO map carries NO presence signal. With active-high pull-down toggles a
+LOW input is produced equally by:
+
+1. a physical toggle that exists and is OFF
+2. an unwired / absent wing
+
+Firmware and cloud therefore MUST NOT derive "hardware present" from toggle or
+detect levels, and MUST NOT probe by driving outputs. "Logical slot enabled" is
+an explicit administrative setting (cloud `slot_configs.disabled`), separate from
+toggle state and contactor feedback.
+
+If true presence detection is required, the hardware must add one of:
+
+- a per-wing presence strap to a dedicated GPIO input (pull-up, strap to GND = present)
+- a 3-position input (OFF / ON / ABSENT) per wing
+- an ADC / resistor-ladder wing-ID input
+
+Such a signal must be added to this document first, then to the firmware.
 
 ---
 
@@ -465,8 +500,8 @@ C = Relay23 / Toggle13 / Detect20
 D = Relay22 / Toggle12 / Detect21
 
 Relay = ACTIVE-LOW
-Toggle = ACTIVE-LOW
 Detect = ACTIVE-LOW
+Toggle = ACTIVE-HIGH (pull-down, HIGH = ON)
 
 12 unique GPIO signals.
 

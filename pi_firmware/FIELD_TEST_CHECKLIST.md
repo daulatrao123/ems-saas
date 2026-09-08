@@ -4,8 +4,9 @@ Status: **FIELD TEST REQUIRED — NOT YET PERFORMED.** All automated tests use m
 Do not tick any box without a physical Pi, relay board and (optionally) feedback wiring.
 
 Hardware contract: see `HARDWARE_SOURCE_OF_TRUTH.md` (BCM). Relays A/B/C/D = GPIO 17/27/23/22 (ACTIVE-LOW: pin LOW = relay ON),
-toggles A/B/C/D = GPIO 5/6/13/12 (pull-up, LOW = ON), detect/feedback A/B/C/D = GPIO 19/16/20/21 (pull-up, LOW = contactor ON).
-Effective feedback = device `feedback_hardware_installed` AND slot `feedback_enabled`. Physical toggles are real inputs and go through the same interlock FSM as cloud commands.
+toggles A/B/C/D = GPIO 5/6/13/12 (ACTIVE-HIGH: pull-down, HIGH = ON, LOW = OFF-or-unwired), detect/feedback A/B/C/D = GPIO 19/16/20/21 (pull-up, LOW = contactor ON).
+Effective feedback = device `feedback_hardware_installed` AND slot `feedback_enabled`. Physical toggles are real inputs and go through the same interlock FSM as cloud commands. Logical slot enable is admin config (`ENABLE/DISABLE` on the slot card); a LOW toggle never implies hardware presence.
+Input-only diagnostic (never touches relays): `cd /mnt/ems-data && sudo -u pi GPIOZERO_PIN_FACTORY=lgpio python3 /opt/ems/pi_firmware/gpio_input_diag.py`
 
 | # | Step | Expected evidence | Pass |
 |---|------|-------------------|------|
@@ -21,8 +22,8 @@ Effective feedback = device `feedback_hardware_installed` AND slot `feedback_ena
 | 8 | Slot A → ACTIVATE (`set_active_slot`) | Last Response: DELIVERED → EXECUTING | ☐ |
 | 9 | Observe relay A (GPIO 17, pin driven LOW) | Relay physically energises (LED/click/meter); GPIO 17 HIGH again after DEACTIVATE | ☐ |
 | 10 | If feedback installed + slot feedback enabled: contactor closes, detect GPIO 19 goes LOW | Result `VERIFIED_ON`; without feedback hardware result is `GPIO_CONFIRMED` and PHYSICAL stays `UNKNOWN` | ☐ |
-| 10b | Physical toggle B (GPIO 6 to GND) while A active | Break-before-make: relay A OFF (and feedback OFF confirmed if enabled), interlock delay, then relay B ON; cloud shows `toggle` event `TOGGLE B ON -> OK`; `toggle_input` B = ON in snapshot | ☐ |
-| 10c | Toggle B released (GPIO 6 HIGH) | Relay B OFF; `TOGGLE B OFF -> OK`. Toggle of a non-active channel OFF = no action. In FAULT a toggle produces `toggle_rejected` and no relay change | ☐ |
+| 10b | Physical toggle B (GPIO 6 driven HIGH) while A active | Break-before-make: relay A OFF (and feedback OFF confirmed if enabled), interlock delay, then relay B ON; cloud shows `toggle` event `TOGGLE B ON -> OK`; top-level `toggle_input.B` = true in snapshot; dashboard slot B shows PHYSICAL TOGGLE ON | ☐ |
+| 10c | Toggle B released (GPIO 6 LOW) | Relay B OFF; `TOGGLE B OFF -> OK`. Toggle of a non-active channel OFF = no action. In FAULT a toggle produces `toggle_rejected` and no relay change | ☐ |
 | 10d | Bench: hold two detect inputs LOW at once / one detect LOW with relays OFF | System FAULT, all relays OFF, no automatic recovery until service restart + healthy reconciliation | ☐ |
 | 11 | Backend `pi_commands` row | `hardware_verified_at` set with a positive verification token | ☐ |
 | 12 | Last Response | Status COMPLETED **only after** HW VERIFIED timestamp; never before | ☐ |

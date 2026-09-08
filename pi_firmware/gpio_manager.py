@@ -45,12 +45,17 @@ except ImportError:
         def off(self):
             self.is_active = False
 
+        def close(self):
+            pass
+
         @property
         def pin_level_high(self):
             return self.is_active if self.active_high else not self.is_active
 
     class Button:
-        """Mock: `is_pressed` is a property (as in gpiozero); `_set()` drives it and fires callbacks."""
+        """Mock: `is_pressed` is a property (as in gpiozero) meaning *logically active*
+        (LOW with pull_up=True, HIGH with pull_up=False). `_set(active)` / `_set_level(high)`
+        drive it and fire callbacks on change."""
 
         def __init__(self, pin, pull_up=False, bounce_time=None):
             self.pin = pin
@@ -64,6 +69,10 @@ except ImportError:
         def is_pressed(self):
             return self._state
 
+        @property
+        def level_high(self):
+            return (not self._state) if self.pull_up else self._state
+
         def _set(self, pressed):
             pressed = bool(pressed)
             changed = pressed != self._state
@@ -72,6 +81,12 @@ except ImportError:
                 cb = self.when_pressed if pressed else self.when_released
                 if cb:
                     cb()
+
+        def _set_level(self, high):
+            self._set((not high) if self.pull_up else bool(high))
+
+        def close(self):
+            pass
 
 
 class GPIOManager:
@@ -94,40 +109,54 @@ class GPIOManager:
         self.relays = {}
         self.feedback_inputs = {}
         self.toggles = {}
+        self.hardware_fault = None
 
         self._lock = threading.RLock()
         self._running = True
 
         self._toggle_events = collections.deque(maxlen=64)
         self._toggle_lock = threading.Lock()
+        self._toggle_last = {}
 
         relay_active_low = bool(self.profile["relay_active_low"])
         self._toggle_active_low = bool(self.profile["toggle_active_low"])
         self._detect_active_low = bool(self.profile["detect_active_low"])
 
-        for slot, ch in self.profile["channels"].items():
+        try:
+            for slot, ch in self.profile["channels"].items():
 
-            # Relays are ACTIVE-LOW on this hardware: explicit polarity, always start OFF.
-            self.relays[slot] = OutputDevice(
-                ch["relay_gpio"],
-                active_high=not relay_active_low,
-                initial_value=False,
-            )
+                # Relays are ACTIVE-LOW on this hardware: explicit polarity, always start OFF.
+                self.relays[slot] = OutputDevice(
+                    ch["relay_gpio"],
+                    active_high=not relay_active_low,
+                    initial_value=False,
+                )
 
-            self.feedback_inputs[slot] = Button(
-                ch["detect_gpio"],
-                pull_up=True,
-                bounce_time=FEEDBACK_DEBOUNCE_MS / 1000.0,
-            )
+                # pull_up selects the idle level: True -> active LOW, False -> pull-down, active HIGH.
+                self.feedback_inputs[slot] = Button(
+                    ch["detect_gpio"],
+                    pull_up=self._detect_active_low,
+                    bounce_time=FEEDBACK_DEBOUNCE_MS / 1000.0,
+                )
 
-            toggle = Button(
-                ch["toggle_gpio"],
-                pull_up=True,
-                bounce_time=TOGGLE_DEBOUNCE_S,
-            )
-            toggle.when_pressed = self._toggle_callback(slot, pressed=True)
-            toggle.when_released = self._toggle_callback(slot, pressed=False)
-            self.toggles[slot] = toggle
+                toggle = Button(
+                    ch["toggle_gpio"],
+                    pull_up=self._toggle_active_low,
+                    bounce_time=TOGGLE_DEBOUNCE_S,
+                )
+                # Level present at init is reported, never treated as an edge.
+                self._toggle_last[slot] = bool(toggle.is_pressed)
+                toggle.when_pressed = self._toggle_callback(slot, ch["toggle_gpio"], on=True)
+                toggle.when_released = self._toggle_callback(slot, ch["toggle_gpio"], on=False)
+                self.toggles[slot] = toggle
+        except Exception as exc:
+            # Fail SAFE, not fast: no relay was ever driven ON (initial_value=False) and the
+            # controller stays alive in FAULT to report the fault; systemd must not crash-loop.
+            self.hardware_fault = f"GPIO_INIT_FAILED: {type(exc).__name__}: {exc}"
+            logger.critical("%s -- controller will run in FAULT with no GPIO.", self.hardware_fault)
+            self._release_devices()
+            self.monitor_thread = None
+            return
 
         self.monitor_thread = threading.Thread(
             target=self._local_monitor_loop,
@@ -137,17 +166,34 @@ class GPIOManager:
 
         self.monitor_thread.start()
 
+    def _release_devices(self):
+        for dev in (*self.relays.values(), *self.feedback_inputs.values(), *self.toggles.values()):
+            try:
+                dev.close()
+            except Exception:
+                pass
+        self.relays.clear()
+        self.feedback_inputs.clear()
+        self.toggles.clear()
+
     # ============================================================
     # TOGGLE INPUTS (events only: never drive relays from here)
     # ============================================================
 
-    def _toggle_callback(self, slot, pressed):
-        on = pressed if self._toggle_active_low else not pressed
-
+    def _toggle_callback(self, slot, gpio, on):
         def _cb():
             with self._toggle_lock:
+                old = self._toggle_last.get(slot)
+                self._toggle_last[slot] = on
                 self._toggle_events.append(
-                    {"slot": slot, "on": on, "monotonic": time.monotonic()}
+                    {
+                        "slot": slot,
+                        "gpio": gpio,
+                        "old": old,
+                        "on": on,
+                        "ts": time.time(),
+                        "monotonic": time.monotonic(),
+                    }
                 )
 
         return _cb
@@ -158,10 +204,13 @@ class GPIOManager:
             self._toggle_events.clear()
         return events
 
-    def toggle_input_state(self, slot) -> str:
-        pressed = bool(self.toggles[slot].is_pressed)
-        on = pressed if self._toggle_active_low else not pressed
-        return "ON" if on else "OFF"
+    def toggle_inputs(self) -> dict:
+        """{slot: True/False, or None when the GPIO is unavailable}. Telemetry only."""
+        out = {}
+        for slot in self.profile["slots"]:
+            btn = self.toggles.get(slot)
+            out[slot] = bool(btn.is_pressed) if btn is not None else None
+        return out
 
     # ============================================================
     # CONFIG
@@ -206,10 +255,8 @@ class GPIOManager:
 
         pressed = first and second
 
-        if self._detect_active_low:
-            return pressed
-
-        return not pressed
+        # `is_pressed` already means logically active for the configured pull (see config).
+        return pressed
 
     # ============================================================
     # VERIFICATION
@@ -267,6 +314,12 @@ class GPIOManager:
     # ============================================================
 
     def reconcile_hardware_state(self):
+
+        if self.hardware_fault:
+            logger.critical("Reconciliation refused: %s", self.hardware_fault)
+            self.state_manager.system_state = SystemState.FAULT
+            self.state_manager.save_state(immediate=True)
+            return False
 
         self.state_manager.system_state = (
             SystemState.HARDWARE_RECONCILIATION

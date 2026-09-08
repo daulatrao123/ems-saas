@@ -1,9 +1,11 @@
-export type Slot = { display_name: string; target_days: number; used_days: number; physical_toggle: string; disabled: boolean; visible?: boolean };
+// physical_toggle = CONTACTOR FEEDBACK (Pi telemetry, historical name); toggle_input = PHYSICAL TOGGLE input (Pi telemetry);
+// disabled = LOGICAL slot enable (admin configuration). Three separate concepts — never derive one from another.
+export type Slot = { display_name: string; target_days: number; used_days: number; physical_toggle: string; toggle_input?: string; disabled: boolean; visible?: boolean };
 export type Telemetry = { cpu_temp: number | null; uptime_seconds: number | null; boot_count: number | null };
 export type Device = {
   id: string; name: string; connected: boolean; active_slot: string | null; slots: Record<string, Slot>;
   config_state?: string | null; config_error?: string | null; ota_state?: string | null; storage_state?: string | null;
-  firmware_version?: string | null; last_sync?: string | null; telemetry?: Telemetry;
+  firmware_version?: string | null; last_sync?: string | null; telemetry?: Telemetry; hardware_fault?: string | null;
 };
 export type SocietyMeta = { name: string; location: string | null; plan: string | null; society_code: string | null; status: string | null };
 export type Dashboard = { society_id: number; society: SocietyMeta; reset_day: number; devices: Device[] };

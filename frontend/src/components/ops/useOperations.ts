@@ -4,6 +4,8 @@ import api from "@/lib/api";
 import { CommandRow, Dashboard, EventRow, LastResponse, errorText } from "./types";
 
 export type QueueFn = (deviceId: string, command: string, slot: string, params?: Record<string, unknown>) => Promise<boolean>;
+// LOGICAL slot enable/disable (slot_configs.disabled). Never touches GPIO, toggle or contactor state.
+export type SlotConfigFn = (deviceId: string, slot: string, patch: { disabled?: boolean; display_name?: string }) => Promise<boolean>;
 
 // Single data source for the operational dashboard. Explicit, targeted refreshes only — no polling.
 export function useOperations(societyId: string | null) {
@@ -61,6 +63,26 @@ export function useOperations(societyId: string | null) {
     }
   }, [societyId, pending, loadCommands, loadDashboard, loadEvents]);
 
+  const setSlotConfig: SlotConfigFn = useCallback(async (deviceId, slot, patch) => {
+    if (!societyId) return false;
+    const key = `${deviceId}:slot-config:${slot}`;
+    if (pending.has(key)) return false;
+    setPending((p) => new Set(p).add(key));
+    const at = new Date().toISOString();
+    try {
+      await api.post("/api/admin/slot-config", { society_id: societyId, device_id: deviceId, slot, ...patch });
+      setLast({ kind: "queued", command: patch.disabled === undefined ? "slot_rename" : patch.disabled ? "slot_disable" : "slot_enable", slot, command_id: "config", sequence_no: 0, duplicate: false, at });
+      await loadDashboard(societyId);
+      return true;
+    } catch (e) {
+      const { http, detail } = errorText(e);
+      setLast({ kind: "error", command: "slot_config", slot, http, detail, at });
+      return false;
+    } finally {
+      setPending((p) => { const n = new Set(p); n.delete(key); return n; });
+    }
+  }, [societyId, pending, loadDashboard]);
+
   const isPending = (deviceId: string, command: string, slot = "") => pending.has(`${deviceId}:${command}:${slot}`);
-  return { dash, commands, events, last, error, loading, queue, isPending, refresh: () => societyId && refreshAll(societyId) };
+  return { dash, commands, events, last, error, loading, queue, setSlotConfig, isPending, refresh: () => societyId && refreshAll(societyId) };
 }

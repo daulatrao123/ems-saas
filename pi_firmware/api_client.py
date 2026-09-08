@@ -34,6 +34,9 @@ class ApiClient:
         self.api_key = API_KEY
 
         self.session = requests.Session()
+        self.last_ack_http = None
+        self.last_ack_code = None
+        self.last_retry_after = None
 
         self.session.headers.update(
             {
@@ -143,6 +146,10 @@ class ApiClient:
             "attempt": attempt,
         }
 
+        self.last_ack_http = None
+        self.last_ack_code = None
+        self.last_retry_after = None
+
         try:
             response = self.session.post(
                 f"{self.base_url}/pi/command-ack",
@@ -150,10 +157,17 @@ class ApiClient:
                 timeout=API_TIMEOUT_S,
             )
 
+            self.last_ack_http = response.status_code
+            self.last_ack_code = response.headers.get("X-EMS-Ack-Code")
+            ra = response.headers.get("Retry-After")
+            if ra and str(ra).isdigit():
+                self.last_retry_after = int(ra)
+
             if response.status_code != 200:
                 logger.error(
-                    "Command ACK failed: HTTP %s",
+                    "Command ACK failed: HTTP %s%s",
                     response.status_code,
+                    f" ({self.last_ack_code})" if self.last_ack_code else "",
                 )
                 return False
 

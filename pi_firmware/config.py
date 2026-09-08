@@ -32,7 +32,8 @@ HARDWARE_PROFILES = {
             },
         },
         "relay_active_low": True,
-        "toggle_active_low": True,
+        # Toggles: pull-down, GPIO HIGH = ON (HARDWARE_SOURCE_OF_TRUTH §4).
+        "toggle_active_low": False,
         "detect_active_low": True,
     }
 }
@@ -69,8 +70,9 @@ _finalize_hardware_profiles()
 # FEEDBACK / TOGGLE POLARITY
 # ================================================================
 
-# Polarity lives in the hardware profile (*_active_low). Inputs use an internal
-# pull-up, so gpiozero `is_pressed` == pin LOW; with active_low=True that means ON.
+# Polarity lives in the hardware profile (*_active_low). gpiozero: pull_up=True -> "pressed" when
+# LOW (active-low input); pull_up=False -> internal pull-down, "pressed" when HIGH (active-high).
+# `is_pressed` therefore always means "logically active" for both toggles and detect inputs.
 TOGGLE_DEBOUNCE_S = 0.05
 
 

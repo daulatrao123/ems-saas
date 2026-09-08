@@ -206,6 +206,8 @@ class OfflineQueue:
                 "ack_status": "TEXT NOT NULL DEFAULT 'PENDING'",
                 "sequence_no": "INTEGER",
                 "cloud_attempt": "INTEGER",
+                "ack_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "ack_error": "TEXT",
             }
             for column, definition in migrations.items():
                 if column not in existing_columns:
@@ -722,6 +724,44 @@ class OfflineQueue:
                 )
                 return False
 
+    def count_ack_attempt(self, cmd_id):
+        with self.lock:
+            try:
+                self.conn.execute(
+                    "UPDATE commands SET ack_attempts=ack_attempts+1 WHERE id=?", (str(cmd_id),)
+                )
+                self.conn.commit()
+            except sqlite3.Error as exc:
+                logger.warning("ack_attempts update failed: %s", exc)
+
+    def get_ack_attempts(self, cmd_id):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT ack_attempts, ack_status, ack_error FROM commands WHERE id=?", (str(cmd_id),)
+            ).fetchone()
+            return {"attempts": row[0], "ack_status": row[1], "ack_error": row[2]} if row else None
+
+    def mark_ack_rejected(self, cmd_id, code):
+        """Cloud answered 409 (genuine conflict): this ACK is non-retryable. Attempt count is kept."""
+        if not self.storage.is_write_allowed("queue_db"):
+            return False
+        with self.lock:
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                self.conn.execute(
+                    """
+                    UPDATE commands
+                    SET ack_status='REJECTED', ack_error=?, acked_at=?
+                    WHERE id=? AND ack_status='PENDING'
+                    """,
+                    (str(code)[:120], now, str(cmd_id)),
+                )
+                self.conn.commit()
+                return True
+            except sqlite3.Error as exc:
+                logger.critical("Queue ACK reject update failed: %s", exc)
+                return False
+
     # ============================================================
     # T6 EXECUTION IDENTITY (reported in every sync)
     # ============================================================
@@ -866,13 +906,13 @@ class OfflineQueue:
                     WHERE id IN (
                         SELECT id
                         FROM commands
-                        WHERE ack_status='ACKED'
+                        WHERE ack_status IN ('ACKED','REJECTED')
                           AND acked_at IS NOT NULL
                           AND acked_at < ?
                           AND acked_at < (
                               SELECT acked_at
                               FROM commands
-                              WHERE ack_status='ACKED'
+                              WHERE ack_status IN ('ACKED','REJECTED')
                                 AND acked_at IS NOT NULL
                               ORDER BY acked_at DESC
                               LIMIT 1 OFFSET ?
@@ -914,7 +954,7 @@ class OfflineQueue:
     def count_acked(self):
         with self.lock:
             return self.conn.execute(
-                "SELECT COUNT(*) FROM commands WHERE ack_status='ACKED'"
+                "SELECT COUNT(*) FROM commands WHERE ack_status IN ('ACKED','REJECTED')"
             ).fetchone()[0]
 
     # ============================================================
