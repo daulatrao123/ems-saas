@@ -376,6 +376,7 @@ class EMSController:
 
             slots[slot] = {
                 "physical_toggle": physical,
+                "toggle_input": self.gpio.toggle_input_state(slot),
                 "used_days": int(slot_state.used_days),
                 "clicks": int(slot_state.clicks),
             }
@@ -1028,6 +1029,74 @@ class EMSController:
         return True
 
     # ============================================================
+    # PHYSICAL TOGGLES (local requests through the same gate as cloud commands)
+    # ============================================================
+
+    def _emit_event(self, event_type, message):
+        self._pending_events.append(
+            {
+                "eventId": str(uuid.uuid4()),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": event_type,
+                "message": message,
+            }
+        )
+        if len(self._pending_events) > self._pending_events_max:
+            self._pending_events = self._pending_events[-self._pending_events_max:]
+
+    def process_toggle_events(self):
+        """Drain debounced toggle transitions. ON -> ACTIVATE slot (break-before-make handled by
+        GPIOManager); OFF -> DEACTIVATE only if that slot is active (otherwise silent no-op).
+        Never runs in FAULT (rejected + toggle_rejected event). Returns number of hardware actions."""
+        actions = 0
+        for ev in self.gpio.pop_toggle_events():
+            slot, on = ev["slot"], bool(ev["on"])
+            if slot not in self.state.slots:
+                continue
+
+            if self.state.system_state == SystemState.FAULT:
+                logger.critical("Toggle %s=%s rejected: system in FAULT.", slot, "ON" if on else "OFF")
+                self._emit_event("toggle_rejected", f"TOGGLE {slot} {'ON' if on else 'OFF'} rejected: FAULT")
+                continue
+
+            if not on and self.state.active_slot != slot:
+                continue
+
+            if self.state.system_state not in (SystemState.READY, SystemState.CLOUD_OFFLINE):
+                logger.warning("Toggle %s=%s ignored: system %s.", slot, on, self.state.system_state)
+                self._emit_event("toggle_rejected", f"TOGGLE {slot} {'ON' if on else 'OFF'} rejected: {self.state.system_state.value}")
+                continue
+
+            prior_state = self.state.system_state
+            self.state.system_state = SystemState.EXECUTING
+            if not self.state.save_state(immediate=True):
+                logger.critical("Refusing toggle %s: EXECUTING state could not be persisted.", slot)
+                self.state.system_state = SystemState.FAULT
+                self._emit_event("toggle_rejected", f"TOGGLE {slot} rejected: STATE_PERSIST_FAILED")
+                continue
+
+            success = False
+            try:
+                success = self.gpio.transition_slot(slot) if on else self.gpio.deactivate_slot(slot)
+                if success:
+                    self.state.increment_clicks(slot, immediate=False)
+            except Exception as exc:
+                logger.critical("Toggle execution exception: %s", exc)
+                self.state.system_state = SystemState.FAULT
+            finally:
+                if self.state.system_state != SystemState.FAULT:
+                    self.state.system_state = prior_state
+                self.state.save_state(immediate=True)
+
+            verification = self.state.slots[slot].verification_state.value
+            self._emit_event(
+                "toggle",
+                f"TOGGLE {slot} {'ON' if on else 'OFF'} -> {'OK' if success else 'FAILED'} {verification}",
+            )
+            actions += 1
+        return actions
+
+    # ============================================================
     # DEACTIVATE ALL
     # ============================================================
 
@@ -1195,6 +1264,7 @@ class EMSController:
                     self.sync_cloud()
 
                 self._update_daily_usage()
+                self.process_toggle_events()
                 self.process_one_command()
 
                 self.flush_acks()

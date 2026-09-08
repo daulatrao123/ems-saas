@@ -1,3 +1,4 @@
+import collections
 import threading
 import time
 
@@ -7,7 +8,7 @@ from config import (
     FEEDBACK_DEBOUNCE_MS,
     INTERLOCK_DELAY_MS,
     LOCAL_MONITOR_INTERVAL_S,
-    FEEDBACK_ACTIVE_WHEN_PRESSED,
+    TOGGLE_DEBOUNCE_S,
 )
 
 from state import (
@@ -31,9 +32,12 @@ except ImportError:
     )
 
     class OutputDevice:
-        def __init__(self, pin):
+        """Mock with gpiozero semantics: `is_active` is logical state, polarity explicit."""
+
+        def __init__(self, pin, active_high=True, initial_value=False):
             self.pin = pin
-            self.is_active = False
+            self.active_high = active_high
+            self.is_active = bool(initial_value)
 
         def on(self):
             self.is_active = True
@@ -41,17 +45,33 @@ except ImportError:
         def off(self):
             self.is_active = False
 
-    class Button:
-        def __init__(
-            self,
-            pin,
-            pull_up=False,
-        ):
-            self.pin = pin
-            self._state = False
+        @property
+        def pin_level_high(self):
+            return self.is_active if self.active_high else not self.is_active
 
+    class Button:
+        """Mock: `is_pressed` is a property (as in gpiozero); `_set()` drives it and fires callbacks."""
+
+        def __init__(self, pin, pull_up=False, bounce_time=None):
+            self.pin = pin
+            self.pull_up = pull_up
+            self.bounce_time = bounce_time
+            self._state = False
+            self.when_pressed = None
+            self.when_released = None
+
+        @property
         def is_pressed(self):
             return self._state
+
+        def _set(self, pressed):
+            pressed = bool(pressed)
+            changed = pressed != self._state
+            self._state = pressed
+            if changed:
+                cb = self.when_pressed if pressed else self.when_released
+                if cb:
+                    cb()
 
 
 class GPIOManager:
@@ -73,26 +93,41 @@ class GPIOManager:
 
         self.relays = {}
         self.feedback_inputs = {}
+        self.toggles = {}
 
         self._lock = threading.RLock()
         self._running = True
 
-        for slot, relay_pin in self.profile[
-            "relay_gpio"
-        ].items():
+        self._toggle_events = collections.deque(maxlen=64)
+        self._toggle_lock = threading.Lock()
 
+        relay_active_low = bool(self.profile["relay_active_low"])
+        self._toggle_active_low = bool(self.profile["toggle_active_low"])
+        self._detect_active_low = bool(self.profile["detect_active_low"])
+
+        for slot, ch in self.profile["channels"].items():
+
+            # Relays are ACTIVE-LOW on this hardware: explicit polarity, always start OFF.
             self.relays[slot] = OutputDevice(
-                relay_pin
+                ch["relay_gpio"],
+                active_high=not relay_active_low,
+                initial_value=False,
             )
-
-        for slot, fb_pin in self.profile[
-            "feedback_gpio"
-        ].items():
 
             self.feedback_inputs[slot] = Button(
-                fb_pin,
-                pull_up=False,
+                ch["detect_gpio"],
+                pull_up=True,
+                bounce_time=FEEDBACK_DEBOUNCE_MS / 1000.0,
             )
+
+            toggle = Button(
+                ch["toggle_gpio"],
+                pull_up=True,
+                bounce_time=TOGGLE_DEBOUNCE_S,
+            )
+            toggle.when_pressed = self._toggle_callback(slot, pressed=True)
+            toggle.when_released = self._toggle_callback(slot, pressed=False)
+            self.toggles[slot] = toggle
 
         self.monitor_thread = threading.Thread(
             target=self._local_monitor_loop,
@@ -101,6 +136,32 @@ class GPIOManager:
         )
 
         self.monitor_thread.start()
+
+    # ============================================================
+    # TOGGLE INPUTS (events only: never drive relays from here)
+    # ============================================================
+
+    def _toggle_callback(self, slot, pressed):
+        on = pressed if self._toggle_active_low else not pressed
+
+        def _cb():
+            with self._toggle_lock:
+                self._toggle_events.append(
+                    {"slot": slot, "on": on, "monotonic": time.monotonic()}
+                )
+
+        return _cb
+
+    def pop_toggle_events(self):
+        with self._toggle_lock:
+            events = list(self._toggle_events)
+            self._toggle_events.clear()
+        return events
+
+    def toggle_input_state(self, slot) -> str:
+        pressed = bool(self.toggles[slot].is_pressed)
+        on = pressed if self._toggle_active_low else not pressed
+        return "ON" if on else "OFF"
 
     # ============================================================
     # CONFIG
@@ -129,8 +190,10 @@ class GPIOManager:
 
         btn = self.feedback_inputs[slot]
 
+        # gpiozero `is_pressed` is a property (pin LOW with pull-up). Two reads FEEDBACK_DEBOUNCE_MS
+        # apart must agree so a bouncing contact never counts as a stable ON.
         first = bool(
-            btn.is_pressed()
+            btn.is_pressed
         )
 
         time.sleep(
@@ -138,12 +201,12 @@ class GPIOManager:
         )
 
         second = bool(
-            btn.is_pressed()
+            btn.is_pressed
         )
 
         pressed = first and second
 
-        if FEEDBACK_ACTIVE_WHEN_PRESSED:
+        if self._detect_active_low:
             return pressed
 
         return not pressed
@@ -743,78 +806,81 @@ class GPIOManager:
 
             try:
 
-                if (
-                    self.state_manager.system_state
-                    == SystemState.READY
-                ):
-
-                    for slot, state_obj in (
-                        self.state_manager.slots.items()
+                # Hold the transition lock: never sample feedback mid-transition (contactor in flight).
+                with self._lock:
+                    # Safety monitoring must run offline too: only FAULT/boot phases pause it.
+                    if self.state_manager.system_state in (
+                        SystemState.READY,
+                        SystemState.CLOUD_OFFLINE,
                     ):
 
-                        if not self._is_feedback_enabled(
-                            slot
-                        ):
-                            continue
-
-                        expected = (
-                            state_obj.commanded_state
-                        )
-
-                        if expected not in (
-                            CommandedState.ON,
-                            CommandedState.OFF,
-                        ):
-                            continue
-
-                        result = self.verify_slot(
-                            slot,
-                            expected,
-                        )
-
-                        if (
-                            expected
-                            == CommandedState.ON
-                            and result
-                            == VerificationState.MISMATCH_ON_OFF
+                        for slot, state_obj in (
+                            self.state_manager.slots.items()
                         ):
 
-                            logger.critical(
-                                "Slot %s unexpectedly OFF.",
+                            if not self._is_feedback_enabled(
+                                slot
+                            ):
+                                continue
+
+                            expected = (
+                                state_obj.commanded_state
+                            )
+
+                            if expected not in (
+                                CommandedState.ON,
+                                CommandedState.OFF,
+                            ):
+                                continue
+
+                            result = self.verify_slot(
                                 slot,
+                                expected,
                             )
 
-                            self.state_manager.set_verification(
-                                slot,
-                                result,
-                                immediate=True,
-                            )
+                            if (
+                                expected
+                                == CommandedState.ON
+                                and result
+                                == VerificationState.MISMATCH_ON_OFF
+                            ):
 
-                            self.state_manager.system_state = (
-                                SystemState.FAULT
-                            )
+                                logger.critical(
+                                    "Slot %s unexpectedly OFF.",
+                                    slot,
+                                )
 
-                        elif (
-                            expected
-                            == CommandedState.OFF
-                            and result
-                            == VerificationState.MISMATCH_OFF_ON
-                        ):
+                                self.state_manager.set_verification(
+                                    slot,
+                                    result,
+                                    immediate=True,
+                                )
 
-                            logger.critical(
-                                "DANGER: Slot %s unexpectedly ON.",
-                                slot,
-                            )
+                                self.state_manager.system_state = (
+                                    SystemState.FAULT
+                                )
 
-                            self.state_manager.set_verification(
-                                slot,
-                                result,
-                                immediate=True,
-                            )
+                            elif (
+                                expected
+                                == CommandedState.OFF
+                                and result
+                                == VerificationState.MISMATCH_OFF_ON
+                            ):
 
-                            self.state_manager.system_state = (
-                                SystemState.FAULT
-                            )
+                                logger.critical(
+                                    "DANGER: Slot %s unexpectedly ON.",
+                                    slot,
+                                )
+
+                                self.state_manager.set_verification(
+                                    slot,
+                                    result,
+                                    immediate=True,
+                                )
+
+                                self.state_manager.system_state = (
+                                    SystemState.FAULT
+                                )
 
             except Exception as exc:
 

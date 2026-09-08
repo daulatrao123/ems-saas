@@ -35,7 +35,7 @@ def simulate_pi():
         "wings": {
             "A": {"usedDays": 1, "physicalToggle": "ON", "clicks": 5},
             "B": {"usedDays": 2, "physicalToggle": "ON", "clicks": 3},
-            "G": {"usedDays": 0, "physicalToggle": "OFF", "clicks": 0}
+            "C": {"usedDays": 0, "physicalToggle": "OFF", "clicks": 0}
         },
         # T6 reconciliation evidence (in-memory only: this simulator is not a durable device)
         "last_executed_sequence": 0,

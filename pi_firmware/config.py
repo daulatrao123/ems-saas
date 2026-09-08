@@ -5,25 +5,35 @@ import os
 # HARDWARE
 # ================================================================
 
+# Single authoritative GPIO map: see pi_firmware/HARDWARE_SOURCE_OF_TRUTH.md.
+# BCM numbering. Change that document first, then this table. Never elsewhere.
 HARDWARE_PROFILES = {
     "EMS-4CH-v1": {
-        "slots": ["A", "B", "C", "D"],
-
-        "relay_gpio": {
-            "A": 17,
-            "B": 27,
-            "C": 22,
-            "D": 23,
+        "channels": {
+            "A": {
+                "relay_gpio": 17,
+                "toggle_gpio": 5,
+                "detect_gpio": 19,
+            },
+            "B": {
+                "relay_gpio": 27,
+                "toggle_gpio": 6,
+                "detect_gpio": 16,
+            },
+            "C": {
+                "relay_gpio": 23,
+                "toggle_gpio": 13,
+                "detect_gpio": 20,
+            },
+            "D": {
+                "relay_gpio": 22,
+                "toggle_gpio": 12,
+                "detect_gpio": 21,
+            },
         },
-
-        "feedback_gpio": {
-            "A": 5,
-            "B": 6,
-            "C": 13,
-            "D": 19,
-        },
-
-        "feedback_capable": True,
+        "relay_active_low": True,
+        "toggle_active_low": True,
+        "detect_active_low": True,
     }
 }
 
@@ -35,19 +45,33 @@ SUPPORTED_SLOTS = (
 )
 
 
+def _finalize_hardware_profiles():
+    """Derive `slots` from `channels` and refuse any GPIO used twice (import-time guard)."""
+    for name, profile in HARDWARE_PROFILES.items():
+        channels = profile["channels"]
+        profile["slots"] = list(channels.keys())
+        seen = {}
+        for slot, ch in channels.items():
+            for role in ("relay_gpio", "toggle_gpio", "detect_gpio"):
+                pin = ch[role]
+                if pin in seen:
+                    raise RuntimeError(
+                        f"FATAL: hardware profile {name} assigns GPIO{pin} to both "
+                        f"{seen[pin]} and {slot}.{role}"
+                    )
+                seen[pin] = f"{slot}.{role}"
+
+
+_finalize_hardware_profiles()
+
+
 # ================================================================
-# FEEDBACK
+# FEEDBACK / TOGGLE POLARITY
 # ================================================================
 
-# Must be confirmed against the actual electrical circuit.
-#
-# True:
-#     Button.is_pressed() means contactor is ON.
-#
-# False:
-#     Button.is_pressed() means contactor is OFF.
-#
-FEEDBACK_ACTIVE_WHEN_PRESSED = True
+# Polarity lives in the hardware profile (*_active_low). Inputs use an internal
+# pull-up, so gpiozero `is_pressed` == pin LOW; with active_low=True that means ON.
+TOGGLE_DEBOUNCE_S = 0.05
 
 
 # ================================================================
