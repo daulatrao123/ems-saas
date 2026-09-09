@@ -655,11 +655,17 @@ class EMSController:
     def _slot_visible(self, slot):
         if slot not in self.device_config.get("slots", {}):
             return False
+
         cfg = self.device_config["slots"][slot]
-        physical = self.state.slots[slot].feedback_state.value
+
+        if bool(self.device_config.get("feedback_hardware_installed", False)):
+            is_on = self.state.slots[slot].feedback_state.value == "ON"
+        else:
+            is_on = self.gpio.toggle_inputs().get(slot) is True
+
         return (
             int(cfg.get("target_days", 0)) > 0
-            and physical == "ON"
+            and is_on
             and not bool(cfg.get("disabled", False))
         )
 
