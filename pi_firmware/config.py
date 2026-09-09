@@ -182,7 +182,7 @@ STORAGE_COUNTER_FILE = os.path.join(
 )
 
 
-for directory in (
+DATA_DIRS = (
     DATA_DIR,
     STATE_DIR,
     LOG_DIR,
@@ -190,11 +190,15 @@ for directory in (
     TELEMETRY_DIR,
     DIAGNOSTICS_DIR,
     HEALTH_DIR,
-):
-    os.makedirs(
-        directory,
-        exist_ok=True,
-    )
+)
+
+
+def ensure_data_dirs():
+    """Create the EMS data tree. Call ONLY after storage_health verified the secondary volume
+    SECONDARY_HEALTHY (mount + UUID + write probe). Never at import: with the USB absent this
+    would silently create /mnt/ems-data/* on the primary OS disk."""
+    for directory in DATA_DIRS:
+        os.makedirs(directory, exist_ok=True)
 
 
 # ================================================================

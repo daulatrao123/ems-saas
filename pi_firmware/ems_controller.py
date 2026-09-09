@@ -20,7 +20,7 @@ from config_hash import (
     config_hash,
 )
 
-from logger import logger
+from logger import logger, attach_file_sinks, detach_file_sinks, file_sinks_attached, drain_ring
 from state import (
     PiStateManager,
     SystemState,
@@ -29,7 +29,12 @@ from state import (
 )
 from storage_manager import StorageManager
 from lcd_display import LcdDisplay, message_is_live
-from storage_health import collect_storage_health
+from storage_health import (
+    collect_storage_health,
+    SECONDARY_HEALTHY,
+    SECONDARY_UNAVAILABLE,
+    SECONDARY_UNWRITABLE,
+)
 from offline_queue import OfflineQueue
 from gpio_manager import GPIOManager
 from api_client import ApiClient
@@ -53,6 +58,9 @@ REBOOT_REQUEST_FILE = "reboot.request"
 # Phase 0.5.1: how often the (cheap, read-only) "is today's telemetry
 # recorded?" check runs. The calendar-day CSV itself is the durable identity.
 TELEMETRY_CHECK_INTERVAL_S = 3600.0
+# Secondary (USB data volume) re-verification cadence for the logging policy.
+SECONDARY_RECHECK_S = 60.0
+EXIT_SECONDARY_STORAGE = 4
 
 # Baseline version of THIS artifact. A staged slot reports its own version via
 # ota_manager.active_info(); the baseline is used when no OTA slot is active.
@@ -134,9 +142,12 @@ class EMSController:
         self.smart = SmartHealthMonitor(os.environ.get("EMS_DATA_DEVICE", "/dev/mmcblk0"),
                                         os.path.join(_cfg.HEALTH_DIR, "smart.json"), logger)
         self._ota_status = self._read_ota_status()
-        # Storage health snapshot (read-only + tiny write probe) refreshed at most every 5 minutes.
+        # Storage health snapshot (mount -> UUID -> tiny write probe) refreshed every SECONDARY_RECHECK_S.
+        # It drives the logging policy: file sinks exist only while the secondary volume is HEALTHY.
+        # Deliberately NOT coupled to SystemState or command gating.
         self._storage_health = None
         self._storage_health_next = 0.0
+        self._secondary_state = SECONDARY_HEALTHY  # preflight_secondary_storage() verified this before __init__
         # Website -> LCD message: cached on disk so it survives reboot / cloud outage until expiry.
         self._lcd_message_path = os.path.join(_cfg.HEALTH_DIR, "lcd_message.json")
         self.lcd_message = self._load_lcd_message()
@@ -440,6 +451,7 @@ class EMSController:
         )
 
         self._collect_storage_events()
+        self._collect_log_events()
 
         events = list(self._pending_events)
         self._events_in_flight = len(events)
@@ -546,6 +558,24 @@ class EMSController:
         self._pending_events = (
             self._pending_events[self._events_in_flight:]
         )
+
+    def _collect_log_events(self):
+        """ERROR/CRITICAL ring records -> events[] ONLY while the secondary volume cannot hold the
+        file logs. Fills only the free room so log lines never evict storage/toggle events.
+        While HEALTHY the ring is discarded (those lines are already in critical.log)."""
+        if self._secondary_state == SECONDARY_HEALTHY:
+            drain_ring()
+            return
+        room = self._pending_events_max - len(self._pending_events)
+        for rec in drain_ring(max(room, 0)):
+            self._pending_events.append(
+                {
+                    "eventId": str(uuid.uuid4()),
+                    "timestamp": rec["ts"],
+                    "type": "log",
+                    "message": f"[{rec['level']}] {rec['message']}"[:300],
+                }
+            )
         self._events_in_flight = 0
 
     # ============================================================
@@ -1110,10 +1140,9 @@ class EMSController:
             logger.warning("Ignoring invalid LCD message from cloud.")
             return
         self.lcd_message = msg
-        if not self.storage.is_write_allowed("diagnostics"):
-            return
+        if self._secondary_state != SECONDARY_HEALTHY or not self.storage.is_write_allowed("diagnostics"):
+            return  # RAM only: the cache must never become a primary-disk fallback
         try:
-            os.makedirs(os.path.dirname(self._lcd_message_path), exist_ok=True)
             tmp = self._lcd_message_path + ".tmp"
             with open(tmp, "w") as fh:
                 json.dump(msg, fh)
@@ -1122,16 +1151,38 @@ class EMSController:
             logger.warning("LCD message cache not persisted: %s", exc)
 
     def _storage_health_snapshot(self):
+        return self._refresh_storage_health()
+
+    def _refresh_storage_health(self, force=False):
+        """Re-verify the secondary volume (~every SECONDARY_RECHECK_S) and apply the logging policy."""
         now = time.monotonic()
-        if self._storage_health is None or now >= self._storage_health_next:
-            self._storage_health_next = now + 300.0
-            probe = None if self.storage.is_write_allowed("diagnostics") else (lambda _d: (False, "writes suspended by storage guard"))
+        if force or self._storage_health is None or now >= self._storage_health_next:
+            self._storage_health_next = now + SECONDARY_RECHECK_S
             try:
                 self._storage_health = collect_storage_health(
-                    _cfg.DATA_DIR, os.environ.get("EMS_DATA_DEVICE"), self.smart.last_result, probe=probe)
+                    _cfg.DATA_DIR, os.environ.get("EMS_DATA_DEVICE"), self.smart.last_result)
             except Exception as exc:
-                self._storage_health = {"health": "FAILED", "error": f"{type(exc).__name__}: {exc}", "smart": "UNAVAILABLE", "smart_available": False}
+                self._storage_health = {"health": "FAILED", "error": f"{type(exc).__name__}: {exc}", "smart": "UNAVAILABLE",
+                                        "smart_available": False, "secondary_state": SECONDARY_UNAVAILABLE, "secondary_usable": False}
+            self._apply_secondary_policy(self._storage_health)
         return self._storage_health
+
+    def _apply_secondary_policy(self, health):
+        """HEALTHY -> file sinks attached; anything else -> detached (stdout + RAM ring only).
+        One event per transition. Never touches SystemState, relays or command gating."""
+        state = health.get("secondary_state", SECONDARY_UNAVAILABLE)
+        if state == SECONDARY_HEALTHY and not file_sinks_attached() and not attach_file_sinks():
+            state = SECONDARY_UNWRITABLE
+            health.update({"secondary_state": state, "secondary_usable": False,
+                           "error": health.get("error") or "log file sinks could not be opened"})
+        if state != SECONDARY_HEALTHY and file_sinks_attached():
+            detach_file_sinks()
+        if state != self._secondary_state:
+            previous, self._secondary_state = self._secondary_state, state
+            message = (f"SECONDARY_STORAGE {previous} -> {state} "
+                       f"file_sinks={'ATTACHED' if file_sinks_attached() else 'DETACHED'} error={health.get('error')}")
+            self._emit_event("secondary_storage", message)
+            logger.warning(message)  # the event carries it to the cloud; WARNING avoids a duplicate ring/log entry
 
     # ============================================================
     # PHYSICAL TOGGLES (local requests through the same gate as cloud commands)
@@ -1432,6 +1483,7 @@ class EMSController:
                     self._run_ota_if_requested()
 
                 self.smart.maybe_collect()
+                self._refresh_storage_health()
 
                 if (self._restart_requested or self._reboot_requested) and not self.queue.get_unacked():
                     # Command is terminal AND acknowledged by the cloud -> no re-delivery, no loop.
@@ -1484,7 +1536,30 @@ class EMSController:
             pass
 
 
+def preflight_secondary_storage():
+    """Boot gate, runs BEFORE EMSController() (i.e. before GPIO, storage, queue, state):
+    mount -> UUID -> write probe. HEALTHY: create the data tree and attach the file sinks.
+    Anything else: one critical line on stdout/journald and the caller refuses to start.
+    No directory is ever created on the primary OS disk."""
+    health = collect_storage_health(_cfg.DATA_DIR, os.environ.get("EMS_DATA_DEVICE"))
+    if health.get("secondary_state") == SECONDARY_HEALTHY:
+        _cfg.ensure_data_dirs()
+        if attach_file_sinks():
+            return health
+        health.update({"secondary_state": SECONDARY_UNWRITABLE, "secondary_usable": False,
+                       "error": health.get("error") or "log file sinks could not be opened"})
+    logger.critical(
+        "%s at %s (device=%s uuid=%s expected=%s): %s. Refusing to start the EMS controller; "
+        "the primary OS disk is never used as a fallback.",
+        health.get("secondary_state"), _cfg.DATA_DIR, health.get("device"), health.get("uuid"),
+        health.get("expected_uuid"), health.get("error"),
+    )
+    return health
+
+
 def main():
+    if not preflight_secondary_storage().get("secondary_usable"):
+        raise SystemExit(EXIT_SECONDARY_STORAGE)
     controller = EMSController()
     controller.run()
     if controller._reboot_requested:

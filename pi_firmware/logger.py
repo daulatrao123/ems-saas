@@ -1,6 +1,8 @@
 import logging
 import os
 import threading
+import time
+from collections import deque
 from datetime import datetime
 
 from config import (
@@ -12,6 +14,48 @@ from config import (
 
 _storage_mgr = None
 _storage_lock = threading.Lock()
+
+# Logging policy: at import only stdout (journald, volatile) + a bounded RAM ring exist.
+# File sinks under LOG_DIR are attached by the controller ONLY after the secondary data volume
+# has been verified SECONDARY_HEALTHY, and detached the moment it stops being so.
+# Nothing in this module ever creates a directory: a missing LOG_DIR fails closed.
+RING_MAX_RECORDS = 200
+_file_handlers = []
+_sink_lock = threading.Lock()
+
+
+class RingHandler(logging.Handler):
+    """Bounded RAM sink for ERROR/CRITICAL records. Never touches disk."""
+
+    def __init__(self, maxlen=RING_MAX_RECORDS):
+        super().__init__(level=logging.ERROR)
+        self.records = deque(maxlen=maxlen)
+        self.dropped = 0
+
+    def emit(self, record):
+        try:
+            if len(self.records) == self.records.maxlen:
+                self.dropped += 1
+            self.records.append({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(record.created)),
+                "level": record.levelname,
+                "message": record.getMessage(),
+            })
+        except Exception:
+            self.handleError(record)
+
+    def drain(self, limit=None):
+        out = []
+        while self.records and (limit is None or len(out) < limit):
+            out.append(self.records.popleft())
+        return out
+
+
+ring = RingHandler()
+
+
+def drain_ring(limit=None):
+    return ring.drain(limit)
 
 
 def set_storage_manager(
@@ -70,15 +114,8 @@ class DailyBudgetHandler(
             f"{self.current_date}"
         )
 
-        directory = os.path.dirname(
-            self.current_filename
-        )
-
-        os.makedirs(
-            directory,
-            exist_ok=True,
-        )
-
+        # No os.makedirs here: directories exist only after the secondary volume was verified
+        # (config.ensure_data_dirs). A missing LOG_DIR must fail, never be created on the primary.
         self.fh = open(
             self.current_filename,
             "a",
@@ -253,6 +290,93 @@ class DailyBudgetHandler(
             super().close()
 
 
+_FORMATTER = logging.Formatter(
+    "%(asctime)s "
+    "[%(levelname)s] "
+    "%(message)s",
+    datefmt=(
+        "%Y-%m-%dT%H:%M:%S%z"
+    ),
+)
+
+
+class NormalFilter(
+    logging.Filter
+):
+
+    def filter(
+        self,
+        record,
+    ):
+
+        return (
+            record.levelno
+            < logging.ERROR
+        )
+
+
+def _build_file_handlers():
+    """Opens the two daily log files under LOG_DIR (raises OSError if LOG_DIR is missing)."""
+    normal_handler = DailyBudgetHandler(
+        os.path.join(LOG_DIR, "ems_app.log"),
+        DAILY_LOG_BUDGET_BYTES,
+        "normal_log",
+        fsync_each_write=False,
+    )
+    normal_handler.setFormatter(_FORMATTER)
+    normal_handler.setLevel(logging.INFO)
+    normal_handler.addFilter(NormalFilter())
+
+    try:
+        critical_handler = DailyBudgetHandler(
+            os.path.join(LOG_DIR, "critical.log"),
+            CRITICAL_LOG_BUDGET_BYTES,
+            "critical_log",
+            fsync_each_write=True,
+        )
+    except OSError:
+        normal_handler.close()
+        raise
+    critical_handler.setFormatter(_FORMATTER)
+    critical_handler.setLevel(logging.ERROR)
+    return [normal_handler, critical_handler]
+
+
+def attach_file_sinks():
+    """Attach the daily file sinks. Caller MUST have verified the secondary volume HEALTHY.
+    Returns False (and attaches nothing) when the files cannot be opened. Idempotent."""
+    ems_logger = logging.getLogger("EMS")
+    with _sink_lock:
+        if _file_handlers:
+            return True
+        try:
+            handlers = _build_file_handlers()
+        except OSError as exc:
+            ems_logger.error("Log file sinks not attached: %s", exc)
+            return False
+        for handler in handlers:
+            ems_logger.addHandler(handler)
+        _file_handlers.extend(handlers)
+        return True
+
+
+def detach_file_sinks():
+    """Remove and close the file sinks; logging continues on stdout + RAM ring only."""
+    ems_logger = logging.getLogger("EMS")
+    with _sink_lock:
+        for handler in _file_handlers:
+            ems_logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+        _file_handlers.clear()
+
+
+def file_sinks_attached():
+    return bool(_file_handlers)
+
+
 def setup_logger():
 
     ems_logger = logging.getLogger(
@@ -269,93 +393,21 @@ def setup_logger():
 
         return ems_logger
 
-    formatter = logging.Formatter(
-        "%(asctime)s "
-        "[%(levelname)s] "
-        "%(message)s",
-        datefmt=(
-            "%Y-%m-%dT%H:%M:%S%z"
-        ),
-    )
-
-    normal_handler = (
-        DailyBudgetHandler(
-            os.path.join(
-                LOG_DIR,
-                "ems_app.log",
-            ),
-            DAILY_LOG_BUDGET_BYTES,
-            "normal_log",
-            fsync_each_write=False,
-        )
-    )
-
-    normal_handler.setFormatter(
-        formatter
-    )
-
-    normal_handler.setLevel(
-        logging.INFO
-    )
-
-    class NormalFilter(
-        logging.Filter
-    ):
-
-        def filter(
-            self,
-            record,
-        ):
-
-            return (
-                record.levelno
-                < logging.ERROR
-            )
-
-    normal_handler.addFilter(
-        NormalFilter()
-    )
-
-    critical_handler = (
-        DailyBudgetHandler(
-            os.path.join(
-                LOG_DIR,
-                "critical.log",
-            ),
-            CRITICAL_LOG_BUDGET_BYTES,
-            "critical_log",
-            fsync_each_write=True,
-        )
-    )
-
-    critical_handler.setFormatter(
-        formatter
-    )
-
-    critical_handler.setLevel(
-        logging.ERROR
-    )
-
-    ems_logger.addHandler(
-        normal_handler
-    )
-
-    ems_logger.addHandler(
-        critical_handler
-    )
-
-    # Console logging has no flash write.
+    # Import-time sinks: console (journald is volatile on the Pi) + RAM ring. No file, no flash write.
     stream_handler = (
         logging.StreamHandler()
     )
 
     stream_handler.setFormatter(
-        formatter
+        _FORMATTER
     )
 
     ems_logger.addHandler(
         stream_handler
     )
+
+    ring.setFormatter(_FORMATTER)
+    ems_logger.addHandler(ring)
 
     return ems_logger
 

@@ -1985,6 +1985,7 @@ def queue_command(request: Request, data: dict, user: dict = Depends(get_current
 
 STORAGE_HEALTH_STATES = {"GOOD", "WARNING", "FAILED", "UNAVAILABLE"}
 SMART_STATES = {"PASSED", "WARNING", "FAILED", "UNAVAILABLE"}
+SECONDARY_STATES = {"SECONDARY_HEALTHY", "SECONDARY_UNAVAILABLE", "SECONDARY_UNWRITABLE"}
 
 def normalize_storage_health(raw: dict) -> dict:
     """Pi telemetry, bounded and typed. UNAVAILABLE is never coerced into GOOD/PASSED."""
@@ -1992,7 +1993,11 @@ def normalize_storage_health(raw: dict) -> dict:
         try: return float(v) if v is not None else None
         except (TypeError, ValueError): return None
     health = str(raw.get("health", "UNAVAILABLE")).upper(); smart = str(raw.get("smart", "UNAVAILABLE")).upper()
+    secondary = str(raw.get("secondary_state", "SECONDARY_UNAVAILABLE")).upper()
+    secondary = secondary if secondary in SECONDARY_STATES else "SECONDARY_UNAVAILABLE"
     return {"device": (str(raw["device"])[:80] if raw.get("device") else None), "device_type": (str(raw["device_type"])[:32] if raw.get("device_type") else None),
+            "secondary_state": secondary, "secondary_usable": secondary == "SECONDARY_HEALTHY",
+            "uuid": (str(raw["uuid"])[:64] if raw.get("uuid") else None), "expected_uuid": (str(raw["expected_uuid"])[:64] if raw.get("expected_uuid") else None),
             "mounted": bool(raw.get("mounted")), "mount_point": (str(raw["mount_point"])[:120] if raw.get("mount_point") else None),
             "filesystem": (str(raw["filesystem"])[:32] if raw.get("filesystem") else None),
             "total_bytes": num(raw.get("total_bytes")), "used_bytes": num(raw.get("used_bytes")), "free_bytes": num(raw.get("free_bytes")),

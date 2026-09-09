@@ -11,6 +11,51 @@ WRITE_PROBE_NAME = ".ems_write_probe"
 USAGE_WARNING_PERCENT = 90.0
 USAGE_FAILED_PERCENT = 98.0
 
+# Secondary (USB data volume) verdict used by the logging policy. Only HEALTHY may hold EMS logs.
+SECONDARY_HEALTHY = "SECONDARY_HEALTHY"
+SECONDARY_UNAVAILABLE = "SECONDARY_UNAVAILABLE"   # not mounted / mount is the OS root / UUID mismatch or unknown
+SECONDARY_UNWRITABLE = "SECONDARY_UNWRITABLE"     # correct volume mounted but the write probe failed
+SECONDARY_STATES = (SECONDARY_HEALTHY, SECONDARY_UNAVAILABLE, SECONDARY_UNWRITABLE)
+BY_UUID_DIR = "/dev/disk/by-uuid"
+
+
+def expected_uuid(data_dir, fstab_text=None):
+    """Filesystem UUID configured for data_dir: env EMS_DATA_UUID, else the fstab entry setup_pi.sh wrote."""
+    env = os.environ.get("EMS_DATA_UUID", "").strip()
+    if env:
+        return env
+    try:
+        if fstab_text is None:
+            with open("/etc/fstab") as fh:
+                fstab_text = fh.read()
+    except OSError:
+        return None
+    for line in fstab_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and not parts[0].startswith("#") and parts[1] == data_dir and parts[0].upper().startswith("UUID="):
+            return parts[0][5:] or None
+    return None
+
+
+def mounted_uuid(dev):
+    """UUID of the block device that is actually mounted (by-uuid symlink resolving to dev). Never /dev/sdX assumptions."""
+    try:
+        target = os.path.realpath(dev)
+        for name in os.listdir(BY_UUID_DIR):
+            if os.path.realpath(os.path.join(BY_UUID_DIR, name)) == target:
+                return name
+    except OSError:
+        pass
+    return None
+
+
+def classify_secondary(mounted, uuid_ok, writable):
+    if not mounted or not uuid_ok:
+        return SECONDARY_UNAVAILABLE
+    if not writable:
+        return SECONDARY_UNWRITABLE
+    return SECONDARY_HEALTHY
+
 
 def _mount_for(path, mounts_text):
     best = None
@@ -89,18 +134,23 @@ def classify(mounted, readable, writable, used_percent, smart_state, fs_error):
 
 
 def collect_storage_health(data_dir, expected_device=None, smart_result=None, *, mounts_text=None, statvfs=None,
-                           probe=None, sysfs_reader=None, fs_error=None):
-    """Snapshot dict (snake_case, additive). All I/O injectable for tests. Never raises."""
+                           probe=None, sysfs_reader=None, fs_error=None, fstab_text=None, uuid_resolver=None, access=None):
+    """Snapshot dict (snake_case, additive). All I/O injectable for tests. Never raises.
+    Order is a safety property: mount -> UUID -> (only then) write probe. The probe never runs on an
+    unverified volume, so it can never touch the primary OS disk."""
     out = {"device": expected_device, "device_type": None, "mounted": False, "mount_point": None, "filesystem": None,
            "total_bytes": None, "used_bytes": None, "free_bytes": None, "used_percent": None,
            "readable": False, "writable": False, "smart": "UNAVAILABLE", "smart_available": False,
-           "health": "FAILED", "error": None, "checked_at": time.time()}
+           "health": "FAILED", "error": None, "checked_at": time.time(),
+           "expected_uuid": None, "uuid": None, "secondary_state": SECONDARY_UNAVAILABLE, "secondary_usable": False}
+    uuid_ok = False
     try:
         if mounts_text is None:
             with open("/proc/mounts") as fh:
                 mounts_text = fh.read()
         m = _mount_for(data_dir, mounts_text)
-        if m is None or m[1] == "/":
+        if m is None or m[1] != data_dir.rstrip("/"):
+            # Not mounted, or only covered by a parent mount (e.g. the OS root): that is the primary disk.
             out["error"] = f"{data_dir} is not a mounted data volume"
         else:
             dev, mnt, fs = m
@@ -108,21 +158,31 @@ def collect_storage_health(data_dir, expected_device=None, smart_result=None, *,
             out["device_type"] = device_type(dev, sysfs_reader)
             if expected_device and os.path.basename(expected_device) != os.path.basename(dev) and not expected_device.startswith("/dev/disk/by-"):
                 out["error"] = f"mounted {dev} but EMS_DATA_DEVICE={expected_device}"
+            exp = expected_uuid(data_dir, fstab_text)
+            got = (uuid_resolver or mounted_uuid)(dev)
+            out.update({"expected_uuid": exp, "uuid": got})
+            uuid_ok = bool(exp) and got == exp
             sv = (statvfs or os.statvfs)(mnt)
             total, free = sv.f_frsize * sv.f_blocks, sv.f_frsize * sv.f_bavail
             used = total - sv.f_frsize * sv.f_bfree
             out.update({"total_bytes": total, "used_bytes": used, "free_bytes": free,
                         "used_percent": round(used / total * 100.0, 1) if total else None,
-                        "readable": os.access(data_dir, os.R_OK)})
-            writable, werr = (probe or write_probe)(data_dir)
-            out["writable"] = bool(writable)
-            if werr:
-                out["error"] = werr
+                        "readable": (access or os.access)(data_dir, os.R_OK)})
+            if not uuid_ok:
+                out["error"] = f"UUID verification failed: mounted={got} expected={exp}"
+            else:
+                writable, werr = (probe or write_probe)(data_dir)
+                out["writable"] = bool(writable)
+                if werr:
+                    out["error"] = werr
         out["smart"], out["smart_available"] = summarize_smart(smart_result)
         out["health"] = classify(out["mounted"], out["readable"], out["writable"], out["used_percent"], out["smart"], fs_error)
         if fs_error:
             out["error"] = fs_error
+        out["secondary_state"] = classify_secondary(out["mounted"], uuid_ok, out["writable"] and not fs_error)
     except Exception as exc:  # diagnostics never take the controller down
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["health"] = "FAILED"
+        out["secondary_state"] = SECONDARY_UNAVAILABLE
+    out["secondary_usable"] = out["secondary_state"] == SECONDARY_HEALTHY
     return out
