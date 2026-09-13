@@ -51,6 +51,16 @@ FIRMWARE_FILES = (
     "ota_boot.sh",
     "ems-ota-stage.py",
     "setup_pi.sh",
+    # Energy subsystem (E1): shipped as a package directory under firmware/energy.
+    "energy/__init__.py",
+    "energy/attribution.py",
+    "energy/energy_ledger.py",
+    "energy/energy_state.py",
+    "energy/meter_bus.py",
+    "energy/meter_manager.py",
+    "energy/meter_registry.py",
+    "energy/modbus_meter.py",
+    "energy/register_maps.py",
 )
 
 SYSTEMD_FILES = (
@@ -124,6 +134,15 @@ REQUIRED_FILES=(
   "firmware/ota_boot.sh"
   "firmware/ems-ota-stage.py"
   "firmware/setup_pi.sh"
+  "firmware/energy/__init__.py"
+  "firmware/energy/attribution.py"
+  "firmware/energy/energy_ledger.py"
+  "firmware/energy/energy_state.py"
+  "firmware/energy/meter_bus.py"
+  "firmware/energy/meter_manager.py"
+  "firmware/energy/meter_registry.py"
+  "firmware/energy/modbus_meter.py"
+  "firmware/energy/register_maps.py"
 
   "systemd/ems-controller.service"
   "systemd/ems-reboot.path"
@@ -249,6 +268,8 @@ install -d -m 0755 \
   "$UNIT_DST"
 
 cp "$HERE"/firmware/*.py "$HERE"/firmware/*.sh "$FW_DST"/
+rm -rf "$FW_DST"/energy
+cp -r "$HERE"/firmware/energy "$FW_DST"/energy
 
 chmod 0755 "$FW_DST"/*.sh
 

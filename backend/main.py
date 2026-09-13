@@ -17,6 +17,8 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
 from provisioning import build_provisioning_zip, service_unit_sha256
+from energy import ingest as energy_ingest
+from energy.routes import create_router as create_energy_router
 import logging
 _seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
 from fastapi.middleware.cors import CORSMiddleware
@@ -1700,6 +1702,9 @@ def pi_sync(
                          desired_hash, eff_av, eff_ah, eff_at, config_state, raw_err,
                          ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good, hardware_fault, storage_health))
 
+            # Energy (E2): meter health, latest cumulative readings, OPEN/CLOSED daily ledger rows (idempotent upsert).
+            energy_ingest.ingest(cur, device_id, payload.get("energy"), now)
+
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")
                 if not ev_id: continue
@@ -1767,6 +1772,9 @@ def pi_sync(
                 "reconciled_commands": reconciled,
                 "lcd_message": active_lcd_message(cur, device_id, now),
             }
+            energy_cfg = energy_ingest.config_reply(cur, device_id, payload.get("energy"))
+            if energy_cfg is not None:
+                reply["energy_config"] = energy_cfg
             if cmd:
                 # CAS delivery: only the worker that flips queued->delivered owns this attempt.
                 cur.execute("""UPDATE pi_commands SET status='delivered', delivered_at=%s, attempt_count=attempt_count+1
@@ -2359,3 +2367,5 @@ def member_events(last_id: int = 0, user: dict = Depends(get_current_user)):
             return {"events": mapped, "last_id": mapped[-1]["id"] if mapped else last_id}
     finally:
         conn.close()
+
+app.include_router(create_energy_router(get_db, get_current_user, log_audit, require_uuid))
