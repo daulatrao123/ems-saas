@@ -54,6 +54,8 @@ jobs:
           curl -sf -X POST http://127.0.0.1:8001/api/bootstrap
       - name: E2 (backend energy ingest + API, live backend)
         run: sudo -E "$(which python)" qa/energy_e2_test.py
+      - name: E4 (energy UI structure + compiled helpers + live API contract)
+        run: sudo -E "$(which python)" qa/energy_e4_test.py
       - name: Backend log on failure
         if: failure()
         run: tail -n 100 /tmp/backend.log || true

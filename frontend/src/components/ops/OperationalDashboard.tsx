@@ -12,6 +12,7 @@ import { LcdControl } from "./LcdControl";
 import { LastResponse } from "./LastResponse";
 import { OperationalLogs } from "./OperationalLogs";
 import { Confirm, ConfirmDialog } from "./ConfirmDialog";
+import { EnergyPanel } from "./energy/EnergyPanel";
 import { SLOT_CODES } from "./types";
 
 // Society → Status → Slots A–D → Days → Controls → Last Response → LCD → Logs. Frontend only: same APIs,
@@ -70,6 +71,7 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
               <LcdControl deviceId={device.id} queue={ops.queue} isPending={ops.isPending} />
             </div>
           )}
+          {societyId && <EnergyPanel societyId={societyId} deviceId={device.id} />}
           <OperationalLogs commands={cmds} events={ops.events} />
         </>
       )}
