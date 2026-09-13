@@ -155,8 +155,7 @@ class AllocationPolicy:
                 return {"action": None, "slot": None, "events": events}
             self._set(RUNNING if resume == WAITING_PERSISTENCE else resume, None, resume_status=None, persistence_started_at=None)
             events.append(("energy_allocation_resumed", f"safety condition cleared; reconciled verified active={va or 'NONE'}; state={st['status']}"))
-            if st["status"] != FINALIZING:
-                return {"action": None, "slot": None, "events": events}  # next evaluation decides with fresh data
+            return {"action": None, "slot": None, "events": events}  # recovery never acts; next evaluation decides with fresh data
         if st.get("reason"):
             st["reason"] = None; self.dirty = True
         # ---- reboot / boot reconciliation: never energize based on stale policy state
