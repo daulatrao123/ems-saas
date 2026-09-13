@@ -41,6 +41,7 @@ from api_client import ApiClient
 import ota_manager
 import config as _cfg
 from smart_health import SmartHealthMonitor
+from energy import EnergyEngine
 
 # P0-1 software completion contract (mirrors backend SOFTWARE_RESULTS). A software result is
 # never a claim about physical GPIO state; software commands never enter the hardware queue/FSM.
@@ -156,6 +157,17 @@ class EMSController:
                               rotation_interval_s=float(os.environ.get("LCD_ROTATION_INTERVAL_S", "5")),
                               enabled=os.environ.get("EMS_LCD_ENABLED", "1") != "0")
         self.lcd.start()
+        # Energy metering (E1): isolated engine, background RS485 polling, ledger under DATA_DIR/energy.
+        # Reads verified contactor feedback only; never drives GPIO, never enqueues commands.
+        self.energy = EnergyEngine(
+            _cfg.DATA_DIR,
+            feedback_provider=lambda: {s: self.state.slots[s].feedback_state.value for s in SUPPORTED_SLOTS},
+            operating_date_provider=lambda: datetime.now().astimezone().date().isoformat(),
+            reset_day_provider=lambda: int(self.device_config.get("reset_day", 15)),
+            write_allowed=lambda: self._secondary_state == SECONDARY_HEALTHY and self.storage.is_write_allowed("state"),
+            logger=logger,
+        )
+        self.energy.start()
 
         self._last_sync = 0.0
         self._auth_rejected_logged = False
@@ -498,6 +510,7 @@ class EMSController:
             "toggle_input": self.gpio.toggle_inputs(),
             "hardware_fault": self.gpio.hardware_fault,
             "storage_health": self._storage_health_snapshot(),
+            "energy": self.energy.snapshot(),
             "lcd": {"available": self.lcd.available, "error": self.lcd.init_error,
                     "message_id": (self.lcd_message or {}).get("id") if message_is_live(self.lcd_message) else None},
             "memory": memory,
@@ -757,6 +770,7 @@ class EMSController:
                                     "(download a NEW ZIP and install it) — next attempt in %ds.",
                                     getattr(self.api, "last_sync_http", None), self.AUTH_REJECT_HOLD_S)
             self._events_in_flight = 0
+            self.energy.sync_failed()
             if (
                 self.state.system_state
                 != SystemState.FAULT
@@ -783,6 +797,9 @@ class EMSController:
         self._consider_firmware(response)
 
         self._ack_sent_events()
+        self.energy.sync_succeeded()
+        if isinstance(response.get("energy_config"), dict):
+            self.energy.apply_config(response["energy_config"])
         self._auth_rejected_logged = False
 
         if self.state.system_state == (
@@ -1518,6 +1535,11 @@ class EMSController:
         )
         try:
             self.lcd.stop()
+        except Exception:
+            pass
+
+        try:
+            self.energy.stop()
         except Exception:
             pass
 
