@@ -19,4 +19,41 @@ jobs:
       - name: Strict release gate
         run: python qa/strict_6_4_1_check.py
       - name: Shell syntax
-        run: bash -n pi_firmware/setup_pi.sh
+        run: bash -n pi_firmware/setup_pi.sh qa/run_energy_regression.sh
+
+  energy-regression:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5433/ems_fresh
+      SECRET_KEY: ci-only-secret-key-not-for-production
+      EMS_BOOTSTRAP_PASSWORD: 'Boot#Pass123'
+      EMS_TRUSTED_ORIGINS: http://localhost:3000
+      COOKIE_SECURE: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt requests
+      - name: E1 + E3 (Pi energy core + allocation policy, mocked RS485/GPIO)
+        run: bash qa/run_energy_regression.sh
+      - name: PostgreSQL on :5433 (ems_fresh) for E2
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql
+          sudo sed -i 's/^port = .*/port = 5433/' /etc/postgresql/*/main/postgresql.conf
+          sudo systemctl restart postgresql
+          sudo -u postgres psql -p 5433 -c "ALTER USER postgres PASSWORD 'postgres'"
+          sudo -u postgres createdb -p 5433 ems_fresh
+      - name: Migrate + start backend :8001 + bootstrap super admin
+        working-directory: backend
+        run: |
+          alembic upgrade head
+          nohup uvicorn main:app --host 127.0.0.1 --port 8001 > /tmp/backend.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8001/api/health && break; sleep 1; done
+          curl -sf -X POST http://127.0.0.1:8001/api/bootstrap
+      - name: E2 (backend energy ingest + API, live backend)
+        run: sudo -E "$(which python)" qa/energy_e2_test.py
+      - name: Backend log on failure
+        if: failure()
+        run: tail -n 100 /tmp/backend.log || true
