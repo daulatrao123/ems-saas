@@ -1,12 +1,21 @@
 """Energy allocation POLICY (E3): sequential A -> B -> C -> D generation-target allocation.
 Pure decision layer: it never touches GPIO, the command queue or the controller system state. The controller executes
 its decisions through the existing local transition path (same gates/FSM/verification as physical toggles).
-Policy states: IDLE, RUNNING, WAITING_PERSISTENCE, PAUSED, COMPLETED, BLOCKED (per operating day)."""
+Policy states (per operating day):
+  IDLE -> RUNNING(wing) -> WAITING_PERSISTENCE -> next wing ... -> FINALIZING (final OFF requested) -> COMPLETED
+  BLOCKED  : a global safety condition holds (M1 stale/offline/disabled, feedback unknown, multiple contactors,
+             attribution FAULT, system FAULT). No hardware action, persistence timer cleared. When the condition
+             clears the policy RECONCILES against verified physical state before doing anything.
+  PAUSED   : operator wins / failure; no automatic hardware action until the next operating day.
+  COMPLETED: only after the final deactivation was executed AND verified_active == None."""
 import time
 
 from .energy_state import atomic_write_json, load_json
 
-IDLE, RUNNING, WAITING_PERSISTENCE, PAUSED, COMPLETED, BLOCKED = "IDLE", "RUNNING", "WAITING_PERSISTENCE", "PAUSED", "COMPLETED", "BLOCKED"
+IDLE, RUNNING, WAITING_PERSISTENCE, FINALIZING, PAUSED, COMPLETED, BLOCKED = (
+    "IDLE", "RUNNING", "WAITING_PERSISTENCE", "FINALIZING", "PAUSED", "COMPLETED", "BLOCKED")
+ACTIVE_STATES = (IDLE, RUNNING, WAITING_PERSISTENCE, FINALIZING)
+MAX_FINALIZE_ATTEMPTS = 3
 DEFAULT_SEQUENCE = ("A", "B", "C", "D")
 M1_STALE_S = 60.0
 EVALUATE_INTERVAL_S = 5.0
@@ -42,7 +51,8 @@ class AllocationPolicy:
     # ---------------------------------------------------------------- state helpers
     def _fresh(self, operating_date):
         return {"version": 1, "operating_date": operating_date, "status": IDLE, "current_wing": None, "index": 0,
-                "persistence_started_at": None, "completed": [], "skipped": [], "reason": None, "reconciled": True}
+                "persistence_started_at": None, "completed": [], "skipped": [], "reason": None, "reconciled": True,
+                "resume_status": None, "finalize_attempts": 0}
 
     def _set(self, status, reason=None, **kw):
         self.state.update({"status": status, "reason": reason, **kw})
@@ -128,21 +138,46 @@ class AllocationPolicy:
             return {"action": None, "slot": None, "events": events}
         block = self.global_block(ctx)
         if block:
-            if st["status"] in (RUNNING, WAITING_PERSISTENCE):
-                st["persistence_started_at"] = None  # never count time while data is untrusted
-            if st.get("reason") != block:
-                events.append(("energy_allocation_blocked", f"no action: {block} (state={st['status']} wing={st['current_wing']})"))
+            if st["status"] != BLOCKED:
+                self._set(BLOCKED, block, resume_status=st["status"], persistence_started_at=None)
+                events.append(("energy_allocation_blocked", f"no action: {block} (was {st['resume_status']} wing={st['current_wing']}); persistence timer cleared"))
+            elif st.get("reason") != block:
                 st["reason"] = block; self.dirty = True
+                events.append(("energy_allocation_blocked", f"no action: {block} (still blocked, wing={st['current_wing']})"))
             return {"action": None, "slot": None, "events": events}
+        va = ctx["verified_active"]
+        if st["status"] == BLOCKED:
+            # Safety condition cleared: reconcile against VERIFIED physical state before any decision. Never energize here.
+            resume = st.get("resume_status") or IDLE
+            if resume in (RUNNING, WAITING_PERSISTENCE, FINALIZING) and va != st["current_wing"]:
+                self._set(PAUSED, "INTERVENTION_WHILE_BLOCKED", resume_status=None)
+                events.append(("energy_allocation_paused", f"after block cleared verified active={va or 'NONE'} expected={st['current_wing']}; paused for the day"))
+                return {"action": None, "slot": None, "events": events}
+            self._set(RUNNING if resume == WAITING_PERSISTENCE else resume, None, resume_status=None, persistence_started_at=None)
+            events.append(("energy_allocation_resumed", f"safety condition cleared; reconciled verified active={va or 'NONE'}; state={st['status']}"))
+            if st["status"] != FINALIZING:
+                return {"action": None, "slot": None, "events": events}  # next evaluation decides with fresh data
         if st.get("reason"):
             st["reason"] = None; self.dirty = True
-        va = ctx["verified_active"]
         # ---- reboot / boot reconciliation: never energize based on stale policy state
         if not st.get("reconciled"):
             st["reconciled"] = True
-            if st["status"] in (RUNNING, WAITING_PERSISTENCE) and va != st["current_wing"]:
+            if st["status"] in (RUNNING, WAITING_PERSISTENCE, FINALIZING) and va != st["current_wing"]:
                 self._set(PAUSED, "RECONCILIATION_MISMATCH"); events.append(("energy_allocation_paused", f"after restart verified active={va} expected={st['current_wing']}; paused for the day"))
                 return {"action": None, "slot": None, "events": events}
+        # ---- FINALIZING: the final OFF was requested but not yet verified -> retry (bounded) or fail safe
+        if st["status"] == FINALIZING:
+            if va is None:
+                return self._complete(ctx, events)
+            if va != st["current_wing"]:
+                self._set(PAUSED, "MANUAL_INTERVENTION"); events.append(("energy_allocation_paused", f"verified active wing={va} differs from finalizing {st['current_wing']}; operator wins"))
+                return {"action": None, "slot": None, "events": events}
+            if st["finalize_attempts"] >= MAX_FINALIZE_ATTEMPTS:
+                self._set(PAUSED, "FINAL_DEACTIVATION_FAILED"); events.append(("energy_allocation_fault", f"wing {va} still verified ON after {st['finalize_attempts']} deactivation attempts; NOT completed; paused"))
+                return {"action": None, "slot": None, "events": events}
+            st["finalize_attempts"] += 1; self.dirty = True
+            events.append(("energy_allocation_transition_requested", f"deactivate wing {va} (final OFF, attempt {st['finalize_attempts']})"))
+            return {"action": "DEACTIVATE", "slot": va, "events": events}
         # ---- manual intervention: the verified physical wing is not the allocator's
         if st["status"] in (RUNNING, WAITING_PERSISTENCE) and va != st["current_wing"]:
             self._set(PAUSED, "MANUAL_INTERVENTION"); events.append(("energy_allocation_paused", f"verified active wing={va or 'NONE'} differs from allocated {st['current_wing']}; operator wins for the rest of {ctx['operating_date']}"))
@@ -189,9 +224,16 @@ class AllocationPolicy:
             events.append(("energy_allocation_started" if start else "energy_allocation_transition_requested", f"activate wing {wing} target {target:.3f} kWh"))
             return {"action": "ACTIVATE", "slot": wing, "events": events}
         previous = self.state["current_wing"]
+        if previous is None or ctx["verified_active"] is None:
+            return self._complete(ctx, events)  # nothing is verified ON: complete without any hardware action
+        self._set(FINALIZING, None, finalize_attempts=1)
+        events.append(("energy_allocation_transition_requested", f"deactivate wing {previous} (final OFF, attempt 1)"))
+        return {"action": "DEACTIVATE", "slot": previous, "events": events}
+
+    def _complete(self, ctx, events):
         self._set(COMPLETED, None, current_wing=None)
-        events.append(("energy_allocation_completed", f"all eligible wings done for {ctx['operating_date']}: completed={self.state['completed']} skipped={[s['wing'] for s in self.state['skipped']]}; all wings OFF"))
-        return {"action": "DEACTIVATE" if previous else None, "slot": previous, "events": events}
+        events.append(("energy_allocation_completed", f"all eligible wings done for {ctx['operating_date']}: completed={self.state['completed']} skipped={[s['wing'] for s in self.state['skipped']]}; all wings verified OFF"))
+        return {"action": None, "slot": None, "events": events}
 
     def after_execution(self, action, slot, success, verified_active_now):
         """Controller feedback after the local transition ran through GPIOManager + verification."""
@@ -200,6 +242,15 @@ class AllocationPolicy:
                 return [("energy_allocation_transition_verified", f"wing {slot} verified active")]
             self._set(PAUSED, "TRANSITION_FAILED", current_wing=None)
             return [("energy_allocation_fault", f"activate {slot} failed or unverified (verified active={verified_active_now}); allocation paused for the day")]
-        if action == "DEACTIVATE" and not (success and verified_active_now is None):
-            return [("energy_allocation_fault", f"deactivate {slot} failed or unverified (verified active={verified_active_now})")]
+        if action == "DEACTIVATE":
+            if success and verified_active_now is None:
+                events = [("energy_allocation_transition_verified", f"wing {slot} verified OFF")]
+                if self.state["status"] == FINALIZING:
+                    self._set(COMPLETED, None, current_wing=None)
+                    events.append(("energy_allocation_completed", f"all eligible wings done for {self.state['operating_date']}: completed={self.state['completed']} skipped={[s['wing'] for s in self.state['skipped']]}; all wings verified OFF"))
+                return events
+            # Physical state is authoritative: still ON (or failed) => NOT completed. FINALIZING retries (bounded) via evaluate().
+            if self.state["status"] == FINALIZING and self.state["finalize_attempts"] >= MAX_FINALIZE_ATTEMPTS:
+                self._set(PAUSED, "FINAL_DEACTIVATION_FAILED")
+            return [("energy_allocation_fault", f"deactivate {slot} failed or unverified (success={success}, verified active={verified_active_now}); NOT completed")]
         return []

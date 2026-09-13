@@ -1313,7 +1313,6 @@ class EMSController:
             success, reason = self._execute_local_transition(slot, on, "ENERGY")
         if reason:
             self._emit_event("energy_allocation_blocked", f"{decision['action']} {slot} rejected: {reason}")
-            return
         for etype, message in self.energy.allocation_result(decision["action"], slot, success):
             self._emit_event(etype, message)
         self._emit_event("energy_allocation_transition", f"{decision['action']} {slot} result={'OK' if success else 'FAILED'} "
