@@ -6,6 +6,7 @@ import os
 import threading
 import time
 
+from .allocation import AllocationPolicy, verified_active
 from .attribution import ATTRIBUTED, FAULT, UNATTRIBUTED, attribute
 from .energy_ledger import DailyLedger
 from .energy_state import MeterBaselines, atomic_write_json, load_json
@@ -50,6 +51,9 @@ class EnergyEngine:
         self._events_in_flight = 0
         self._days_in_flight = []
         self._last_loop_error = 0.0
+        self.allocation = AllocationPolicy(os.path.join(self.dir, "allocation.json"), self._writes_ok, now)
+        self.targets = {}
+        self._last_feedback = {}
         stored = load_json(os.path.join(self.dir, "config.json"), None)
         if stored:
             self.apply_config(stored, persist=False)
@@ -96,6 +100,8 @@ class EnergyEngine:
                 elif self.bus is None:
                     h.update({"comm_status": OFFLINE, "last_error": self.bus_error})
             self.config = cfg
+            self.allocation.apply_config(cfg.get("allocation"))
+            self.targets = cfg.get("targets") if isinstance(cfg.get("targets"), dict) else {}
             self.config_version = cfg.get("version")
             self.config_error = None
             if persist and self._writes_ok():
@@ -144,6 +150,7 @@ class EnergyEngine:
         feedback = self.feedback()
         wing, status, reason = attribute(feedback)
         with self._lock:
+            self._last_feedback = dict(feedback)
             meters = list(self.meters.items())
         readings = [(mid, meter.read()) for mid, meter in meters]
         with self._lock:
@@ -213,6 +220,7 @@ class EnergyEngine:
                 "today": self.ledger.snapshot_today(),
                 "closed_days": json.loads(json.dumps(days)),
                 "events": list(self._events),
+                "allocation": self.allocation.view(),
             }
 
     def sync_succeeded(self):
@@ -225,6 +233,30 @@ class EnergyEngine:
     def sync_failed(self):
         with self._lock:
             self._days_in_flight, self._events_in_flight = [], 0
+
+    # ---------------------------------------------------------------- allocation policy (E3) — decisions only
+    def evaluate_allocation(self, system_state, wings):
+        """Build the policy context from live engine data + verified feedback; returns the policy decision."""
+        feedback = self.feedback()
+        with self._lock:
+            today = self.ledger.snapshot_today()
+            ctx = {
+                "now": self.now(), "operating_date": today["operating_date"], "system_state": system_state,
+                "targets": self.targets, "feedback": feedback, "verified_active": verified_active(feedback),
+                "attribution": dict(self.attribution), "wing_generation": today["wing_generation"],
+                "m1": {"enabled": self.registry["M1"].enabled, **self.health["M1"]},
+                "wings": {w: {**wings.get(w, {}), "consumption_meter_enabled": self.registry[mid].enabled and self.health[mid]["comm_status"] == ONLINE}
+                          for w, mid in (("A", "M2"), ("B", "M3"), ("C", "M4"), ("D", "M5"))},
+            }
+            decision = self.allocation.evaluate(ctx)
+            self.allocation.persist()
+            return decision
+
+    def allocation_result(self, action, slot, success):
+        with self._lock:
+            events = self.allocation.after_execution(action, slot, success, verified_active(self.feedback()))
+            self.allocation.persist()
+            return events
 
     def status_view(self):
         """Tiny read-only view for the LCD/diagnostics (no I/O)."""

@@ -17,8 +17,8 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
 from provisioning import build_provisioning_zip, service_unit_sha256
-from energy import ingest as energy_ingest
-from energy.routes import create_router as create_energy_router
+from energy_api import ingest as energy_ingest
+from energy_api.routes import create_router as create_energy_router
 import logging
 _seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
 from fastapi.middleware.cors import CORSMiddleware

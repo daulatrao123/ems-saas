@@ -12,6 +12,8 @@ METER_WING = {"M1": None, "M2": "A", "M3": "B", "M4": "C", "M5": "D"}
 WINGS = ("A", "B", "C", "D")
 COMM_STATES = {"DISABLED", "NOT_CONFIGURED", "ONLINE", "DEGRADED", "OFFLINE"}
 READINGS_RETENTION_DAYS = 30
+DEFAULT_ALLOCATION = {"enabled": False, "sequence": list(WINGS), "tolerance_kwh": 1.0, "persistence_s": 300,
+                      "wings": {w: {"generation_attribution_enabled": True, "manual_target_kwh": None} for w in WINGS}}
 
 
 def _num(v):
@@ -132,7 +134,7 @@ def _ingest(cur, device_id, energy, now):
 
 def build_energy_config(cur, device_id):
     """Backend-authoritative config for the Pi: {"version", "bus", "meters": {Mx: {...}}}."""
-    cur.execute("SELECT energy_bus, energy_config_version FROM pi_devices WHERE id=%s", (device_id,))
+    cur.execute("SELECT energy_bus, energy_config_version, energy_allocation FROM pi_devices WHERE id=%s", (device_id,))
     dev = cur.fetchone()
     if not dev:
         return None
@@ -144,7 +146,12 @@ def build_energy_config(cur, device_id):
         meters[r["meter_id"]] = {"enabled": bool(r["enabled"]), "serial": r["serial"], "modbus_address": r["modbus_address"], "model": r["model"],
                                  "register_map": r["register_map"], "phases": r["phases"],
                                  "ct_ratio": _num(r["ct_ratio"]), "max_kw": _num(r["max_kw"])}
-    return {"version": int(dev["energy_config_version"] or 0), "bus": dev["energy_bus"] or {}, "meters": meters}
+    cur.execute("""SELECT DISTINCT ON (wing) wing, target_kwh_per_day, effective_from FROM energy_generation_targets
+                   WHERE device_id=%s AND effective_from <= CURRENT_DATE ORDER BY wing, effective_from DESC, id DESC""", (device_id,))
+    targets = {r["wing"]: {"target_kwh_per_day": _num(r["target_kwh_per_day"]), "effective_from": r["effective_from"].isoformat()} for r in cur.fetchall()}
+    allocation = dev["energy_allocation"] or DEFAULT_ALLOCATION
+    return {"version": int(dev["energy_config_version"] or 0), "bus": dev["energy_bus"] or {}, "meters": meters,
+            "allocation": allocation, "targets": targets}
 
 
 def config_reply(cur, device_id, energy):

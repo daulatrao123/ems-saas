@@ -1,0 +1,1 @@
+"""Energy management backend (E2; package named energy_api to avoid colliding with pi_firmware/energy in shared test processes): ingestion of the Pi `energy` sync block, authoritative daily ledger, config + read APIs."""

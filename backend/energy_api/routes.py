@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from . import queries as Q
-from .ingest import METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
+from .ingest import DEFAULT_ALLOCATION, METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
 
 VALUE_TYPES = {"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64"}
 KINDS = {"MANUAL_GENERATION", "MANUAL_CONSUMPTION", "ACCOUNTING"}
@@ -193,6 +193,41 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             ver = cur.fetchone()["energy_config_version"]
             log_audit(cur, user, sid, "ENERGY_BUS_CONFIG", {"device_id": did, "port": port or None, "version": ver})
             return {"success": True, "config_version": ver, "bus": bus}
+        return run(fn, write=True)
+
+    @router.get("/allocation")
+    def get_allocation(society_id: str, device_id: str, user: dict = Depends(get_current_user)):
+        sid = access(user, society_id)
+        def fn(cur):
+            dev = device(cur, sid, device_id)
+            cur.execute("SELECT energy_allocation FROM pi_devices WHERE id=%s", (dev["id"],))
+            return {"allocation": cur.fetchone()["energy_allocation"] or DEFAULT_ALLOCATION, "config_version": dev["energy_config_version"]}
+        return run(fn)
+
+    @router.put("/allocation")
+    def put_allocation(data: dict, user: dict = Depends(get_current_user)):
+        sid = access(user, data.get("society_id"), write=True)
+        seq = data.get("sequence", list(WINGS))
+        if not isinstance(seq, list) or [str(w).upper() for w in seq] != list(WINGS):
+            raise HTTPException(400, "sequence must be exactly [A, B, C, D]")
+        cfg = {"enabled": bool(data.get("enabled", False)), "sequence": list(WINGS),
+               "tolerance_kwh": _num(data.get("tolerance_kwh", 1.0), "tolerance_kwh", 0, 1000),
+               "persistence_s": int(_num(data.get("persistence_s", 300), "persistence_s", 10, 86400)), "wings": {}}
+        wings = data.get("wings") if isinstance(data.get("wings"), dict) else {}
+        for w in WINGS:
+            wc = wings.get(w) if isinstance(wings.get(w), dict) else {}
+            mt = wc.get("manual_target_kwh")
+            cfg["wings"][w] = {"generation_attribution_enabled": bool(wc.get("generation_attribution_enabled", True)),
+                               "manual_target_kwh": None if mt is None else _num(mt, f"wings.{w}.manual_target_kwh", 0.001, 1_000_000)}
+        def fn(cur):
+            dev = device(cur, sid, data.get("device_id")); did = str(dev["id"])
+            if cfg["enabled"]:
+                cur.execute("SELECT enabled FROM energy_meters WHERE device_id=%s AND meter_id='M1'", (did,))
+                if not cur.fetchone()["enabled"]: raise HTTPException(409, "Cannot enable allocation: generation meter M1 is disabled")
+            cur.execute("UPDATE pi_devices SET energy_allocation=%s, energy_config_version=energy_config_version+1 WHERE id=%s RETURNING energy_config_version", (Json(cfg), did))
+            ver = cur.fetchone()["energy_config_version"]
+            log_audit(cur, user, sid, "ENERGY_ALLOCATION_CONFIG", {"device_id": did, "enabled": cfg["enabled"], "tolerance_kwh": cfg["tolerance_kwh"], "persistence_s": cfg["persistence_s"], "version": ver})
+            return {"success": True, "config_version": ver, "allocation": cfg}
         return run(fn, write=True)
 
     # ---------------------------------------------------------------- summary

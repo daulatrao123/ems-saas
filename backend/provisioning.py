@@ -53,6 +53,7 @@ FIRMWARE_FILES = (
     "setup_pi.sh",
     # Energy subsystem (E1): shipped as a package directory under firmware/energy.
     "energy/__init__.py",
+    "energy/allocation.py",
     "energy/attribution.py",
     "energy/energy_ledger.py",
     "energy/energy_state.py",
@@ -135,6 +136,7 @@ REQUIRED_FILES=(
   "firmware/ems-ota-stage.py"
   "firmware/setup_pi.sh"
   "firmware/energy/__init__.py"
+  "firmware/energy/allocation.py"
   "firmware/energy/attribution.py"
   "firmware/energy/energy_ledger.py"
   "firmware/energy/energy_state.py"

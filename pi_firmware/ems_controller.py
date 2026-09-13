@@ -61,6 +61,7 @@ REBOOT_REQUEST_FILE = "reboot.request"
 TELEMETRY_CHECK_INTERVAL_S = 3600.0
 # Secondary (USB data volume) re-verification cadence for the logging policy.
 SECONDARY_RECHECK_S = 60.0
+ENERGY_ALLOC_INTERVAL_S = 5.0
 EXIT_SECONDARY_STORAGE = 4
 
 # Baseline version of THIS artifact. A staged slot reports its own version via
@@ -168,6 +169,7 @@ class EMSController:
             logger=logger,
         )
         self.energy.start()
+        self._energy_alloc_next = 0.0
 
         self._last_sync = 0.0
         self._auth_rejected_logged = False
@@ -1249,33 +1251,73 @@ class EMSController:
             if not on and self.state.active_slot != slot:
                 continue
 
-            if self.state.system_state not in (SystemState.READY, SystemState.CLOUD_OFFLINE):
-                rejected(f"SYSTEM_{self.state.system_state.value}")
+            success, reason = self._execute_local_transition(slot, on, "TOGGLE")
+            if reason:
+                rejected(reason)
                 continue
-
-            prior_state = self.state.system_state
-            self.state.system_state = SystemState.EXECUTING
-            if not self.state.save_state(immediate=True):
-                self.state.system_state = SystemState.FAULT
-                rejected("STATE_PERSIST_FAILED")
-                continue
-
-            success = False
-            try:
-                success = self.gpio.transition_slot(slot) if on else self.gpio.deactivate_slot(slot)
-                if success:
-                    self.state.increment_clicks(slot, immediate=False)
-            except Exception as exc:
-                logger.critical("Toggle execution exception: %s", exc)
-                self.state.system_state = SystemState.FAULT
-            finally:
-                if self.state.system_state != SystemState.FAULT:
-                    self.state.system_state = prior_state
-                self.state.save_state(immediate=True)
-
             self._emit_event("toggle", self._toggle_message(ev, "OK" if success else "FAILED"))
             actions += 1
         return actions
+
+    def _execute_local_transition(self, slot, on, origin):
+        """Shared LOCAL hardware execution for physical toggles and the energy allocator (origin TOGGLE|ENERGY).
+        No OfflineQueue row, no command id, no /api/pi/ack. Same gate as cloud commands (READY/CLOUD_OFFLINE),
+        EXECUTING persisted, then GPIOManager break-before-make + positive feedback verification.
+        Returns (success, rejection_reason); rejection_reason is None when the hardware path actually ran."""
+        if self.state.system_state not in (SystemState.READY, SystemState.CLOUD_OFFLINE):
+            return False, f"SYSTEM_{self.state.system_state.value}"
+        prior_state = self.state.system_state
+        self.state.system_state = SystemState.EXECUTING
+        if not self.state.save_state(immediate=True):
+            self.state.system_state = SystemState.FAULT
+            return False, "STATE_PERSIST_FAILED"
+        success = False
+        try:
+            success = self.gpio.transition_slot(slot) if on else self.gpio.deactivate_slot(slot)
+            if success and origin == "TOGGLE":
+                self.state.increment_clicks(slot, immediate=False)
+        except Exception as exc:
+            logger.critical("%s execution exception: %s", origin, exc)
+            self.state.system_state = SystemState.FAULT
+        finally:
+            if self.state.system_state != SystemState.FAULT:
+                self.state.system_state = prior_state
+            self.state.save_state(immediate=True)
+        return success, None
+
+    # ============================================================
+    # ENERGY ALLOCATION (E3) — policy decides, existing local transition path executes
+    # ============================================================
+
+    def _run_energy_allocation(self):
+        now = time.monotonic()
+        if now < self._energy_alloc_next:
+            return
+        self._energy_alloc_next = now + ENERGY_ALLOC_INTERVAL_S
+        try:
+            decision = self.energy.evaluate_allocation(
+                system_state=self.state.system_state.value,
+                wings={s: {"ems_enabled": not bool(self.device_config.get("slots", {}).get(s, {}).get("disabled", True))} for s in SUPPORTED_SLOTS},
+            )
+        except Exception as exc:
+            logger.error("Energy allocation evaluation failed: %s", exc)
+            return
+        for etype, message in decision["events"]:
+            self._emit_event(etype, message)
+        if decision["action"] is None:
+            return
+        slot, on = decision["slot"], decision["action"] == "ACTIVATE"
+        if bool(self.device_config.get("slots", {}).get(slot, {}).get("disabled", True)):
+            success, reason = False, "SLOT_DISABLED"
+        else:
+            success, reason = self._execute_local_transition(slot, on, "ENERGY")
+        if reason:
+            self._emit_event("energy_allocation_blocked", f"{decision['action']} {slot} rejected: {reason}")
+            return
+        for etype, message in self.energy.allocation_result(decision["action"], slot, success):
+            self._emit_event(etype, message)
+        self._emit_event("energy_allocation_transition", f"{decision['action']} {slot} result={'OK' if success else 'FAILED'} "
+                         f"verification={self.state.slots[slot].verification_state.value} active={self.state.active_slot or 'NONE'}")
 
     def _toggle_message(self, ev, result, reason=None):
         slot = ev["slot"]
@@ -1507,6 +1549,7 @@ class EMSController:
 
                 self.smart.maybe_collect()
                 self._refresh_storage_health()
+                self._run_energy_allocation()
 
                 if (self._restart_requested or self._reboot_requested) and not self.queue.get_unacked():
                     # Command is terminal AND acknowledged by the cloud -> no re-delivery, no loop.
