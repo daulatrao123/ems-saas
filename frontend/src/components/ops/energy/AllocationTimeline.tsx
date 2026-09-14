@@ -9,7 +9,7 @@ export function AllocationTimeline({ events, operatingDate }: { events: EventRow
   const today = events.filter((e) => (e.ts || "").slice(0, 10) === operatingDate);
   return (
     <section data-testid="energy-allocation-timeline" className={`${panel} p-4`}>
-      <div className="flex items-center justify-between"><div className={label}>Allocation timeline · {operatingDate}</div><span className="font-mono text-[10px] text-gray-500">{today.length} event(s) today · Pi policy, executed via GPIOManager</span></div>
+      <div className="flex flex-wrap items-center justify-between gap-2"><div data-testid="energy-allocation-timeline-title" className={label}>Auto Allocation Timeline · {operatingDate}</div><span data-testid="energy-allocation-provenance" className="font-mono text-[10px] text-gray-500">Pi-reported events · not live state</span></div>
       {today.length === 0 ? (
         <div data-testid="energy-allocation-empty" className="mt-2 font-mono text-[10px] text-gray-500">NO ALLOCATION EVENTS TODAY{events.length ? ` (${events.length} older allocation event(s) in the feed)` : ""}</div>
       ) : (

@@ -74,14 +74,16 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             raise HTTPException(403, "Cannot access other society data")
         return sid
 
-    def device(cur, sid, device_id):
+    def device(cur, sid, device_id, ensure_meters=True):
         did = require_uuid(device_id, "device_id")
-        cur.execute("""SELECT d.id, d.energy_bus, d.energy_config_version, COALESCE(s.reset_day, 15) AS reset_day
+        cur.execute("""SELECT d.id, d.energy_bus, d.energy_config_version,
+                              d.energy_calculation_mode, d.energy_calculation_version, COALESCE(s.reset_day, 15) AS reset_day
                        FROM pi_devices d JOIN societies s ON s.id=d.society_id WHERE d.id=%s AND d.society_id=%s""", (did, sid))
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "Device not found in this society")
-        ensure_meter_rows(cur, did)
+        if ensure_meters:
+            ensure_meter_rows(cur, did)
         return row
 
     def run(fn, write=False):
@@ -230,6 +232,32 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             return {"success": True, "config_version": ver, "allocation": cfg}
         return run(fn, write=True)
 
+    # Data-source setting only: never bump the Pi energy_config_version or enqueue commands.
+    @router.put("/calculation-mode")
+    def put_calculation_mode(data: dict, user: dict = Depends(get_current_user)):
+        sid = access(user, data.get("society_id"), write=True)
+        mode = data.get("mode")
+        if mode not in ("AUTO", "MANUAL"):
+            raise HTTPException(400, "mode must be AUTO or MANUAL")
+        expected = data.get("expected_version")
+        if type(expected) is not int or expected < 0:
+            raise HTTPException(400, "expected_version must be a non-negative integer")
+        def fn(cur):
+            did = str(device(cur, sid, data.get("device_id"), ensure_meters=False)["id"])
+            cur.execute("SELECT energy_calculation_mode, energy_calculation_version FROM pi_devices WHERE id=%s FOR UPDATE", (did,))
+            current = cur.fetchone()
+            previous, version = current["energy_calculation_mode"], current["energy_calculation_version"]
+            if expected != version:
+                raise HTTPException(409, "Energy calculation mode changed; refresh before saving")
+            if mode != previous:
+                cur.execute("""UPDATE pi_devices SET energy_calculation_mode=%s,
+                               energy_calculation_version=energy_calculation_version+1 WHERE id=%s
+                               RETURNING energy_calculation_version""", (mode, did))
+                version = cur.fetchone()["energy_calculation_version"]
+                log_audit(cur, user, sid, "ENERGY_CALCULATION_MODE", {"device_id": did, "previous_mode": previous, "mode": mode, "version": version})
+            return {"success": True, "device_id": did, "mode": mode, "version": version}
+        return run(fn, write=True)
+
     # ---------------------------------------------------------------- summary
     @router.get("/summary")
     def summary(society_id: str, device_id: str, user: dict = Depends(get_current_user)):
@@ -266,7 +294,8 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                                 "unattributed": unattr, "active_generation_wing": active, "attribution": attr if gen_on else None,
                                 "source": "PHYSICAL" if gen_total and gen_total["today"]["kwh"] is not None else "UNAVAILABLE"}
             return {"device_id": did, "as_of_operating_date": today.isoformat(), "reset_day": dev["reset_day"], "reset_period": Q.reset_period_for(today, dev["reset_day"]),
-                    "generation_meter": generation_meter, "wings": wings}
+                    "generation_meter": generation_meter, "wings": wings,
+                    "calculation": Q.calculation_view(cur, did, dev["energy_calculation_mode"], dev["energy_calculation_version"], meters, today)}
         return run(fn)
 
     # ---------------------------------------------------------------- history / graph / monthly
@@ -289,16 +318,20 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
 
     @router.get("/graph/wing")
     def graph_wing(society_id: str, device_id: str, wing: str, range: str = None, frm: str = Query(None, alias="from"), to: str = None,
-                   user: dict = Depends(get_current_user)):
-        return _graph(society_id, device_id, wing, range, frm, to, user)
+                   basis: str = "legacy", user: dict = Depends(get_current_user)):
+        if basis not in ("legacy", "calculation"):
+            raise HTTPException(400, "basis must be legacy or calculation")
+        return _graph(society_id, device_id, wing, range, frm, to, user, basis)
 
-    def _graph(society_id, device_id, wing, rng, frm, to, user):
+    def _graph(society_id, device_id, wing, rng, frm, to, user, basis):
         sid = access(user, society_id); w = _wing(wing)
         def fn(cur):
             dev = device(cur, sid, device_id); did = str(dev["id"]); meters = meters_of(cur, did)
             f, t, today = _range(cur, did, dev, frm, to, rng)
-            rows = Q.wing_graph_rows(cur, did, w, f, t, bool(meters["M1"]["enabled"]), bool(meters[METER_WING_INV[w]]["enabled"]))
+            mode = dev["energy_calculation_mode"] if basis == "calculation" else None
+            rows = Q.wing_graph_rows(cur, did, w, f, t, bool(meters["M1"]["enabled"]), bool(meters[METER_WING_INV[w]]["enabled"]), mode)
             return {"wing": w, "from": f.isoformat(), "to": t.isoformat(), "as_of_operating_date": today.isoformat(), "unit": "kWh",
+                    "basis": basis, "calculation_mode": mode,
                     "series": ["required_kwh", "generated_kwh", "consumed_kwh"], "rows": rows,
                     "generation_meter_enabled": bool(meters["M1"]["enabled"]), "consumption_meter_enabled": bool(meters[METER_WING_INV[w]]["enabled"])}
         return run(fn)

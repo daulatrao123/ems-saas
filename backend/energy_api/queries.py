@@ -1,6 +1,7 @@
 """Aggregations over the authoritative energy_daily ledger (daily -> monthly/yearly/reset/lifetime).
 NULL means UNAVAILABLE and is never coerced to 0; a period without any measured day returns None."""
 import calendar
+import math
 from datetime import date, timedelta
 
 WINGS = ("A", "B", "C", "D")
@@ -103,7 +104,12 @@ def target_for_date(timeline, d):
 
 
 # ---------------------------------------------------------------- graph rows (aligned by operating_date)
-def wing_graph_rows(cur, device_id, wing, frm, to, generation_enabled, consumption_enabled):
+def wing_graph_rows(cur, device_id, wing, frm, to, generation_enabled, consumption_enabled, calculation_mode=None):
+    """Legacy accounting mix by default; explicit calculation mode selects ONE source.
+
+The selected-source view shares this query pipeline, never rewrites the ledger,
+and never treats manual entries as editable absolute daily totals.
+    """
     cur.execute("""SELECT operating_date, status, (wing_generation->>%s)::numeric AS gen, (wing_consumption->>%s)::numeric AS cons,
                           consumption_source->>%s AS cons_src, generation_source
                    FROM energy_daily WHERE device_id=%s AND operating_date BETWEEN %s AND %s ORDER BY operating_date""",
@@ -122,9 +128,18 @@ def wing_graph_rows(cur, device_id, wing, frm, to, generation_enabled, consumpti
         a = adj.get(d, {})
         gen_phys = float(r["gen"]) if r and r["gen"] is not None and generation_enabled else None
         cons_phys = float(r["cons"]) if r and r["cons"] is not None and consumption_enabled else None
+        if calculation_mode is not None:
+            gen_phys = gen_phys if r and r["generation_source"] == "PHYSICAL" and _physical(gen_phys) else None
+            cons_phys = cons_phys if r and r["cons_src"] == "PHYSICAL" and _physical(cons_phys) else None
+            if calculation_mode == "AUTO":
+                a = {}  # No automatic substitution or addition of manual entries.
+            elif calculation_mode == "MANUAL":
+                gen_phys = cons_phys = None
+            else:
+                raise ValueError("Unknown energy calculation mode")
         gen = _combine(gen_phys, a.get("MANUAL_GENERATION"))
         cons = _combine(cons_phys, a.get("MANUAL_CONSUMPTION"))
-        req = target_for_date(timeline, d)
+        req = target_for_date(timeline, d) if calculation_mode != "MANUAL" else None
         gen_src, cons_src = _src(gen_phys, a.get("MANUAL_GENERATION")), _src(cons_phys, a.get("MANUAL_CONSUMPTION"))
         sources = {s for s in (gen_src, cons_src) if s != "UNAVAILABLE"}
         source = "UNAVAILABLE" if not sources else ("MIXED" if len(sources) > 1 or "MIXED" in sources else sources.pop())
@@ -134,9 +149,29 @@ def wing_graph_rows(cur, device_id, wing, frm, to, generation_enabled, consumpti
                      "generation_minus_consumption_kwh": _r(gen - cons) if gen is not None and cons is not None else None,
                      "target_achievement_percent": ach, "target_status": status, "source": source,
                      "generation_source": gen_src, "consumption_source": cons_src,
-                     "day_status": r["status"] if r else "NO_DATA"})
+                     "day_status": ("MANUAL_ENTRIES" if source != "UNAVAILABLE" else "NO_DATA") if calculation_mode == "MANUAL" else r["status"] if r else "NO_DATA"})
         d += timedelta(days=1)
     return rows
+
+
+def _physical(value):
+    return value is not None and math.isfinite(value) and value >= 0
+
+
+def calculation_view(cur, device_id, mode, version, meters, today):
+    """Bounded seven-day generation view using the existing graph calculation.
+
+Common generation is intentionally NOT summed from manual wing entries: there
+is no authoritative common manual-generation measurement in this contract.
+    """
+    wings = {}
+    for wing, mid in zip(WINGS, ("M2", "M3", "M4", "M5")):
+        rows = wing_graph_rows(cur, device_id, wing, today - timedelta(days=6), today,
+                              bool(meters["M1"]["enabled"]), bool(meters[mid]["enabled"]), mode)
+        wings[wing] = {"wing": wing, "today": rows[-1],
+                       "generation_trend": [{k: r[k] for k in ("date", "generated_kwh", "generation_source")} for r in rows]}
+    return {"mode": mode, "version": version, "operating_date": today.isoformat(), "wings": wings,
+            "manual_entry_semantics": "ADDITIVE_ENTRIES", "common_generation_basis": "PHYSICAL_M1_ONLY"}
 
 
 def _combine(phys, manual):

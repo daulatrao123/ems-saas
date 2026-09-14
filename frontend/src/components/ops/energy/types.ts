@@ -14,7 +14,13 @@ export type GenerationMeter = {
   meter_id: "M1"; status: string; serial: string | null; model: string | null; current_power_kw: number | null; generation: Metric;
   unattributed: Metric | null; active_generation_wing: string; attribution: { wing?: string | null; status?: string } | null; source: string;
 };
-export type EnergySummary = { device_id: string; as_of_operating_date: string; reset_day: number; reset_period: string; generation_meter: GenerationMeter; wings: Record<string, WingSummary> };
+export type CalculationMode = "AUTO" | "MANUAL";
+export type GenerationPoint = { date: string; generated_kwh: number | null; generation_source: string };
+export type CalculationWing = { wing: WingCode; today: GenerationPoint & { required_kwh: number | null; target_achievement_percent: number | null; target_status: string }; generation_trend: GenerationPoint[] };
+export type Calculation = { mode: CalculationMode; version: number; operating_date: string; wings: Record<WingCode, CalculationWing> };
+export type ManualEntry = { id: number; wing: WingCode | null; operating_date: string; kind: string; value_kwh: number; source: string; reason: string; created_at: string };
+export type ManualEntryInput = { wing: WingCode; operating_date: string; kind: "MANUAL_GENERATION"; value_kwh: number; reason: string };
+export type EnergySummary = { device_id: string; as_of_operating_date: string; reset_day: number; reset_period: string; generation_meter: GenerationMeter; wings: Record<string, WingSummary>; calculation: Calculation };
 export type MonthRow = { month: string; generation_kwh: number | null; source: string; completeness: "COMPLETE" | "PARTIAL" | "UNAVAILABLE"; physical_days: number; expected_days: number };
 export type MonthlyGeneration = { meter_id: "M1"; unit: string; months: number; as_of_operating_date: string; rows: MonthRow[]; source: string };
 export type WingAllocationConfig = { generation_attribution_enabled: boolean; manual_target_kwh: number | null };
