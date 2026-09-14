@@ -10,7 +10,7 @@ import os
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -86,7 +86,7 @@ class Monitor:
 
 
 @contextmanager
-def fixture(installed=True, enabled=True, real_clock=False):
+def fixture(installed=True, enabled=True, real_clock=False, reconcile=True):
     clock = time if real_clock else Clock()
     state, outputs, events = MemoryState(), {}, []
 
@@ -131,8 +131,23 @@ def fixture(installed=True, enabled=True, real_clock=False):
             patch.object(gm, "threading", isolated_threads), patch.object(gm, "time", clock):
         g = gm.GPIOManager(state, cfg)
         try:
-            assert g.reconcile_hardware_state(), "clean fixture must reconcile"
-            state.system_state = SystemState.EXECUTING  # Same command gate as EMSController.
+            if reconcile:
+                ok = g.reconcile_hardware_state()
+                if real_clock:
+                    # Unrestricted scheduling cannot guarantee startup success.
+                    # A refusal must remain fail-closed; noise assertions still run.
+                    check("REAL-CLOCK startup: READY or fail-closed deadline", (
+                        ok and state.system_state == SystemState.READY
+                    ) or (
+                        not ok and state.system_state == SystemState.FAULT
+                        and not any(r.is_active for r in g.relays.values())
+                        and all(state.slots[s].verification_state == VerificationState.PENDING for s in "ABCD")
+                        and not events
+                    ))
+                else:
+                    assert ok, "clean fixture must reconcile"
+                if ok:
+                    state.system_state = SystemState.EXECUTING  # Same command gate as EMSController.
             yield g, state, clock, events
         finally:
             g.stop()
@@ -273,6 +288,137 @@ def transition_cases():
         check("monitor never retains a positive state for unstable feedback", st.system_state == SystemState.FAULT and st.slots["A"].verification_state == VerificationState.PENDING)
 
 
+def reconciliation_cases():
+    positive = (VerificationState.VERIFIED_ON, VerificationState.VERIFIED_OFF)
+    limit = config.FEEDBACK_TIMEOUT_MS / 1000.0
+    with fixture(reconcile=False) as (g, st, clock, events):
+        with ExitStack() as forbidden:
+            for relay in g.relays.values():
+                for action in ("on", "off"):
+                    forbidden.enter_context(patch.object(relay, action, side_effect=AssertionError("reconciliation must not actuate")))
+            ok = g.reconcile_hardware_state()
+        check("RECON A/J: constant OFF qualifies without any relay on/off call", ok and st.system_state == SystemState.READY and not events and all(st.slots[s].verification_state == VerificationState.VERIFIED_OFF for s in "ABCD"))
+
+    with fixture(reconcile=False) as (g, st, clock, events):
+        for s in "ABCD":
+            st.slots[s].verification_state = VerificationState.VERIFIED_ON
+            st.slots[s].feedback_state = FeedbackState.ON
+        pending, owned = [], []
+        def observe():
+            pending.append(st.system_state == SystemState.HARDWARE_RECONCILIATION and all(st.slots[s].verification_state == VerificationState.PENDING and st.slots[s].feedback_state == FeedbackState.PENDING for s in "ABCD"))
+            owned.append(g._lock._is_owned())
+            return False
+        for s in "ABCD":
+            g.feedback_inputs[s].signal = observe
+        clock.gap = 0.020
+        clock.at(clock.now + 0.005, lambda: setattr(clock, "gap", 0))
+        start = clock.now
+        ok = g.reconcile_hardware_state()
+        check("RECON B: transient 20ms observation gap recovers with fresh evidence", ok and 0.220 <= clock.now - start < limit)
+        check("RECON B: no stale VERIFIED or partial feedback publication while pending", bool(pending) and all(pending))
+        check("RECON B: all reads hold the existing GPIO RLock and never actuate", all(owned) and not events)
+
+    with fixture(reconcile=False) as (g, st, clock, events):
+        clock.gap = 0.020
+        start = clock.now
+        ok = g.reconcile_hardware_state()
+        elapsed = clock.now - start
+        # A modelled scheduler overrun can delay return, never restart the budget.
+        check("RECON C: sustained starvation exhausts ONE overall 2000ms budget", not ok and st.system_state == SystemState.FAULT and limit <= elapsed <= limit + 0.022, f"{elapsed:.6f}s")
+        check("RECON C/N: timeout has no positive verification or subsequent MAKE", all(st.slots[s].verification_state == VerificationState.PENDING for s in "ABCD") and not g.transition_slot("B") and not events and not any(r.is_active for r in g.relays.values()))
+
+    for period, label in ((0.025, "mixed"), (0.005, "noise")):
+        for phase in (False, True):
+            with fixture(reconcile=False) as (g, st, clock, events):
+                start = clock.now
+                g.feedback_inputs["A"].signal = lambda: bool(int((clock.now - start + 1e-9) / period) % 2) != phase
+                ok = g.reconcile_hardware_state()
+                check(f"RECON D/E: repeated {label} phase={int(phase)} cannot verify", not ok and st.system_state == SystemState.FAULT and all(st.slots[s].verification_state not in positive for s in "ABCD") and not events)
+
+    for scenario in ("agreement", "mismatch", "multiple-relays", "multiple-contactors"):
+        with fixture(reconcile=False) as (g, st, clock, events):
+            if scenario != "multiple-contactors":
+                g.relays["A"].on()
+            if scenario in ("agreement", "multiple-relays", "multiple-contactors"):
+                level(g, "A", True)
+            if scenario == "multiple-relays":
+                g.relays["B"].on()
+            if scenario in ("multiple-relays", "multiple-contactors"):
+                level(g, "B", True)
+            before = list(events)
+            ok = g.reconcile_hardware_state()
+            if scenario == "agreement":
+                valid = ok and st.system_state == SystemState.READY and st.active_slot == "A" and st.slots["A"].verification_state == VerificationState.VERIFIED_ON
+            else:
+                valid = not ok and st.system_state == SystemState.FAULT and all(st.slots[s].verification_state not in positive for s in "ABCD")
+            check(f"RECON F/G/H/I: {scenario}, no GPIO writes", valid and events == before)
+
+    with fixture(reconcile=False) as (g, st, clock, events):
+        first_b = True
+        def disrupt_b():
+            nonlocal first_b
+            if first_b:
+                first_b = False
+                clock.gap = 0.020
+                clock.at(clock.now + 0.005, lambda: setattr(clock, "gap", 0))
+                clock.at(clock.now + 0.010, lambda: level(g, "A", True))
+            return False
+        g.feedback_inputs["B"].signal = disrupt_b
+        check("RECON: discard earlier A=OFF after incomplete B, never reuse stale evidence", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and st.slots["A"].verification_state == VerificationState.MISMATCH_OFF_ON and not events)
+
+    with fixture(reconcile=False) as (g, st, clock, events):
+        clock.at(clock.now + 0.075, lambda: level(g, "A", True))
+        check("RECON: veto A feedback reasserted while later channels were sampled", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and st.slots["A"].verification_state == VerificationState.MISMATCH_OFF_ON and not events)
+
+    with fixture(reconcile=False) as (g, st, clock, events):
+        # Every complete read is stable, but the bank cannot fit before this
+        # same deadline; no channel gets its own fresh 2-second allowance.
+        clock.at(clock.now + limit - 0.025, lambda: setattr(clock, "gap", 0))
+        clock.gap = 0.020
+        start = clock.now
+        check("RECON: recovery too late for a full fresh pass must not report READY", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and clock.now - start <= limit + 0.022 and all(st.slots[s].verification_state not in positive for s in "ABCD") and not events)
+
+
+def reconciliation_lock_case():
+    with fixture(reconcile=False) as (g, st, clock, events):
+        entered, release, competing, completed = (threading.Event() for _ in range(4))
+        results, owned = {}, []
+        once = True
+        def feedback():
+            nonlocal once
+            if once:
+                once = False
+                owned.append(g._lock._is_owned())
+                entered.set()
+                assert release.wait(5), "test barrier watchdog, not a firmware timeout"
+            return False
+        g.feedback_inputs["A"].signal = feedback
+        def reconcile():
+            results["reconcile"] = g.reconcile_hardware_state()
+        def transition():
+            competing.set()
+            results["transition"] = g.transition_slot("B")
+            completed.set()
+        reader = threading.Thread(target=reconcile, daemon=True)
+        contender = threading.Thread(target=transition, daemon=True)
+        reader.start()
+        try:
+            assert entered.wait(5), "reconciliation thread must reach the barrier"
+            acquired = g._lock.acquire(blocking=False)
+            if acquired:
+                g._lock.release()
+            contender.start()
+            assert competing.wait(5), "transition contender must start"
+            check("RECON K: another thread cannot acquire GPIO lock or MAKE during qualification", not acquired and owned == [True] and not completed.is_set() and not events)
+            clock.gap = 0.020  # Reconciliation must fail before the contender can run.
+        finally:
+            release.set()
+            reader.join(5)
+            if contender.ident is not None:
+                contender.join(5)
+        check("RECON K/N: queued transition refuses MAKE after reconciliation failure", not reader.is_alive() and not contender.is_alive() and results == {"reconcile": False, "transition": False} and st.system_state == SystemState.FAULT and not events and not any(r.is_active for r in g.relays.values()))
+
+
 def real_clock_noise():
     # Poll a time-defined input waveform, NOT a Python thread pretending a 5ms
     # sleep always schedules on time. Descheduling must fail closed, not alias.
@@ -288,6 +434,8 @@ if __name__ == "__main__":
     legacy_assertions()
     positive_qualification()
     transition_cases()
+    reconciliation_cases()
+    reconciliation_lock_case()
     real_clock_noise()
     print(f"\n{sum(R)}/{len(R)} passed")
     sys.exit(0 if all(R) else 1)

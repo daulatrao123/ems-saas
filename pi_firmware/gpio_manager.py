@@ -235,6 +235,7 @@ class GPIOManager:
     def _read_feedback_raw(
         self,
         slot: str,
+        deadline: float | None = None,
     ) -> bool | None:
         """Qualify ON/OFF separately; None means changing, unavailable or unobserved.
 
@@ -253,10 +254,14 @@ class GPIOManager:
             # perf_counter is monotonic and measures the actual observation gap.
             start = previous = time.perf_counter()
             while True:
-                time.sleep(window / 50)
+                remaining = None if deadline is None else deadline - time.perf_counter()
+                if remaining is not None and remaining <= 0:
+                    return None
+                time.sleep(window / 50 if remaining is None else min(window / 50, remaining))
                 sample = btn.is_pressed
                 now = time.perf_counter()
-                if (not isinstance(sample, bool) or sample != first
+                if ((deadline is not None and now >= deadline)
+                        or not isinstance(sample, bool) or sample != first
                         or now - previous > window / 10):
                     return None
                 if now - start >= window:
@@ -326,6 +331,11 @@ class GPIOManager:
     # ============================================================
 
     def reconcile_hardware_state(self):
+        deadline = time.perf_counter() + FEEDBACK_TIMEOUT_MS / 1000.0
+        with self._lock:
+            return self._reconcile_hardware_state_locked(deadline)
+
+    def _reconcile_hardware_state_locked(self, deadline):
 
         if self.hardware_fault:
             logger.critical("Reconciliation refused: %s", self.hardware_fault)
@@ -341,62 +351,53 @@ class GPIOManager:
             "Starting strict hardware reconciliation."
         )
 
-        active_relays = []
-        active_feedbacks = []
-
-        # --------------------------------------------------------
-        # Read ALL channels.
-        # --------------------------------------------------------
-
+        enabled = [s for s in self.profile["slots"] if self._is_feedback_enabled(s)]
+        # Invalidate prior/persisted verification before collecting any evidence.
         for slot in self.profile["slots"]:
-
-            relay_on = bool(
-                self.relays[slot].is_active
+            self.state_manager.set_feedback(
+                slot, FeedbackState.PENDING if slot in enabled else FeedbackState.UNKNOWN
+            )
+            self.state_manager.set_verification(
+                slot, VerificationState.PENDING if slot in enabled else VerificationState.NOT_CONFIGURED
             )
 
-            self.state_manager.set_gpio_output(
-                slot,
-                (
-                    GpioOutputState.ON
-                    if relay_on
-                    else GpioOutputState.OFF
-                ),
-            )
+        snapshot = None
+        while time.perf_counter() < deadline:
+            # A failed pass contributes NO evidence to the next pass.
+            relay_states = {s: bool(self.relays[s].is_active) for s in self.profile["slots"]}
+            feedback_states = {}
+            for slot in enabled:
+                value = self._read_feedback_raw(slot, deadline=deadline)
+                if value is None:
+                    break
+                feedback_states[slot] = value
 
-            if relay_on:
-                active_relays.append(slot)
+            if len(feedback_states) == len(enabled) and time.perf_counter() < deadline:
+                try:
+                    # Veto evidence that changed while another channel was sampled.
+                    # These reads do not qualify anything by themselves.
+                    unchanged = all(bool(self.relays[s].is_active) == v for s, v in relay_states.items())
+                    unchanged = unchanged and all(self.feedback_inputs[s].is_pressed is v for s, v in feedback_states.items())
+                    if unchanged and time.perf_counter() < deadline:
+                        snapshot = relay_states, feedback_states
+                        break
+                except Exception as exc:
+                    logger.error("Unable to revalidate reconciliation snapshot: %s", exc)
 
-            if self._is_feedback_enabled(slot):
+            # Keep the existing 1ms sampling cadence even if an unavailable input
+            # returned immediately; this is not a new grace period or backoff.
+            remaining = deadline - time.perf_counter()
+            if remaining > 0:
+                time.sleep(min(FEEDBACK_DEBOUNCE_MS / 1000.0 / 50, remaining))
 
-                feedback_on = (
-                    self._read_feedback_raw(slot)
-                )
+        if snapshot is None:
+            logger.critical("Hardware reconciliation feedback deadline expired.")
+            self.state_manager.system_state = SystemState.FAULT
+            return False
 
-                if feedback_on is None:
-                    logger.critical("FAULT: Slot %s feedback is not stable/available.", slot)
-                    self.state_manager.set_feedback(slot, FeedbackState.PENDING)
-                    self.state_manager.set_verification(slot, VerificationState.PENDING)
-                    self.state_manager.system_state = SystemState.FAULT
-                    return False
-
-                self.state_manager.set_feedback(
-                    slot,
-                    (
-                        FeedbackState.ON
-                        if feedback_on
-                        else FeedbackState.OFF
-                    ),
-                )
-
-                if feedback_on:
-                    active_feedbacks.append(slot)
-
-            else:
-
-                self.state_manager.set_feedback(
-                    slot,
-                    FeedbackState.UNKNOWN,
-                )
+        relay_states, feedback_states = snapshot
+        active_relays = [s for s, on in relay_states.items() if on]
+        active_feedbacks = [s for s, on in feedback_states.items() if on]
 
         # --------------------------------------------------------
         # Interlock violation.
@@ -472,8 +473,17 @@ class GPIOManager:
                 return False
 
         # --------------------------------------------------------
-        # Determine state.
+        # Publish only a complete, consistent pass inside the overall deadline.
         # --------------------------------------------------------
+
+        if time.perf_counter() >= deadline:
+            self.state_manager.system_state = SystemState.FAULT
+            return False
+
+        for slot, relay_on in relay_states.items():
+            self.state_manager.set_gpio_output(slot, GpioOutputState.ON if relay_on else GpioOutputState.OFF)
+            if slot in feedback_states:
+                self.state_manager.set_feedback(slot, FeedbackState.ON if feedback_states[slot] else FeedbackState.OFF)
 
         if active_relays:
 
@@ -535,9 +545,14 @@ class GPIOManager:
                     ),
                 )
 
-        self.state_manager.system_state = (
-            SystemState.READY
-        )
+        if time.perf_counter() >= deadline:
+            for slot in enabled:
+                self.state_manager.set_feedback(slot, FeedbackState.PENDING)
+                self.state_manager.set_verification(slot, VerificationState.PENDING)
+            self.state_manager.system_state = SystemState.FAULT
+            return False
+
+        self.state_manager.system_state = SystemState.READY
 
         logger.info(
             "Hardware reconciliation complete."
