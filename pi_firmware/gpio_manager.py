@@ -235,28 +235,36 @@ class GPIOManager:
     def _read_feedback_raw(
         self,
         slot: str,
-    ) -> bool:
+    ) -> bool | None:
+        """Qualify ON/OFF separately; None means changing, unavailable or unobserved.
 
-        btn = self.feedback_inputs[slot]
-
-        # gpiozero `is_pressed` is a property (pin LOW with pull-up). Two reads FEEDBACK_DEBOUNCE_MS
-        # apart must agree so a bouncing contact never counts as a stable ON.
-        first = bool(
-            btn.is_pressed
-        )
-
-        time.sleep(
-            FEEDBACK_DEBOUNCE_MS / 1000.0
-        )
-
-        second = bool(
-            btn.is_pressed
-        )
-
-        pressed = first and second
-
-        # `is_pressed` already means logically active for the configured pull (see config).
-        return pressed
+        Poll throughout the existing stability window, not just its endpoints.
+        At the configured 50ms window this samples every 1ms; an observation gap
+        over 5ms invalidates the attempt instead of crediting scheduler downtime
+        as stable feedback. This is sampled qualification, not HIL certification.
+        """
+        window = FEEDBACK_DEBOUNCE_MS / 1000.0
+        try:
+            btn = self.feedback_inputs[slot]
+            first = btn.is_pressed
+            if not isinstance(first, bool):
+                logger.error("Slot %s feedback is not a boolean input.", slot)
+                return None
+            # perf_counter is monotonic and measures the actual observation gap.
+            start = previous = time.perf_counter()
+            while True:
+                time.sleep(window / 50)
+                sample = btn.is_pressed
+                now = time.perf_counter()
+                if (not isinstance(sample, bool) or sample != first
+                        or now - previous > window / 10):
+                    return None
+                if now - start >= window:
+                    return first
+                previous = now
+        except Exception as exc:
+            logger.error("Unable to qualify slot %s feedback: %s", slot, exc)
+            return None
 
     # ============================================================
     # VERIFICATION
@@ -272,6 +280,10 @@ class GPIOManager:
             return VerificationState.NOT_CONFIGURED
 
         is_on = self._read_feedback_raw(slot)
+
+        if is_on is None:
+            self.state_manager.set_feedback(slot, FeedbackState.PENDING)
+            return VerificationState.PENDING
 
         if expected_commanded == CommandedState.ON:
 
@@ -359,6 +371,13 @@ class GPIOManager:
                 feedback_on = (
                     self._read_feedback_raw(slot)
                 )
+
+                if feedback_on is None:
+                    logger.critical("FAULT: Slot %s feedback is not stable/available.", slot)
+                    self.state_manager.set_feedback(slot, FeedbackState.PENDING)
+                    self.state_manager.set_verification(slot, VerificationState.PENDING)
+                    self.state_manager.system_state = SystemState.FAULT
+                    return False
 
                 self.state_manager.set_feedback(
                     slot,
@@ -589,23 +608,9 @@ class GPIOManager:
                         if (
                             result
                             == VerificationState.VERIFIED_OFF
+                            and (time.monotonic() - start) * 1000 <= FEEDBACK_TIMEOUT_MS
                         ):
                             break
-
-                        if result == (
-                            VerificationState.MISMATCH_OFF_ON
-                        ):
-
-                            logger.critical(
-                                "Slot %s appears welded.",
-                                current_active,
-                            )
-
-                            self.state_manager.system_state = (
-                                SystemState.FAULT
-                            )
-
-                            return False
 
                         if (
                             time.monotonic() - start
@@ -614,6 +619,10 @@ class GPIOManager:
                             logger.critical(
                                 "Slot %s opening timeout.",
                                 current_active,
+                            )
+
+                            self.state_manager.set_verification(
+                                current_active, VerificationState.TIMEOUT, immediate=True
                             )
 
                             self.state_manager.system_state = (
@@ -627,6 +636,20 @@ class GPIOManager:
                 time.sleep(
                     INTERLOCK_DELAY_MS / 1000.0
                 )
+
+                # The earlier OFF result predates deadtime. Qualify again under
+                # the same transition lock, immediately before MAKE; no retries
+                # or further deadtime after this final veto.
+                if self._is_feedback_enabled(current_active):
+                    result = self.verify_slot(current_active, CommandedState.OFF)
+                    if result != VerificationState.VERIFIED_OFF:
+                        logger.critical("Pre-MAKE veto: slot %s feedback=%s.", current_active, result.value)
+                        self.relays[target_slot].off()
+                        self.state_manager.set_gpio_output(target_slot, GpioOutputState.OFF)
+                        self.state_manager.set_commanded(target_slot, CommandedState.OFF)
+                        self.state_manager.set_verification(current_active, result, immediate=True)
+                        self.state_manager.system_state = SystemState.FAULT
+                        return False
 
             # ----------------------------------------------------
             # MAKE
@@ -661,7 +684,7 @@ class GPIOManager:
 
                     if result == (
                         VerificationState.VERIFIED_ON
-                    ):
+                    ) and (time.monotonic() - start) * 1000 <= FEEDBACK_TIMEOUT_MS:
 
                         self.state_manager.active_slot = (
                             target_slot
@@ -789,7 +812,7 @@ class GPIOManager:
 
                 if result == (
                     VerificationState.VERIFIED_OFF
-                ):
+                ) and (time.monotonic() - start) * 1000 <= FEEDBACK_TIMEOUT_MS:
 
                     if (
                         self.state_manager.active_slot
@@ -804,27 +827,6 @@ class GPIOManager:
                     )
 
                     return True
-
-                if result == (
-                    VerificationState.MISMATCH_OFF_ON
-                ):
-
-                    logger.critical(
-                        "Slot %s welded or stuck ON.",
-                        target_slot,
-                    )
-
-                    self.state_manager.set_verification(
-                        target_slot,
-                        result,
-                        immediate=True,
-                    )
-
-                    self.state_manager.system_state = (
-                        SystemState.FAULT
-                    )
-
-                    return False
 
                 if (
                     time.monotonic() - start
@@ -890,6 +892,12 @@ class GPIOManager:
                                 slot,
                                 expected,
                             )
+
+                            if result == VerificationState.PENDING:
+                                logger.critical("Slot %s feedback cannot be qualified.", slot)
+                                self.state_manager.set_verification(slot, result, immediate=True)
+                                self.state_manager.system_state = SystemState.FAULT
+                                break
 
                             if (
                                 expected
