@@ -30,7 +30,7 @@ sha = lambda rel: hashlib.sha256(open(os.path.join(ROOT, rel), "rb").read()).hex
 check("18 GPIO/logger untouched by E4 (current blobs unchanged)", sha("pi_firmware/gpio_manager.py") == "fdd3f38ca366e44ba1aff690e69240d6c314b9b2f7fe4d5063d932db821f9136" and sha("pi_firmware/logger.py") == "8d62ae5ef5bff7a259b6612e3f7508b0585082f980d2a4a8df5c5060a036fffb")
 
 # ---------------------------------------------------------------- compiled helpers under node (real behaviour, not grep)
-out = "/tmp/e4_types_js"; subprocess.run(["npx", "--yes", "tsc", "src/components/ops/energy/types.ts", "--outDir", out, "--module", "commonjs", "--target", "es2020", "--skipLibCheck"], cwd=os.path.join(ROOT, "frontend"), check=True, capture_output=True)
+out = "/tmp/e4_types_js"; subprocess.run(["npx", "--yes", "--package=typescript@5.9.3", "tsc", "src/components/ops/energy/types.ts", "--outDir", out, "--module", "commonjs", "--target", "es2020", "--skipLibCheck"], cwd=os.path.join(ROOT, "frontend"), check=True)
 node = subprocess.run(["node", "-e", f"""const t=require('{out}/types.js');console.log(JSON.stringify({{
  p:t.sourceLabel('PHYSICAL'),a:t.sourceLabel('ADAPTIVE_ESTIMATE'),m:t.sourceLabel('MANUAL'),x:t.sourceLabel('MIXED'),u:t.sourceLabel('UNAVAILABLE'),n:t.sourceLabel(null),k:t.sourceLabel('weird'),
  z:t.fmtKwh(null),zero:t.fmtKwh(0),v:t.fmtKwh(12.345),tu:t.todayKwh({{status:'UNAVAILABLE',reason:'meter off'}}),tp:t.todayKwh({{today:{{kwh:1.5,days:1,status:'PHYSICAL'}}}}),tn:t.todayKwh({{today:{{kwh:null,days:0,status:'UNAVAILABLE'}}}}),
