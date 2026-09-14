@@ -5,13 +5,14 @@ import { AllocationTimeline } from "./AllocationTimeline";
 import { GenerationCard } from "./GenerationCard";
 import { CalculationMode, fmtKwh } from "./types";
 import { useEnergy } from "./useEnergy";
+import { EnergyReferences } from "./EnergyReferences";
 
-export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, children }: {
-  energy: ReturnType<typeof useEnergy>; readOnly: boolean; activeGenerationWing?: string; children: ReactNode;
+export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, children, societyId }: {
+  energy: ReturnType<typeof useEnergy>; readOnly: boolean; activeGenerationWing?: string; children: ReactNode; societyId: string;
 }) {
   const mode = en.summary?.calculation?.mode;
   const entries = en.entries.filter((r) => r.kind === "MANUAL_GENERATION" && r.source === "MANUAL");
-  return (
+  const content = (
     <div data-testid="energy-panel" className="space-y-3">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <label className="block text-xs text-gray-400">Energy Calculation Mode
@@ -43,4 +44,5 @@ export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, childr
       </section>}
     </div>
   );
+  return en.summary?.references ? <EnergyReferences key={en.summary.device_id} societyId={societyId} summary={en.summary} readOnly={readOnly} refresh={en.refresh}>{content}</EnergyReferences> : content;
 }

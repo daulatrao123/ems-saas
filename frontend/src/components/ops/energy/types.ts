@@ -1,3 +1,4 @@
+import { EnergyReferenceData } from "./referenceTypes";
 // E4 energy view types — mirror backend/energy_api/routes.py (/summary, /generation/monthly, /allocation) and /api/admin/pi-events.
 // Values are never coerced: null / UNAVAILABLE stays UNAVAILABLE (an OFF meter is NOT zero).
 export type Period = { kwh: number | null; days: number; status: "PHYSICAL" | "UNAVAILABLE" };
@@ -20,7 +21,7 @@ export type CalculationWing = { wing: WingCode; today: GenerationPoint & { requi
 export type Calculation = { mode: CalculationMode; version: number; operating_date: string; wings: Record<WingCode, CalculationWing> };
 export type ManualEntry = { id: number; wing: WingCode | null; operating_date: string; kind: string; value_kwh: number; source: string; reason: string; created_at: string };
 export type ManualEntryInput = { wing: WingCode; operating_date: string; kind: "MANUAL_GENERATION"; value_kwh: number; reason: string };
-export type EnergySummary = { device_id: string; as_of_operating_date: string; reset_day: number; reset_period: string; generation_meter: GenerationMeter; wings: Record<string, WingSummary>; calculation: Calculation };
+export type EnergySummary = { device_id: string; as_of_operating_date: string; reset_day: number; reset_period: string; generation_meter: GenerationMeter; wings: Record<string, WingSummary>; calculation: Calculation; references: EnergyReferenceData };
 export type MonthRow = { month: string; generation_kwh: number | null; source: string; completeness: "COMPLETE" | "PARTIAL" | "UNAVAILABLE"; physical_days: number; expected_days: number };
 export type MonthlyGeneration = { meter_id: "M1"; unit: string; months: number; as_of_operating_date: string; rows: MonthRow[]; source: string };
 export type WingAllocationConfig = { generation_attribution_enabled: boolean; manual_target_kwh: number | null };

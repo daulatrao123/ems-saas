@@ -76,7 +76,7 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
       {!device ? <div className={`${panel} p-8 text-center text-gray-500 font-mono text-sm`}>NO PI DEVICE REGISTERED FOR THIS SOCIETY</div> : (
         <>
           <div data-testid="ops-device-identity" className="text-[11px] text-gray-400 break-words">{device.name} · <span className="font-mono">{device.id}</span></div>
-          {societyId && <EnergyPanel energy={energy} readOnly={readOnly} activeGenerationWing={activeGenerationWing}>{renderWings()}</EnergyPanel>}
+          {societyId && <EnergyPanel societyId={societyId} energy={energy} readOnly={readOnly} activeGenerationWing={activeGenerationWing}>{renderWings()}</EnergyPanel>}
           <details data-testid="days-command-details" className="border border-[#1e2a3a]">
             <summary data-testid="days-command-details-toggle" className="p-3 text-xs text-gray-400 cursor-pointer">Days & command details</summary>
             {readOnly && renderDayControls()}

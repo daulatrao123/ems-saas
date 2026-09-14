@@ -1,6 +1,7 @@
 "use client";
 import { label } from "../DashboardHeader";
 import { GenerationTrend } from "./GenerationTrend";
+import { BillHistoryButton } from "./BillHistoryButton";
 import { AllocationConfig, CalculationMode, CalculationWing, WingCode, WingSummary, WING_METERS, fmtKwh, fmtPct, sourceLabel, sourceTone } from "./types";
 
 type Props = { code: WingCode; wing?: WingSummary; calculation?: CalculationWing; mode?: CalculationMode; allocation: AllocationConfig | null; activeGenerationWing?: string };
@@ -48,6 +49,7 @@ export function WingEnergyCard({ code: w, wing: candidate, calculation, mode, al
         <span data-testid={`energy-wing-health-${w}`} className="block">{meter ? meter.enabled ? meter.comm_status : "DISABLED" : "UNAVAILABLE"}</span>
         {meterReason && <span data-testid={`energy-wing-unavailable-${w}`} className="block break-words">{meterReason}</span>}
       </div>
+      <BillHistoryButton wing={w} />
     </div>
   );
 }

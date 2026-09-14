@@ -1,6 +1,7 @@
 "use client";
 import { label, panel } from "../DashboardHeader";
 import { MonthlyBars } from "./MonthlyBars";
+import { BillHistoryButton } from "./BillHistoryButton";
 import { GenerationMeter, MonthlyGeneration, fmtKw, fmtKwh, reasonOf, sourceLabel, sourceTone, todayKwh } from "./types";
 
 type Props = { meter: GenerationMeter; monthly: MonthlyGeneration | null; operatingDate: string; resetPeriod: string; activeGenerationWing?: string };
@@ -33,6 +34,7 @@ export function GenerationCard({ meter, monthly, operatingDate, resetPeriod, act
         <div className="flex flex-wrap items-center justify-between gap-2"><h3 id="monthly-generation-heading" data-testid="energy-monthly-heading" className={label}>Monthly Generation — Last 6 Months</h3><span data-testid="energy-monthly-legend" className="font-mono text-[10px] text-gray-500">Complete · Partial · N/A = no physical data</span></div>
         {monthly ? <MonthlyBars rows={monthly.rows} unit={monthly.unit} /> : <div data-testid="energy-monthly-unavailable" className="mt-2 font-mono text-[10px] text-gray-500">MONTHLY GENERATION UNAVAILABLE</div>}
       </div>
+      <div><BillHistoryButton /></div>
     </section>
   );
 }

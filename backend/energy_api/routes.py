@@ -1,6 +1,7 @@
 """Energy API (E2). Backend-authoritative config, read models derived from energy_daily. Prefix /api/energy.
 RBAC: super_admin (any society) / society_admin (own society) write; member read-only (own society)."""
 import math
+import calendar
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -8,6 +9,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from . import queries as Q
+from . import references as R
 from .ingest import DEFAULT_ALLOCATION, METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
 
 VALUE_TYPES = {"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64"}
@@ -77,7 +79,9 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
     def device(cur, sid, device_id, ensure_meters=True):
         did = require_uuid(device_id, "device_id")
         cur.execute("""SELECT d.id, d.energy_bus, d.energy_config_version,
-                              d.energy_calculation_mode, d.energy_calculation_version, COALESCE(s.reset_day, 15) AS reset_day
+                              d.energy_calculation_mode, d.energy_calculation_version,
+                              d.grid_export_enabled, d.grid_export_limit_kwh, d.grid_reference_version,
+                              COALESCE(s.reset_day, 15) AS reset_day
                        FROM pi_devices d JOIN societies s ON s.id=d.society_id WHERE d.id=%s AND d.society_id=%s""", (did, sid))
         row = cur.fetchone()
         if not row:
@@ -295,7 +299,8 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                                 "source": "PHYSICAL" if gen_total and gen_total["today"]["kwh"] is not None else "UNAVAILABLE"}
             return {"device_id": did, "as_of_operating_date": today.isoformat(), "reset_day": dev["reset_day"], "reset_period": Q.reset_period_for(today, dev["reset_day"]),
                     "generation_meter": generation_meter, "wings": wings,
-                    "calculation": Q.calculation_view(cur, did, dev["energy_calculation_mode"], dev["energy_calculation_version"], meters, today)}
+                    "calculation": Q.calculation_view(cur, did, dev["energy_calculation_mode"], dev["energy_calculation_version"], meters, today),
+                    "references": R.overview(cur, dev, meters, today)}
         return run(fn)
 
     # ---------------------------------------------------------------- history / graph / monthly
@@ -386,30 +391,70 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                 "months": [{"month": r["bill_month"].strftime("%Y-%m"), "consumption_kwh": float(r["consumption_kwh"]), "days": r["days"], "note": r["note"]} for r in rows], **stats}
 
     @router.get("/bills")
-    def get_bills(society_id: str, device_id: str, wing: str, user: dict = Depends(get_current_user)):
+    def get_bills(society_id: str, device_id: str, wing: str, end_month: str = None, user: dict = Depends(get_current_user)):
         sid = access(user, society_id); w = _wing(wing)
-        return run(lambda cur: _bills(cur, str(device(cur, sid, device_id)["id"]), w))
+        end = _bill_month(end_month) if end_month else None
+        return run(lambda cur: R.bill_history(cur, str(device(cur, sid, device_id, ensure_meters=False)["id"]), w, datetime.now(timezone.utc).date(), end))
 
     @router.put("/bills")
     def put_bills(data: dict, user: dict = Depends(get_current_user)):
         sid = access(user, data.get("society_id"), write=True); w = _wing(data.get("wing"))
         months = data.get("months")
-        if not isinstance(months, list) or not 1 <= len(months) <= 6: raise HTTPException(400, "months must be a list of 1..6 entries")
-        clean = {}
+        if not isinstance(months, list) or not 0 <= len(months) <= 12: raise HTTPException(400, "months must be a list of up to 12 entries")
+        end = _bill_month(data["end_month"]) if data.get("end_month") else None
+        clean, seen = {}, set()
         for e in months:
-            try: bm = datetime.strptime(str(e.get("month")), "%Y-%m").date()
-            except (TypeError, ValueError, AttributeError): raise HTTPException(400, "month must be YYYY-MM")
-            days = e.get("days")
-            if days is not None and (not isinstance(days, int) or not 1 <= days <= 62): raise HTTPException(400, "days must be 1..62")
-            if bm in clean: raise HTTPException(400, f"duplicate month {e.get('month')}")
-            clean[bm] = (_num(e.get("consumption_kwh"), "consumption_kwh", 0, 10_000_000), days, (str(e.get("note"))[:200] if e.get("note") else None))
+            if not isinstance(e, dict): raise HTTPException(400, "each month must be an object")
+            bm = _bill_month(e.get("month"))
+            if bm in seen: raise HTTPException(400, f"duplicate month {e.get('month')}")
+            seen.add(bm)
+            if end and not R.month_shift(end, -11) <= bm <= end: raise HTTPException(400, "month outside selected 12-month window")
+            val = e.get("consumption_kwh")
+            if val is None or isinstance(val, str) and not val.strip(): continue  # omitted, not deleted or zeroed
+            if isinstance(val, bool): raise HTTPException(400, "consumption_kwh must be numeric, not boolean")
+            days = calendar.monthrange(bm.year, bm.month)[1]
+            if e.get("days") is not None and (type(e["days"]) is not int or e["days"] != days): raise HTTPException(400, "days must match the actual calendar month")
+            clean[bm] = (_num(val, "consumption_kwh", 0, 10_000_000), days, str(e["note"])[:200] if e.get("note") else None)
         def fn(cur):
-            did = str(device(cur, sid, data.get("device_id"))["id"])
-            cur.execute("DELETE FROM energy_bill_history WHERE device_id=%s AND wing=%s", (did, w))
+            did = str(device(cur, sid, data.get("device_id"), ensure_meters=False)["id"])
+            cur.execute("SELECT id FROM pi_devices WHERE id=%s FOR UPDATE", (did,))
+            changes = []
             for bm, (kwh, days, note) in clean.items():
-                cur.execute("INSERT INTO energy_bill_history (device_id, wing, bill_month, consumption_kwh, days, note, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s)", (did, w, bm, kwh, days, note, user.get("id")))
-            log_audit(cur, user, sid, "ENERGY_BILL_HISTORY", {"device_id": did, "wing": w, "months": [m.strftime("%Y-%m") for m in clean]})
-            return {"success": True, **_bills(cur, did, w)}
+                cur.execute("SELECT consumption_kwh FROM energy_bill_history WHERE device_id=%s AND wing=%s AND bill_month=%s", (did, w, bm))
+                old = cur.fetchone()
+                cur.execute("""INSERT INTO energy_bill_history (device_id, wing, bill_month, consumption_kwh, days, note, created_by, updated_by)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (device_id, wing, bill_month) DO UPDATE SET consumption_kwh=EXCLUDED.consumption_kwh,
+                    days=EXCLUDED.days, note=COALESCE(EXCLUDED.note, energy_bill_history.note), updated_by=EXCLUDED.updated_by, updated_at=NOW()""",
+                    (did, w, bm, kwh, days, note, user.get("id"), user.get("id")))
+                changes.append({"month": bm.strftime("%Y-%m"), "previous_kwh": float(old["consumption_kwh"]) if old else None, "kwh": kwh})
+            if changes: log_audit(cur, user, sid, "ENERGY_BILL_HISTORY", {"device_id": did, "wing": w, "semantics": "MONTH_UPSERT", "changes": changes})
+            return {"success": True, "updated_months": len(clean), **R.bill_history(cur, did, w, datetime.now(timezone.utc).date(), end)}
+        return run(fn, write=True)
+
+    @router.put("/grid-reference")
+    def put_grid_reference(data: dict, user: dict = Depends(get_current_user)):
+        sid = access(user, data.get("society_id"), write=True)
+        enabled, expected = data.get("enabled"), data.get("expected_version")
+        if type(enabled) is not bool: raise HTTPException(400, "enabled must be true or false")
+        if type(expected) is not int or expected < 0: raise HTTPException(400, "expected_version must be a non-negative integer")
+        raw = data.get("limit_kwh_day")
+        if isinstance(raw, bool): raise HTTPException(400, "limit_kwh_day must be numeric")
+        limit = _num(raw, "limit_kwh_day", 0, 10_000_000) if raw is not None else None
+        if enabled and limit is None: raise HTTPException(400, "limit_kwh_day is required when enabled")
+        def fn(cur):
+            did = str(device(cur, sid, data.get("device_id"), ensure_meters=False)["id"])
+            cur.execute("SELECT grid_export_enabled, grid_export_limit_kwh, grid_reference_version FROM pi_devices WHERE id=%s FOR UPDATE", (did,))
+            old = cur.fetchone()
+            if old["grid_reference_version"] != expected: raise HTTPException(409, "Grid reference changed; refresh before saving")
+            if old["grid_export_enabled"] != enabled or (float(old["grid_export_limit_kwh"]) if old["grid_export_limit_kwh"] is not None else None) != limit:
+                cur.execute("""UPDATE pi_devices SET grid_export_enabled=%s, grid_export_limit_kwh=%s,
+                    grid_reference_version=grid_reference_version+1 WHERE id=%s RETURNING grid_reference_version""", (enabled, limit, did))
+                expected_new = cur.fetchone()["grid_reference_version"]
+                log_audit(cur, user, sid, "ENERGY_GRID_REFERENCE", {"device_id": did, "enabled": enabled, "limit_kwh_day": limit, "version": expected_new,
+                    "previous_enabled": old["grid_export_enabled"], "previous_limit_kwh_day": float(old["grid_export_limit_kwh"]) if old["grid_export_limit_kwh"] is not None else None})
+            else: expected_new = expected
+            return {"success": True, "device_id": did, "enabled": enabled, "limit_kwh_day": limit, "version": expected_new}
         return run(fn, write=True)
 
     @router.get("/targets")
@@ -474,6 +519,16 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
 
 
 METER_WING_INV = {v: k for k, v in METER_WING.items() if v}
+
+
+def _bill_month(value):
+    try:
+        month = datetime.strptime(str(value), "%Y-%m").date()
+        if month.strftime("%Y-%m") != value or month > datetime.now(timezone.utc).date().replace(day=1) or month.year < 1971:
+            raise ValueError()
+        return month
+    except (ValueError, TypeError):
+        raise HTTPException(400, "month must be YYYY-MM, from 1971 through the current month")
 
 
 def _target_row(r):
