@@ -1,7 +1,9 @@
 """E4 energy UI tests: (1) structural checks on the frontend energy components, (2) compiled TypeScript helpers executed under
 node (source labels / never-zero formatting), (3) live-backend contract the UI consumes, seeding a society the UI can be opened on.
-Logins: 3 (limit 5/min). Prints ENERGY_E4_SOCIETY=<id> for browser verification."""
+Logins: 2 (E2 + E4 share the 5/min budget). Prints ENERGY_E4_SOCIETY=<id> for browser verification."""
 import os, sys, re, json, uuid, hashlib, subprocess, requests
+import bcrypt, psycopg, secrets
+from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 FE = os.path.join(ROOT, "frontend/src/components/ops")
@@ -48,10 +50,20 @@ def login(e, p):
     s = requests.Session(); r = s.post(f"{B}/api/auth/login", json={"email": e, "password": p}, headers={"Origin": O}); assert r.status_code == 200, r.text
     for ck in s.cookies: ck.secure = False
     s.headers.update({"Origin": O, "X-CSRF-Token": s.cookies.get("ems_csrf")}); return s
-tag = uuid.uuid4().hex[:6]; sa = login("admin@ems.com", os.environ.get("EMS_BOOTSTRAP_PASSWORD", "Boot#Pass123"))
-sid = sa.post(f"{B}/api/super-admin/societies", json={"name": f"E4-UI-{tag}", "reset_day": 15}).json()["society_id"]
-u = sa.post(f"{B}/api/super-admin/users", json={"society_id": sid, "role": "society_admin", "email": f"e4a-{tag}@t.test", "name": "A"}).json(); adm = login(u["email"], u["temporary_password"])
-mu = sa.post(f"{B}/api/super-admin/users", json={"society_id": sid, "role": "member", "email": f"e4m-{tag}@t.test", "name": "M"}).json(); mem = login(mu["email"], mu["temporary_password"])
+# Provisioning is covered by T9: seed only E4's tenant/users, not sessions or energy data.
+# Both roles still use real password login, cookie issuance, CSRF and live API authorization.
+load_dotenv(os.path.join(ROOT, "backend/.env"))
+tag = uuid.uuid4().hex[:6]
+u = {"email": f"e4a-{tag}@t.test", "name": "A", "role": "society_admin", "temporary_password": secrets.token_urlsafe(16)}
+mu = {"email": f"e4m-{tag}@t.test", "name": "M", "role": "member", "temporary_password": secrets.token_urlsafe(16)}
+with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+    sid = conn.execute("INSERT INTO societies (name, location, plan, status, society_code, config_version, reset_day) VALUES (%s, '', 'Basic', 'active', %s, 1, 15) RETURNING id",
+                       (f"E4-UI-{tag}", f"E4-{tag}")).fetchone()[0]
+    for fixture in (u, mu):
+        conn.execute("INSERT INTO users (email, name, role, society_id, password) VALUES (%s, %s, %s, %s, %s)",
+                     (fixture["email"], fixture["name"], fixture["role"], sid, bcrypt.hashpw(fixture["temporary_password"].encode(), bcrypt.gensalt()).decode()))
+adm = login(u["email"], u["temporary_password"])
+mem = login(mu["email"], mu["temporary_password"])
 reg = adm.post(f"{B}/api/admin/devices/register", json={"name": f"e4-{tag}"}).json(); dev, key = reg["device_id"], reg["api_key"]
 Q = {"society_id": sid, "device_id": dev}; body = lambda **k: {"society_id": sid, "device_id": dev, **k}
 VMAP = {"name": "TEST", "verified": True, "registers": {"energy_total_kwh": {"address": 342, "function": 4, "type": "float32", "word_order": "big", "scale": 1.0, "unit": "kWh"}}}
