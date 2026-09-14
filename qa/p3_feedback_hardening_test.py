@@ -134,20 +134,11 @@ def fixture(installed=True, enabled=True, real_clock=False, reconcile=True):
             if reconcile:
                 ok = g.reconcile_hardware_state()
                 if real_clock:
-                    # Unrestricted scheduling cannot guarantee startup success.
-                    # A refusal must remain fail-closed; noise assertions still run.
-                    check("REAL-CLOCK startup: READY or fail-closed deadline", (
-                        ok and state.system_state == SystemState.READY
-                    ) or (
-                        not ok and state.system_state == SystemState.FAULT
-                        and not any(r.is_active for r in g.relays.values())
-                        and all(state.slots[s].verification_state == VerificationState.PENDING for s in "ABCD")
-                        and not events
-                    ))
-                else:
-                    assert ok, "clean fixture must reconcile"
-                if ok:
-                    state.system_state = SystemState.EXECUTING  # Same command gate as EMSController.
+                    check("REAL-CLOCK clean startup: reconciliation succeeds and READY",
+                          ok is True and state.system_state == SystemState.READY)
+                assert ok is True, "clean fixture must reconcile"
+                assert state.system_state == SystemState.READY, "clean fixture must reach READY"
+                state.system_state = SystemState.EXECUTING  # Same command gate as EMSController.
             yield g, state, clock, events
         finally:
             g.stop()
