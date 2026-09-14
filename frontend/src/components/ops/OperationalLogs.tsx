@@ -28,21 +28,21 @@ export function OperationalLogs({ commands, events }: { commands: CommandRow[]; 
   const lvTone = { INFO: "text-emerald-400", WARN: "text-amber-300", ERROR: "text-red-400" };
   return (
     <section data-testid="operational-logs" className={`${panel} p-4`}>
-      <div className="flex items-center justify-between"><div className={label}>Operational Logs · newest first</div><span className="font-mono text-[10px] text-gray-500">{Math.min(limit, lines.length)} / {lines.length} loaded (bounded: 25 commands, 50 Pi events)</span></div>
+      <div className="flex flex-wrap items-center justify-between gap-2"><div data-testid="operational-logs-heading" className={label}>Operational Logs · newest first</div><span data-testid="operational-logs-count" className="font-mono text-[10px] text-gray-500">{Math.min(limit, lines.length)} / {lines.length} loaded (bounded: 25 commands, 50 Pi events)</span></div>
       {lines.length === 0 ? <div className="mt-3 text-sm text-gray-500">No events recorded for this device.</div> : (
-        <table className="mt-3 w-full font-mono text-[11px]">
-          <thead className="text-left text-[10px] uppercase tracking-wide text-gray-500"><tr><th className="py-1 pr-3 w-40">Time</th><th className="py-1 pr-3 w-14">Level</th><th className="py-1 pr-3 w-56">Event</th><th className="py-1">Details</th></tr></thead>
-          <tbody>
+        <div className="mt-3 w-full font-mono text-[11px]">
+          <div aria-hidden="true" className="hidden lg:grid lg:grid-cols-[160px_56px_224px_minmax(0,1fr)] gap-3 py-1 text-[10px] uppercase text-gray-500"><span>Time</span><span>Level</span><span>Event</span><span>Details</span></div>
+          <ol>
             {lines.slice(0, limit).map((l) => (
-              <tr key={l.key} data-testid="log-row" className="border-t border-[#1e2a3a] align-top">
-                <td className="py-1.5 pr-3 text-gray-400 whitespace-nowrap">{fmtDateTime(l.ts)}</td>
-                <td className={`py-1.5 pr-3 font-bold ${lvTone[l.level]}`}>{l.level}</td>
-                <td className={`py-1.5 pr-3 ${l.event.startsWith("COMMAND_") ? statusTone(l.event.replace("COMMAND_", "").toLowerCase()) : "text-gray-200"}`}>{l.event}</td>
-                <td className="py-1.5 text-gray-300 break-words">{l.details}</td>
-              </tr>
+              <li key={l.key} data-testid={`log-row-${l.key}`} className="grid grid-cols-[auto_minmax(0,1fr)] lg:grid-cols-[160px_56px_224px_minmax(0,1fr)] gap-x-3 gap-y-1 border-t border-[#1e2a3a] py-2 [overflow-wrap:anywhere]">
+                <span data-testid={`log-time-${l.key}`} className="col-span-2 lg:col-span-1 text-gray-400">{fmtDateTime(l.ts)}</span>
+                <span data-testid={`log-level-${l.key}`} className={`font-bold ${lvTone[l.level]}`}>{l.level}</span>
+                <span data-testid={`log-event-${l.key}`} className={l.event.startsWith("COMMAND_") ? statusTone(l.event.replace("COMMAND_", "").toLowerCase()) : "text-gray-200"}>{l.event}</span>
+                <span data-testid={`log-details-${l.key}`} className="col-span-2 lg:col-span-1 text-gray-300">{l.details}</span>
+              </li>
             ))}
-          </tbody>
-        </table>
+          </ol>
+        </div>
       )}
       {lines.length > limit && <button data-testid="logs-more" onClick={() => setLimit(limit + 20)} className={`${btn} ${tone.gray} mt-3`}>SHOW MORE</button>}
     </section>

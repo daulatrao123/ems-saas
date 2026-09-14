@@ -28,15 +28,15 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
     setIssued(null); setReveal(false); notify("Provisioning package downloaded successfully. The previous API key is now invalid.", true); onChanged();
   });
   const revoke = () => run("revoke", async () => { await api.post(`/api/super-admin/devices/${d.id}/credentials/revoke`, { reason: "super_admin_revoke" }); setIssued(null); notify("Device credential revoked — the Pi can no longer authenticate.", true); onChanged(); });
-  const setFeedback = (installed: boolean) => run("feedback", async () => { await api.post(`/api/super-admin/devices/${d.id}/feedback-hardware`, { installed }); notify(`Feedback hardware ${installed ? "ON" : "OFF"}`, true); onChanged(); });
+  const setFeedback = (installed: boolean) => run("feedback", async () => { await api.post(`/api/super-admin/devices/${d.id}/feedback-hardware`, { installed }); notify(`Feedback hardware ${installed ? "ON" : "OFF"}`, true); onChanged(); window.dispatchEvent(new CustomEvent("ems-device-metadata-changed", { detail: { societyId: sid } })); });
   const cred = d.credential_state === "active" ? "ACTIVE" : "NONE / REVOKED";
   return (
-    <article data-testid={`prov-device-${d.id}`} className={`${panel} p-4`}>
+    <article data-testid={`prov-device-${d.id}`} className={`${panel} p-4 min-w-0 [overflow-wrap:anywhere]`}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div><div className="text-base font-bold text-white">{d.name}</div><div className="font-mono text-[11px] text-gray-500">{d.hardware_profile} · society #{sid} · {d.status}</div></div>
         <span data-testid={`prov-online-${d.id}`} className={`flex items-center gap-2 font-mono text-xs font-bold ${d.online ? "text-emerald-400" : "text-red-400"}`}><Dot on={d.online} />{d.online ? "ONLINE" : "OFFLINE"} <span className="text-gray-500 font-normal">· last sync {ago(d.last_sync)}</span></span>
       </div>
-      <dl className="mt-3 grid grid-cols-[130px_1fr] gap-y-1.5 font-mono text-[11px]">
+      <dl className="mt-3 grid grid-cols-1 sm:grid-cols-[130px_minmax(0,1fr)] gap-y-1.5 font-mono text-[11px]">
         <dt className="text-gray-500">DEVICE ID</dt>
         <dd className="flex items-center gap-2 min-w-0"><span data-testid={`prov-device-id-${d.id}`} className="truncate text-gray-100">{d.id}</span><button data-testid={`prov-copy-id-${d.id}`} onClick={() => copy(d.id)} className={`${btn} ${tone.gray} py-0.5`}>COPY</button></dd>
         <dt className="text-gray-500">API KEY</dt>
@@ -49,11 +49,11 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
         </dd>
         <Field k="KEY ID" v={issued?.key_id || d.key_id || "—"} testId={`prov-key-id-${d.id}`} />
         <Field k="CREDENTIAL" v={cred} tone={cred === "ACTIVE" ? "text-emerald-300" : "text-red-400"} testId={`prov-cred-${d.id}`} />
-        <Field k="FIRMWARE" v={d.firmware_version || "N/A"} />
-        <Field k="CONFIG / OTA" v={`${d.config_state || "—"} / ${d.ota_state || "—"}`} />
-        <Field k="STORAGE" v={d.storage_state || "UNKNOWN"} />
+        <Field k="FIRMWARE" v={d.firmware_version || "N/A"} testId={`prov-firmware-${d.id}`} />
+        <Field k="CONFIG / OTA" v={`${d.config_state || "—"} / ${d.ota_state || "—"}`} testId={`prov-config-ota-${d.id}`} />
+        <Field k="STORAGE" v={d.storage_state || "UNKNOWN"} testId={`prov-storage-${d.id}`} />
         <dt className="text-gray-500">FEEDBACK HW</dt>
-        <dd className="flex items-center gap-2">
+        <dd className="flex flex-wrap items-center gap-2">
           <span data-testid={`prov-feedback-${d.id}`} className={d.feedback_hardware_installed ? "text-emerald-300" : "text-gray-400"}>{d.feedback_hardware_installed ? "ON — physically installed" : "OFF — not installed"}</span>
           <button data-testid={`prov-feedback-toggle-${d.id}`} disabled={busy !== null} onClick={() => setFeedback(!d.feedback_hardware_installed)} className={`${btn} ${d.feedback_hardware_installed ? tone.gray : tone.cyan} py-0.5`}>{d.feedback_hardware_installed ? "SET OFF" : "SET ON"}</button>
         </dd>
@@ -85,8 +85,8 @@ export function ProvisioningCenter({ societyId }: { societyId: string }) {
     <section data-testid="provisioning-center" className={`${panel} p-4 space-y-3`}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div><div className={label}>Pi Provisioning Center</div><div className="text-[11px] text-gray-500">Register → download installer ZIP → copy to Pi → <span className="font-mono">sudo ./install.sh</span> → ONLINE after first authenticated sync.</div></div>
-        <div className="flex items-center gap-2">
-          <input data-testid="prov-register-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="New device name" className={`${input} w-52`} />
+        <div className="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
+          <input data-testid="prov-register-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="New device name" className={`${input} w-52 min-w-0 max-w-full`} />
           <button data-testid="prov-register-submit" disabled={busy || !name.trim()} onClick={register} className={`${btn} ${tone.amber}`}>REGISTER DEVICE</button>
         </div>
       </div>

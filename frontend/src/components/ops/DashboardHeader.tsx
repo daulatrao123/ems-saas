@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { Dashboard, Device, ago } from "./types";
+import { Dashboard, Device } from "./types";
 
 export const panel = "border border-[#1e2a3a] bg-[#0f1520]";
 export const label = "text-[10px] uppercase tracking-[0.14em] text-gray-500";
@@ -24,20 +24,19 @@ export function DashboardHeader({ dash, device, backHref, onRefresh, readOnly }:
       <div className="flex items-center gap-4 min-w-0">
         <Link href={backHref} data-testid="ops-back" className="text-[11px] font-bold text-gray-400 hover:text-white">← BACK</Link>
         <div className="min-w-0">
-          <h1 data-testid="ops-society-name" className="text-xl font-bold text-white leading-tight truncate">{s.name}</h1>
-          <div className="text-[11px] text-gray-500 font-mono truncate">
+          <h1 data-testid="ops-society-name" className="text-xl font-bold text-white leading-tight break-words">{s.name}</h1>
+          <div data-testid="ops-society-details" className="text-[11px] text-gray-500 font-mono break-words">
             {s.location || "—"} · {s.plan || "—"} · CODE {s.society_code || "—"}
             {s.status && s.status !== "active" && <span className="ml-2 text-red-400">{s.status}</span>}
             {readOnly && <span className="ml-2 text-amber-300">READ-ONLY</span>}
           </div>
         </div>
       </div>
-      <div className="flex items-center gap-5 font-mono text-xs">
+      <div className="flex flex-wrap items-center gap-3 font-mono text-xs">
         {device ? (
           <>
             <span data-testid="ops-online" className={`flex items-center gap-2 font-bold ${device.connected ? "text-emerald-400" : "text-red-400"}`}><Dot on={device.connected} />{device.connected ? "ONLINE" : "OFFLINE"}</span>
             <span data-testid="ops-firmware" className="text-gray-300">FW <b>{device.firmware_version || "N/A"}</b></span>
-            <span data-testid="ops-last-sync" className="text-gray-400">SYNC {ago(device.last_sync)}</span>
           </>
         ) : <span className="text-gray-500">NO DEVICE</span>}
         <button data-testid="ops-refresh" onClick={onRefresh} className={`${btn} ${tone.gray}`}>REFRESH</button>

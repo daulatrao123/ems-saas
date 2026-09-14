@@ -20,7 +20,9 @@ export type MonthlyGeneration = { meter_id: "M1"; unit: string; months: number; 
 export type WingAllocationConfig = { generation_attribution_enabled: boolean; manual_target_kwh: number | null };
 export type AllocationConfig = { enabled: boolean; sequence: string[]; tolerance_kwh: number; persistence_s: number; wings: Record<string, WingAllocationConfig> };
 
-export const WINGS = ["A", "B", "C", "D"];
+export const WING_METERS = { A: "M2", B: "M3", C: "M4", D: "M5" } as const;
+export type WingCode = keyof typeof WING_METERS;
+export const WINGS: WingCode[] = ["A", "B", "C", "D"];
 export const DEFAULT_MONTHS = 6;
 export const ALLOCATION_EVENT_PREFIX = "ENERGY_ALLOCATION_";
 
@@ -31,12 +33,12 @@ export const sourceTone = (s: string | null | undefined) => {
   const k = (s || "").toUpperCase();
   return k === "PHYSICAL" ? "text-emerald-300 border-emerald-500/40" : k === "MANUAL" ? "text-amber-300 border-amber-500/40" : k === "MIXED" || k === "ADAPTIVE_ESTIMATE" ? "text-cyan-300 border-cyan-500/40" : "text-gray-500 border-gray-700";
 };
-export const todayKwh = (m: Metric | null | undefined): number | null => (m && "today" in m ? m.today.kwh : null);
+export const todayKwh = (m: Metric | null | undefined): number | null => (m && "today" in m && m.today?.status === "PHYSICAL" && Number.isFinite(m.today.kwh) ? m.today.kwh : null);
 export const reasonOf = (m: Metric | null | undefined): string | null => (m && "reason" in m ? m.reason : null);
 // Formatting never substitutes zero for a missing value.
-export const fmtKwh = (v: number | null | undefined, digits = 2) => (v == null ? "UNAVAILABLE" : `${v.toFixed(digits)} kWh`);
-export const fmtKw = (v: number | null | undefined) => (v == null ? "—" : `${v.toFixed(2)} kW`);
-export const fmtPct = (v: number | null | undefined) => (v == null ? "—" : `${v.toFixed(1)}%`);
+export const fmtKwh = (v: number | null | undefined, digits = 2) => (v == null || !Number.isFinite(v) ? "UNAVAILABLE" : `${v.toFixed(digits)} kWh`);
+export const fmtKw = (v: number | null | undefined) => (v == null || !Number.isFinite(v) ? "—" : `${v.toFixed(2)} kW`);
+export const fmtPct = (v: number | null | undefined) => (v == null || !Number.isFinite(v) ? "—" : `${v.toFixed(1)}%`);
 export const isAllocationEvent = (level: string) => (level || "").toUpperCase().startsWith(ALLOCATION_EVENT_PREFIX);
 export const allocationEventKind = (level: string) => (level || "").toUpperCase().slice(ALLOCATION_EVENT_PREFIX.length) || "EVENT";
 export const eventTone = (kind: string) =>
