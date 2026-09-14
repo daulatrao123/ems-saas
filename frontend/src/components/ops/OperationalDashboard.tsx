@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { ReactNode, useState } from "react";
 import { useOperations } from "./useOperations";
 import { DashboardHeader, btn, panel, tone } from "./DashboardHeader";
 import { StatusStrip } from "./StatusStrip";
@@ -13,6 +13,8 @@ import { LastResponse } from "./LastResponse";
 import { OperationalLogs } from "./OperationalLogs";
 import { Confirm, ConfirmDialog } from "./ConfirmDialog";
 import { EnergyPanel } from "./energy/EnergyPanel";
+import { useEnergy } from "./energy/useEnergy";
+import { WINGS } from "./energy/types";
 import { SLOT_CODES } from "./types";
 
 // Society → Status → Slots A–D → Days → Controls → Last Response → LCD → Logs. Frontend only: same APIs,
@@ -21,20 +23,30 @@ import { SLOT_CODES } from "./types";
 export function OperationalDashboard({ societyId, readOnly, backHref }: { societyId: string | null; readOnly: boolean; backHref: string }) {
   const ops = useOperations(societyId);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
-  const [deviceIdx, setDeviceIdx] = useState(0);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  const devices = ops.dash?.devices || [];
+  const device = devices.find((d) => d.id === selectedDeviceId) || devices[0] || null;
+  const energy = useEnergy(societyId, device?.id || null);
   if (ops.loading && !ops.dash) return <div data-testid="ops-loading" className="p-10 text-center text-gray-500 font-mono text-sm">LOADING OPERATIONS…</div>;
   if (!ops.dash) return <div data-testid="ops-error" className={`${panel} m-6 p-6 text-red-400 font-mono text-sm`}>{ops.error || "Dashboard unavailable"}</div>;
-  const devices = ops.dash.devices; const device = devices[Math.min(deviceIdx, Math.max(0, devices.length - 1))] || null;
   const cmds = device ? ops.commands[device.id] || [] : [];
-  const lastRow = cmds[0] || null;
+  const lastRow = cmds.find((c) => !SLOT_CODES.includes(c.slot)) || null;
+  const last = ops.last?.device_id === device?.id ? ops.last : null;
   const lastFor = (code: string) => cmds.find((c) => c.slot === code) || undefined;
+  const renderWings = (inputs: Record<string, ReactNode> = {}) => device && (
+    <div data-testid="slot-grid" className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+      {WINGS.map((c) => <SlotCard key={`${device.id}:${c}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={ops.setSlotConfig} isPending={ops.isPending} readOnly={readOnly}
+        lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} wing={energy.summary?.wings?.[c]} allocation={energy.allocation}
+        activeGenerationWing={energy.summary?.generation_meter?.active_generation_wing} allotmentInput={inputs[c]} />)}
+    </div>
+  );
   return (
-    <div data-testid="operational-dashboard" className="space-y-3">
+    <div data-testid="operational-dashboard" className="space-y-3 min-w-0 [&_input]:min-w-0 [&_input]:max-w-full">
       <DashboardHeader dash={ops.dash} device={device} backHref={backHref} onRefresh={() => ops.refresh()} readOnly={readOnly} />
       {ops.error && <div data-testid="ops-inline-error" className="border border-red-500/40 bg-red-500/10 px-4 py-2 font-mono text-xs text-red-300">{ops.error}</div>}
       {devices.length > 1 && (
         <div data-testid="device-tabs" className="flex flex-wrap gap-1">
-          {devices.map((d, i) => <button key={d.id} data-testid={`device-tab-${d.id}`} onClick={() => setDeviceIdx(i)} className={`${btn} ${i === deviceIdx ? tone.cyan : tone.gray}`}>{d.name} <span className={d.connected ? "text-emerald-400" : "text-red-400"}>●</span></button>)}
+          {devices.map((d) => <button key={d.id} data-testid={`device-tab-${d.id}`} onClick={() => setSelectedDeviceId(d.id)} className={`${btn} ${d.id === device?.id ? tone.cyan : tone.gray}`}>{d.name} <span className={d.connected ? "text-emerald-400" : "text-red-400"}>●</span></button>)}
         </div>
       )}
       <StatusStrip device={device} resetDay={ops.dash.reset_day} />
@@ -51,27 +63,16 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
       )}
       {!device ? <div className={`${panel} p-8 text-center text-gray-500 font-mono text-sm`}>NO PI DEVICE REGISTERED FOR THIS SOCIETY</div> : (
         <>
-          <div className="grid gap-3 xl:grid-cols-[1fr_360px]">
-            <div>
-              <div className="mb-2 text-[10px] uppercase tracking-[0.14em] text-gray-500">Slots · {device.name} <span className="font-mono text-gray-600">{device.id}</span></div>
-              <div data-testid="slot-grid" className="grid gap-3 sm:grid-cols-2">
-                {SLOT_CODES.filter((c) => device.slots[c]).map((c) => <SlotCard key={c} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={ops.setSlotConfig} isPending={ops.isPending} readOnly={readOnly} lastCmd={lastFor(c)} />)}
-                {SLOT_CODES.every((c) => !device.slots[c]) && <div className={`${panel} p-6 text-gray-500 text-sm sm:col-span-2`}>No slots configured for this device yet.</div>}
-              </div>
-            </div>
-            <div className="space-y-3">
-              <LastResponse last={ops.last} row={lastRow} />
+          <div data-testid="ops-device-identity" className="text-[11px] text-gray-400 break-words">{device.name} · <span className="font-mono">{device.id}</span></div>
+          {readOnly && renderWings()}
+          {!readOnly && <UnitAllotment key={device.id} device={device} queue={ops.queue} isPending={ops.isPending} ask={setConfirm}>{renderWings}</UnitAllotment>}
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <LastResponse last={last && !SLOT_CODES.includes(last.slot) ? last : null} row={lastRow} />
               {!readOnly && <SystemControls deviceId={device.id} queue={ops.queue} isPending={ops.isPending} ask={setConfirm} />}
               {!readOnly && <ResetDayControl deviceId={device.id} current={ops.dash.reset_day} queue={ops.queue} isPending={ops.isPending} ask={setConfirm} />}
-            </div>
+              {!readOnly && <LcdControl deviceId={device.id} queue={ops.queue} isPending={ops.isPending} />}
           </div>
-          {!readOnly && (
-            <div className="grid gap-3 xl:grid-cols-2">
-              <UnitAllotment device={device} queue={ops.queue} isPending={ops.isPending} ask={setConfirm} />
-              <LcdControl deviceId={device.id} queue={ops.queue} isPending={ops.isPending} />
-            </div>
-          )}
-          {societyId && <EnergyPanel societyId={societyId} deviceId={device.id} />}
+          {societyId && <EnergyPanel energy={energy} />}
           <OperationalLogs commands={cmds} events={ops.events} />
         </>
       )}

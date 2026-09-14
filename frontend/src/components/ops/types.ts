@@ -1,12 +1,13 @@
 // physical_toggle = CONTACTOR FEEDBACK (Pi telemetry, historical name); toggle_input = PHYSICAL TOGGLE input (Pi telemetry);
 // disabled = LOGICAL slot enable (admin configuration). Three separate concepts — never derive one from another.
-export type Slot = { display_name: string; target_days: number; used_days: number; physical_toggle: string; toggle_input?: string; disabled: boolean; visible?: boolean };
+export type Slot = { display_name: string; target_days: number; used_days: number; physical_toggle: string; toggle_input?: string; disabled: boolean; visible?: boolean; feedback_enabled?: boolean };
 export type Telemetry = { cpu_temp: number | null; uptime_seconds: number | null; boot_count: number | null };
 export type Device = {
   id: string; name: string; connected: boolean; active_slot: string | null; slots: Record<string, Slot>;
   config_state?: string | null; config_error?: string | null; ota_state?: string | null; storage_state?: string | null;
   firmware_version?: string | null; last_sync?: string | null; telemetry?: Telemetry; hardware_fault?: string | null;
   storage_health?: StorageHealth | null; lcd?: { available?: boolean; error?: string | null; message_id?: number | null } | null;
+  feedback_hardware_installed?: boolean;
 };
 export type SocietyMeta = { name: string; location: string | null; plan: string | null; society_code: string | null; status: string | null };
 export type Dashboard = { society_id: number; society: SocietyMeta; reset_day: number; devices: Device[] };
@@ -16,9 +17,9 @@ export type CommandRow = {
   executing_at: string | null; hardware_verified_at: string | null; completed_at: string | null; acked_at: string | null; expires_at: string | null;
 };
 export type EventRow = { id: number; ts: string; level: string; msg: string };
-export type LastResponse =
+export type LastResponse = { device_id: string } & (
   | { kind: "queued"; command: string; slot: string; command_id: string; sequence_no: number; duplicate: boolean; at: string }
-  | { kind: "error"; command: string; slot: string; http: number | null; detail: string; at: string };
+  | { kind: "error"; command: string; slot: string; http: number | null; detail: string; at: string });
 
 export const SLOT_CODES = ["A", "B", "C", "D"];
 export const COMMAND_LABEL: Record<string, string> = {
