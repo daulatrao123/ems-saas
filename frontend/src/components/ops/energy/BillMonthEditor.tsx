@@ -31,7 +31,10 @@ export function BillMonthEditor({ societyId, deviceId, wing, endMonth, readOnly,
     if (!history || invalid || readOnly || submitting.current) return;
     submitting.current = true; setBusy(true); setError("");
     try {
-      const months = history.months.filter((m) => values[m.month]?.trim() !== "").map((m) => ({ month: m.month, consumption_kwh: Number(values[m.month]) }));
+      const months = history.months.filter((m) => {
+        const entered = values[m.month]?.trim();
+        return entered !== undefined && entered !== "" && Number(entered) !== m.consumption_kwh;
+      }).map((m) => ({ month: m.month, consumption_kwh: Number(values[m.month]) }));
       const { data } = await api.put("/api/energy/bills", { society_id: societyId, device_id: deviceId, wing, end_month: endMonth, months });
       if (alive.current) onSaved(data);
     } catch (e) { if (alive.current) setError(errorText(e).detail); }

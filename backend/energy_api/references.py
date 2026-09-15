@@ -67,8 +67,10 @@ def bill_history(cur, did, wing, today, end=None):
             "latest_history_end": Q.month_bounds(latest.year, latest.month)[1].isoformat() if latest else None}
 
 
-def wing_reference(cur, did, wing, today, meter_enabled):
-    history = bill_history(cur, did, wing, today)
+def wing_reference(cur, did, wing, today, meter_enabled, *, calendar_today):
+    # Historical bills follow the same UTC calendar as GET/PUT bills, even if
+    # the Pi's operating day is stale. Physical queries below still use today.
+    history = bill_history(cur, did, wing, calendar_today)
     effective = {"daily_kwh": history["reference_daily_kwh"], "source": history["source"], "operating_date": None}
     # A partial OPEN day is not a completed daily demand reference. Prefer a newer
     # CLOSED physical day only, under the existing per-meter enablement semantics.
@@ -125,9 +127,9 @@ def allocation_reference(generation, targets, enabled, limit):
             "status": status, "reason": reason}
 
 
-def overview(cur, dev, meters, today):
+def overview(cur, dev, meters, today, *, calendar_today):
     did = str(dev["id"])
-    wings = {w: wing_reference(cur, did, w, today, meters[mid]["enabled"]) for w, mid in zip(Q.WINGS, ("M2", "M3", "M4", "M5"))}
+    wings = {w: wing_reference(cur, did, w, today, meters[mid]["enabled"], calendar_today=calendar_today) for w, mid in zip(Q.WINGS, ("M2", "M3", "M4", "M5"))}
     history = [wings[w]["history"]["reference_daily_kwh"] for w in Q.WINGS]
     effective = [wings[w]["effective"]["daily_kwh"] for w in Q.WINGS]
     all_history, all_effective = all(v is not None for v in history), all(v is not None for v in effective)

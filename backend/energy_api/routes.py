@@ -268,7 +268,8 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         sid = access(user, society_id)
         def fn(cur):
             dev = device(cur, sid, device_id); did = str(dev["id"]); meters = meters_of(cur, did)
-            today = Q.device_today(cur, did, datetime.now(timezone.utc).date())
+            calendar_today = datetime.now(timezone.utc).date()
+            today = Q.device_today(cur, did, calendar_today)
             gen_on = bool(meters["M1"]["enabled"])
             wings = {}
             for w in WINGS:
@@ -300,7 +301,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             return {"device_id": did, "as_of_operating_date": today.isoformat(), "reset_day": dev["reset_day"], "reset_period": Q.reset_period_for(today, dev["reset_day"]),
                     "generation_meter": generation_meter, "wings": wings,
                     "calculation": Q.calculation_view(cur, did, dev["energy_calculation_mode"], dev["energy_calculation_version"], meters, today),
-                    "references": R.overview(cur, dev, meters, today)}
+                    "references": R.overview(cur, dev, meters, today, calendar_today=calendar_today)}
         return run(fn)
 
     # ---------------------------------------------------------------- history / graph / monthly
