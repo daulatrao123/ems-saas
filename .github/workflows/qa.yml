@@ -59,3 +59,60 @@ jobs:
       - name: Backend log on failure
         if: failure()
         run: tail -n 100 /tmp/backend.log || true
+
+  frontend-validation:
+    name: Frontend validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: frontend
+    env:
+      CI: 'true'
+      NEXT_TELEMETRY_DISABLED: '1'
+      # Next config requires a rewrite target; no backend runs in this job.
+      # This build-only artifact is not deployed.
+      EMS_BACKEND_URL: http://127.0.0.1:9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Record checked-out revision and toolchain
+        id: revision
+        run: |
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf 'Checked-out revision: `%s`\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          node --version
+          npm --version
+      - name: Install locked frontend dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Generate Next.js route types
+        run: ./node_modules/.bin/next typegen
+      - name: TypeScript check
+        run: ./node_modules/.bin/tsc --noEmit --incremental false
+      - name: Offline frontend regressions
+        run: |
+          node --test \
+            ../qa/bill_editor_changes.test.cjs \
+            ../qa/controller_health.test.cjs \
+            ../qa/generation_adjustment_date.test.cjs \
+            ../qa/manual_generation_policy.test.cjs \
+            ../qa/mode_consumption_comparison.test.cjs
+      - name: Production build
+        run: npm run build
+      - name: Verify final revision and tracked files
+        env:
+          CHECKED_OUT_SHA: ${{ steps.revision.outputs.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$CHECKED_OUT_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          printf 'Frontend validation passed for `%s`.\n' "$CHECKED_OUT_SHA" >> "$GITHUB_STEP_SUMMARY"
