@@ -110,12 +110,16 @@ function loadEnergyPanel() {
   const module = { exports: {} };
   const req = (id) => {
     if (id === "react/jsx-runtime") return makeJsxRuntime();
-    if (id === "react") return {};
+    if (id === "react") return { useState: (initial) => [initial, () => {}] };
     if (id === "../DashboardHeader") return { btn: "btn", input: "input", label: "label", panel: "panel", tone: { gray: "gray" } };
     if (id === "./AllocationTimeline") return { AllocationTimeline: (p) => ({ type: "AllocationTimeline", props: p }) };
     if (id === "./GenerationCard") return { GenerationCard: (p) => ({ type: "GenerationCard", props: p }) };
     if (id === "./EnergyReferences") return { EnergyReferences: (p) => p.children };
     if (id === "./SocietyEnergyComparison") return { SocietyEnergyComparison: (p) => ({ type: "SocietyEnergyComparison", props: p }) };
+    if (id === "./CalendarComparisonContext") return { CalendarComparisonContext: { Provider: (p) => p.children } };
+    if (id === "./useCalendarComparison") return { useCalendarComparison: () => ({ data: null, error: "", loading: false }) };
+    if (id === "./ComparisonPeriod") return { ComparisonPeriod: (p) => ({ type: "ComparisonPeriod", props: p }) };
+    if (id === "./CalendarSocietyComparison") return { CalendarSocietyComparison: (p) => ({ type: "CalendarSocietyComparison", props: p }) };
     if (id === "./useEnergy") return { useEnergy: () => ({}) };
     if (id === "./types") return { fmtKwh: (v) => (v == null ? "UNAVAILABLE" : `${Number(v).toFixed(2)} kWh`) };
     throw new Error(`Unexpected import: ${id}`);

@@ -16,9 +16,10 @@ export type GenerationMeter = {
   unattributed: Metric | null; active_generation_wing: string; attribution: { wing?: string | null; status?: string } | null; source: string;
 };
 export type CalculationMode = "AUTO" | "MANUAL";
-export type ComparisonPoint = { date: string; generated_kwh: number | null; consumed_kwh: number | null; generation_source: string; consumption_source: string; generation_minus_consumption_kwh: number | null };
+export type ComparisonPoint = { date: string; generated_kwh: number | null; consumed_kwh: number | null; generation_source: string; consumption_source: string; generation_minus_consumption_kwh: number | null; bill_month?: string | null; generation_reason?: string | null; consumption_reason?: string | null; balance_reason?: string | null; missing_consumption_wings?: string[] };
 export type ComparisonSeries = { today: ComparisonPoint; rows: ComparisonPoint[] };
 export type EnergyComparison = { device_id: string; mode: CalculationMode; version: number; operating_date: string; consumption_basis: string; wings: Record<WingCode, ComparisonSeries & { wing: WingCode }>; society: ComparisonSeries };
+export type CalendarComparison = Omit<EnergyComparison, "wings" | "society"> & { calendar_today: string; period: { kind: "CALENDAR_MONTH"; month: string; start: string; end: string; calendar_days: number }; wings: Record<WingCode, { wing: WingCode; rows: ComparisonPoint[] }>; society: { rows: ComparisonPoint[] } };
 export type GenerationPoint = { date: string; generated_kwh: number | null; generation_source: string };
 export type CalculationWing = { wing: WingCode; today: GenerationPoint & { required_kwh: number | null; target_achievement_percent: number | null; target_status: string }; generation_trend: GenerationPoint[] };
 export type Calculation = { mode: CalculationMode; version: number; operating_date: string; wings: Record<WingCode, CalculationWing> };

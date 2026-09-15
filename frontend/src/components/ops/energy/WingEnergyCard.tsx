@@ -1,7 +1,10 @@
 "use client";
+import { useContext } from "react";
 import { label } from "../DashboardHeader";
 import { BillHistoryButton } from "./BillHistoryButton";
 import { EnergyComparisonChart, signedKwh } from "./EnergyComparisonChart";
+import { CalendarComparisonContext } from "./CalendarComparisonContext";
+import { missingReason, monthLabel } from "./comparisonLabels";
 import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary, WING_METERS, fmtKwh, fmtPct, sourceLabel, sourceTone, todayKwh } from "./types";
 
 type Props = { code: WingCode; wing?: WingSummary; comparison?: ComparisonSeries; mode?: CalculationMode; allocation: AllocationConfig | null; activeGenerationWing?: string; excessEnabled: boolean };
@@ -11,6 +14,9 @@ export function WingEnergyCard({ code: w, wing: candidate, comparison, mode, all
   const meter = wing?.consumption_meter?.meter_id === WING_METERS[w] ? wing.consumption_meter : undefined;
   const gen = todayKwh(wing?.generation), source = gen === null ? "UNAVAILABLE" : "PHYSICAL";
   const data = comparison?.today;
+  const calendar = useContext(CalendarComparisonContext);
+  const rows = calendar?.month ? calendar.data?.wings[w]?.rows : comparison?.rows.slice(-7);
+  const reference = rows?.find((row) => row.consumption_source === "HISTORICAL");
   const cons = data?.consumed_kwh ?? null, delta = data?.generation_minus_consumption_kwh ?? null;
   const wingConfig = allocation?.wings?.[w], index = allocation?.sequence?.indexOf(w) ?? -1;
   const policy = !allocation ? "UNAVAILABLE" : allocation.enabled === false ? "DISABLED" : "ENABLED (CONFIGURATION)";
@@ -29,7 +35,11 @@ export function WingEnergyCard({ code: w, wing: candidate, comparison, mode, all
       <dt className="text-gray-500">ACTIVE GENERATION WING</dt><dd data-testid={`energy-wing-active-${w}`} className="text-gray-300">{activeGenerationWing === w ? `Wing ${w} · Pi feedback` : "—"}</dd>
     </dl>
     {progress != null && <div data-testid={`energy-wing-achievement-${w}`} role="meter" aria-label={`Wing ${w} reference target achievement`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(100, Math.max(0, progress))} aria-valuetext={`${progress}% of reference target`} className="h-2 bg-[#0a0e17]"><div className="h-full bg-emerald-400" style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} /></div>}
-    {mode && comparison && <EnergyComparisonChart scope={w} rows={comparison.rows.slice(-7)} mode={mode} excessEnabled={excessEnabled} compact />}
+    <div data-testid={`energy-wing-display-date-${w}`} className="text-[10px] text-gray-500">Operational values: {data?.date || calendar?.operatingDate || "UNAVAILABLE"}</div>
+    {mode === "MANUAL" && <div data-testid={`energy-wing-bill-reference-${w}`} className="text-xs text-amber-200">{calendar?.month ? `${monthLabel(calendar.month)} daily table: ` : "Daily table: "}{reference ? `${fmtKwh(reference.consumed_kwh)} / day · bill ${reference.bill_month || reference.date.slice(0, 7)}` : calendar?.loading ? "Loading bill reference…" : "Matching monthly bill unavailable"}</div>}
+    {data && data.consumed_kwh === null && <div data-testid={`energy-wing-operating-consumption-reason-${w}`} className="text-[10px] text-gray-400">Pi-day consumption: {missingReason(data, "consumption")}</div>}
+    {mode && rows && <EnergyComparisonChart scope={w} rows={rows} mode={mode} excessEnabled={excessEnabled} compact />}
+    {calendar?.month && !rows && <div data-testid={`energy-wing-month-state-${w}`} className="text-xs text-gray-500">{calendar.loading ? `Loading ${calendar.month}…` : `Daily values unavailable for ${calendar.month}`}</div>}
     <div data-testid={`energy-wing-owner-${w}`} className="text-[10px] text-gray-500">{meter ? `Consumption meter · ${meter.meter_id}` : "Consumption meter · UNAVAILABLE"}<span data-testid={`energy-wing-health-${w}`} className="block">{meter ? meter.enabled ? meter.comm_status : "DISABLED" : "UNAVAILABLE"}</span></div>
     {mode === "MANUAL" && <BillHistoryButton wing={w} />}
   </div>;

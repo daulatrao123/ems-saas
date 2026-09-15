@@ -158,9 +158,9 @@ function historyFromStore(store) {
     months: entries.map(([month, consumption_kwh]) => ({
       month,
       month_name: month,
-      days: month.endsWith("-02") ? 28 : 31,
+      days: new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate(),
       consumption_kwh,
-      daily_kwh: null,
+      daily_kwh: consumption_kwh === null ? null : consumption_kwh / new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate(),
       source: consumption_kwh == null ? "UNAVAILABLE" : "HISTORICAL",
       note: null,
       created_by: null,
@@ -279,4 +279,100 @@ test("BillMonthEditor month filtering semantics and submit guard", async () => {
   });
 
   editor.destroy();
+});
+
+test("BillSaveConfirmation renders per-month rates and latest changed month CTA", () => {
+  const BillSaveConfirmation = (() => {
+    const tsxPath = path.join(__dirname, "..", "frontend", "src", "components", "ops", "energy", "BillSaveConfirmation.tsx");
+    const source = fs.readFileSync(tsxPath, "utf8");
+    const out = ts.transpileModule(source, {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2020,
+        jsx: ts.JsxEmit.ReactJSX,
+        esModuleInterop: true,
+      },
+      fileName: "BillSaveConfirmation.tsx",
+    }).outputText;
+    const module = { exports: {} };
+    const runtime = makeJsxRuntime();
+    const req = (id) => {
+      if (id === "react/jsx-runtime") return runtime;
+      if (id === "../DashboardHeader") return { btn: "btn", tone: { cyan: "cyan" } };
+      if (id === "./referenceTypes") return { dailyRate: (v) => `${Number(v).toFixed(2)} kWh/day` };
+      if (id === "./types") return { fmtKwh: (v) => `${Number(v).toFixed(2)} kWh` };
+      if (id === "./comparisonLabels") return { monthLabel: (m) => m };
+      throw new Error(`Unexpected import: ${id}`);
+    };
+    vm.runInNewContext(out, { module, exports: module.exports, require: req, console }, { filename: "BillSaveConfirmation.compiled.cjs" });
+    return module.exports.BillSaveConfirmation;
+  })();
+
+  const history = {
+    wing: "A",
+    months: [
+      { month: "2026-08", days: 31, consumption_kwh: 620, daily_kwh: 20 },
+      { month: "2026-09", days: 30, consumption_kwh: 900, daily_kwh: 30 },
+    ],
+  };
+  const tree = BillSaveConfirmation({ history, changedMonths: ["2026-08", "2026-09"], operatingDate: "2026-08-31", onClose: () => {} });
+  byTestId(tree, "bills-save-popup");
+  const rateAug = byTestId(tree, "bills-saved-month-rate-2026-08").props.children.join("");
+  const rateSep = byTestId(tree, "bills-saved-month-rate-2026-09").props.children.join("");
+  const appliesSep = byTestId(tree, "bills-saved-month-applies-2026-09").props.children;
+  assert.match(rateAug, /620\.00 kWh ÷ 31 days = 20\.00 kWh\/day/);
+  assert.match(rateSep, /900\.00 kWh ÷ 30 days = 30\.00 kWh\/day/);
+  assert.match(appliesSep, /not the Pi operating month 2026-08/);
+  assert.equal(byTestId(tree, "bills-popup-done").props.children, "VIEW 2026-09 DAILY VALUES");
+});
+
+test("BillHistoryDialog save callback selects latest changed month", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "frontend", "src", "components", "ops", "energy", "BillHistoryDialog.tsx"), "utf8");
+  assert.match(src, /const latest = \[\.\.\.changedMonths\]\.sort\(\)\.pop\(\)/);
+  assert.match(src, /if \(latest\) onSavedMonth\(latest\)/);
+  assert.match(src, /Pi operating day:/);
+  assert.match(src, /bill for .* applies to that day/);
+});
+
+test("BillMonthEditor confirms changed values/identity before notifying selected-month view", async () => {
+  for (const [name, corrupt] of [
+    ["valid", d => d], ["foreign-wing", d => ({...d,wing:"B"})],
+    ["foreign-device", d => ({...d,device_id:"other"})], ["wrong-window", d => ({...d,end_month:"2026-07"})],
+    ["missing-month", d => ({...d,months:[]})],
+    ["stale-month", d => ({...d,months:d.months.map(m=>({...m,consumption_kwh:100}))})],
+  ]) {
+    const store=makeStore({"2026-08":100}), saved=[], options=[];
+    const api={get:async(_url,opts)=>{options.push(opts);return{data:historyFromStore(store)};},put:async(_url,body,opts)=>{
+      options.push(opts);for(const row of body.months)store.set(row.month,row.consumption_kwh);
+      return{data:corrupt(historyFromStore(store))};
+    }};
+    const harness=createHarness(null,api);harness.loadComponent();
+    const editor=harness.mount({societyId:"soc-1",deviceId:"dev-1",wing:"A",endMonth:"2026-08",readOnly:false,onSaved:(...args)=>saved.push(args)});
+    editor.render();await editor.flushEffects();await tick();editor.render();
+    byTestId(editor.tree,"bills-input-2026-08").props.onChange({target:{value:"620"}});editor.render();
+    await byTestId(editor.tree,"bills-month-form").props.onSubmit({preventDefault(){}});editor.render();
+    if(name==="valid") {
+      assert.equal(saved.length,1);assert.equal(saved[0][0].months[0].daily_kwh,20);
+      assert.deepEqual(Array.from(saved[0][1]),["2026-08"]);
+    } else {assert.equal(saved.length,0,name);assert.match(byTestId(editor.tree,"bills-error").props.children,/could not be (verified|confirmed)/);}
+    assert.ok(options.every(o=>o.timeout===12000));editor.destroy();
+  }
+});
+
+test("BillMonthEditor no-change/member saves blocked and late save completion cannot notify another view", async () => {
+  for(const readOnly of [false,true]) {
+    const store=makeStore({"2026-08":100});let puts=0,saves=0;
+    const api={get:async()=>({data:historyFromStore(store)}),put:async()=>{puts++;return{data:historyFromStore(store)};}};
+    const harness=createHarness(null,api);harness.loadComponent();
+    const editor=harness.mount({societyId:"soc-1",deviceId:"dev-1",wing:"A",endMonth:"2026-08",readOnly,onSaved(){saves++;}});
+    editor.render();await editor.flushEffects();await tick();editor.render();
+    await byTestId(editor.tree,"bills-month-form").props.onSubmit({preventDefault(){}});editor.render();
+    assert.equal(puts,0);assert.equal(saves,0);editor.destroy();
+  }
+  const store=makeStore({"2026-08":100});let release;const wait=new Promise(resolve=>{release=resolve;});const saves=[];
+  const api={get:async()=>({data:historyFromStore(store)}),put:async(_url,body)=>{await wait;for(const row of body.months)store.set(row.month,row.consumption_kwh);return{data:historyFromStore(store)};}};
+  const harness=createHarness(null,api);harness.loadComponent();const editor=harness.mount({societyId:"soc-1",deviceId:"dev-1",wing:"A",endMonth:"2026-08",readOnly:false,onSaved:(...args)=>saves.push(args)});
+  editor.render();await editor.flushEffects();await tick();editor.render();byTestId(editor.tree,"bills-input-2026-08").props.onChange({target:{value:"620"}});editor.render();
+  const submit=byTestId(editor.tree,"bills-month-form").props.onSubmit({preventDefault(){}});editor.destroy();release();await submit;
+  assert.equal(saves.length,0);assert.equal(store.get("2026-08"),620,"server completion does not imply callback on unmounted/another-wing view");
 });

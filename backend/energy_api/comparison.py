@@ -33,6 +33,10 @@ def wing_rows(cur, did, wing, mid, meters, frm, to, mode):
             row["consumed_kwh"] = round(consumption, 4) if consumption is not None else None
             row["consumption_source"] = "HISTORICAL" if consumption is not None else "UNAVAILABLE"
         row["generation_minus_consumption_kwh"] = balance(row["generated_kwh"], row["consumed_kwh"])
+        row["bill_month"] = row["date"][:7] if mode == "MANUAL" and row["consumed_kwh"] is not None else None
+        row["generation_reason"] = None if row["generated_kwh"] is not None else "M1_DISABLED" if not meters["M1"]["enabled"] else "PHYSICAL_GENERATION_UNAVAILABLE"
+        row["consumption_reason"] = None if row["consumed_kwh"] is not None else "BILL_NOT_ENTERED_FOR_MONTH" if mode == "MANUAL" else "CONSUMPTION_METER_UNAVAILABLE"
+        row["balance_reason"] = row["generation_reason"] or row["consumption_reason"]
         sources = {row[k] for k in ("generation_source", "consumption_source")} - {"UNAVAILABLE"}
         row["source"] = "MIXED_REFERENCE" if len(sources) > 1 else next(iter(sources), "UNAVAILABLE")
     return rows
@@ -56,9 +60,32 @@ def overview(cur, dev, meters, today, days):
         gen = round(gen, 4) if Q._physical(gen) else None
         consumption = [wings[w]["rows"][i]["consumed_kwh"] for w in Q.WINGS]
         cons = round(sum(consumption), 4) if all(v is not None for v in consumption) else None
+        missing = [w for w in Q.WINGS if wings[w]["rows"][i]["consumed_kwh"] is None]
+        generation_reason = None if gen is not None else "M1_DISABLED" if not meters["M1"]["enabled"] else "PHYSICAL_GENERATION_UNAVAILABLE"
+        consumption_reason = "INCOMPLETE_WING_CONSUMPTION" if missing else None
         society.append({"date": day, "generated_kwh": gen, "generation_source": "PHYSICAL" if gen is not None else "UNAVAILABLE",
                         "consumed_kwh": cons, "consumption_source": ("HISTORICAL" if mode == "MANUAL" else "PHYSICAL") if cons is not None else "UNAVAILABLE",
-                        "generation_minus_consumption_kwh": balance(gen, cons)})
+                        "generation_minus_consumption_kwh": balance(gen, cons), "generation_reason": generation_reason,
+                        "consumption_reason": consumption_reason, "balance_reason": generation_reason or consumption_reason,
+                        "missing_consumption_wings": missing})
     return {"device_id": did, "mode": mode, "version": dev["energy_calculation_version"], "operating_date": today.isoformat(),
             "consumption_basis": "MONTHLY_BILL_DAILY_REFERENCE" if mode == "MANUAL" else "PHYSICAL_CONSUMPTION_METERS",
             "wings": wings, "society": {"today": society[-1], "rows": society}}
+
+
+def month_overview(cur, dev, meters, operating_day, month, calendar_today):
+    """A selected calendar month, never a replacement for the Pi operating day.
+
+    Current-month rows stop at UTC today; daily reference still divides by the
+    full calendar month. Past months include every day, independent of Pi age.
+    """
+    end = min(date(month.year, month.month, calendar.monthrange(month.year, month.month)[1]), calendar_today)
+    result = overview(cur, dev, meters, end, (end - month).days + 1)
+    result["operating_date"] = operating_day.isoformat()
+    result["calendar_today"] = calendar_today.isoformat()
+    result["period"] = {"kind": "CALENDAR_MONTH", "month": month.strftime("%Y-%m"), "start": month.isoformat(),
+                        "end": end.isoformat(), "calendar_days": calendar.monthrange(month.year, month.month)[1]}
+    # Historical endpoint must not call the last historical row "today".
+    for series in [*result["wings"].values(), result["society"]]:
+        series.pop("today", None)
+    return result

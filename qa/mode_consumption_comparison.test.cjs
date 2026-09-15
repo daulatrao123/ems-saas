@@ -53,9 +53,13 @@ function loadTsx(relPath, exportName, mocks = {}) {
   const module = { exports: {} };
   const req = (id) => {
     if (id in mocks) return mocks[id];
+    if (id === "./comparisonLabels") return {
+      missingReason: loadTsx("frontend/src/components/ops/energy/comparisonLabels.ts", "missingReason"),
+      monthLabel: loadTsx("frontend/src/components/ops/energy/comparisonLabels.ts", "monthLabel"),
+    };
     throw new Error(`Unexpected import: ${id}`);
   };
-  vm.runInNewContext(out, { module, exports: module.exports, require: req, console, URLSearchParams, setInterval: () => 1, clearInterval: () => {} }, { filename: `${exportName}.compiled.cjs` });
+  vm.runInNewContext(out, { module, exports: module.exports, require: req, console, URLSearchParams, AbortController, setInterval: () => 1, clearInterval: () => {} }, { filename: `${exportName}.compiled.cjs` });
   return module.exports[exportName];
 }
 
@@ -93,6 +97,8 @@ test("EnergyComparisonChart renders both series; missing bars stay absent; zero/
 
 test("WingEnergyCard keeps physical generation/targets and manual bills button behavior", () => {
   const WingEnergyCard = loadTsx("frontend/src/components/ops/energy/WingEnergyCard.tsx", "WingEnergyCard", {
+    react: { useContext: () => null },
+    "./CalendarComparisonContext": { CalendarComparisonContext: {} },
     "react/jsx-runtime": makeJsxRuntime(),
     "../DashboardHeader": { label: "label" },
     "./BillHistoryButton": { BillHistoryButton: ({ wing }) => ({ type: "button", props: { "data-testid": `bills-open-${wing}`, children: "ADD BILLS / CONSUMPTION" } }) },
@@ -211,7 +217,8 @@ test("Source contracts: no physical-toggle UI, comparison isolation, and bill-sa
 
   const billEditorSrc = fs.readFileSync(path.join(__dirname, "..", "frontend", "src", "components", "ops", "energy", "BillMonthEditor.tsx"), "utf8");
   assert.match(billEditorSrc, /Number\(entered\) !== m\.consumption_kwh/);
-  assert.match(billEditorSrc, /if \(alive\.current\) onSaved\(data\)/);
+  assert.match(billEditorSrc, /if \(alive\.current\) \{/);
+  assert.match(billEditorSrc, /onSaved\(data, months\.map\(\(m\) => m\.month\)\)/);
 });
 
 test("useEnergy runtime rejects mismatched/delayed comparisons and refreshes bill-derived values", async () => {
@@ -256,4 +263,114 @@ test("useEnergy runtime rejects mismatched/delayed comparisons and refreshes bil
   assert.equal(result.comparison.device_id,"two","late device one cannot overwrite device two");
   assert.equal(result.comparison.society.today.consumed_kwh,20);
   for(const slot of slots) slot?.cleanup?.();
+});
+
+test("useCalendarComparison selects exact month, aborts stale replies, and clears old data on switch", async () => {
+  const slots = []; let index = 0, effects = [];
+  let activeDevice = "dev-1";
+  let pendingResolve;
+  const pending = new Promise((resolve) => { pendingResolve = resolve; });
+  const equal = (a,b) => a && b && a.length === b.length && a.every((v,i)=>v===b[i]);
+  const hooks = {
+    useState(initial) { const i = index++; slots[i] ??= { value: typeof initial === "function" ? initial() : initial }; return [slots[i].value, (next) => { slots[i].value = typeof next === "function" ? next(slots[i].value) : next; }]; },
+    useRef(initial) { const i = index++; slots[i] ??= { current: initial }; return slots[i]; },
+    useEffect(fn, deps) { const i = index++; if (!slots[i] || !equal(slots[i].deps, deps)) { const prev = slots[i]; slots[i] = { deps }; effects.push(() => { prev?.cleanup?.(); slots[i].cleanup = fn(); }); } },
+  };
+
+  const requests = [];
+  let override = {};
+  const api = {
+    get(url, opts) {
+      const q = url.split("?")[1] || "";
+      requests.push(q);
+      const month = new URLSearchParams(q).get("month");
+      const rows = [{date:`${month}-01`,generated_kwh:null,consumed_kwh:20,generation_minus_consumption_kwh:null,generation_source:"UNAVAILABLE",consumption_source:"HISTORICAL"}];
+      assert.equal(opts.timeout,12000);assert.ok(opts.signal);
+      const data = { device_id: activeDevice, mode: "MANUAL", version: 3, operating_date: "2026-09-30", period: { kind: "CALENDAR_MONTH", month, start:`${month}-01`,end:`${month}-01`,calendar_days:30 }, society:{rows},wings:Object.fromEntries(["A","B","C","D"].map(w=>[w,{wing:w,rows}])),...override };
+      if (month === "2026-08") return pending.then(() => ({ data }));
+      return Promise.resolve({ data });
+    },
+  };
+
+  const useCalendarComparison = loadTsx("frontend/src/components/ops/energy/useCalendarComparison.ts", "useCalendarComparison", {
+    react: hooks,
+    "./types": { WINGS: ["A", "B", "C", "D"] },
+    "@/lib/api": api,
+    "../types": { errorText: (e) => ({ detail: String(e) }) },
+  });
+
+  const render = (month, revision = 0) => {
+    index = 0;
+    const summary = { device_id: activeDevice, calculation: { mode: "MANUAL", version: 3 }, as_of_operating_date: "2026-09-30" };
+    const value = useCalendarComparison("1", summary, month, revision);
+    const run = effects; effects = []; run.forEach((fn) => fn());
+    return value;
+  };
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+  let result = render("2026-08");
+  assert.equal(result.data, null);
+  assert.equal(result.loading, true);
+  result = render("2026-09", 1); // switch month before older response resolves
+  await flush();
+  result = render("2026-09", 1);
+  assert.equal(result.error, "");
+  assert.equal(result.data?.period?.month, "2026-09");
+  pendingResolve();
+  await flush();
+  result = render("2026-09", 1);
+  assert.equal(result.data?.period?.month, "2026-09", "late 2026-08 response must be discarded");
+  assert.ok(requests.some((q) => q.includes("month=2026-08")));
+  assert.ok(requests.some((q) => q.includes("month=2026-09")));
+  let revision=2;
+  for(const invalid of [{device_id:"foreign"},{mode:"AUTO"},{version:99},{operating_date:"2026-09-29"},{period:{kind:"CALENDAR_MONTH",month:"2026-08"}},{wings:{}},{society:{rows:[]}}]) {
+    override=invalid;render("2026-09",revision);await flush();result=render("2026-09",revision++);
+    assert.equal(result.data,null);assert.match(result.error,/does not match/);
+  }
+  override={};activeDevice="dev-2";result=render("2026-09",revision);assert.equal(result.data,null);await flush();result=render("2026-09",revision);
+  assert.equal(result.data.device_id,"dev-2");
+  for (const slot of slots) slot?.cleanup?.();
+});
+
+test("EnergyPanel wiring refreshes on saved month and comparison key tracks month/revision", () => {
+  const panelSrc = fs.readFileSync(path.join(__dirname, "..", "frontend", "src", "components", "ops", "energy", "EnergyPanel.tsx"), "utf8");
+  assert.match(panelSrc, /const savedMonth = \(value: string\) => \{ selectMonth\(value\); void en\.refresh\(\); \}/);
+  assert.match(panelSrc, /const key = `\$\{societyId\}:\$\{en\.summary\?\.device_id\}:\$\{mode\}`/);
+
+  const hookSrc = fs.readFileSync(path.join(__dirname, "..", "frontend", "src", "components", "ops", "energy", "useCalendarComparison.ts"), "utf8");
+  assert.match(hookSrc, /const key = `\$\{societyId\}:\$\{device\}:\$\{mode\}:\$\{version\}:\$\{day\}:\$\{month\}:\$\{revision\}`/);
+  assert.match(hookSrc, /const q = new URLSearchParams\(\{ society_id: societyId, device_id: device, month \}\)/);
+  assert.match(hookSrc, /period\?\.kind === "CALENDAR_MONTH" && data\.period\.month === month/);
+});
+
+test("useEnergy publishes core data despite pending history and never leaks old-device optional panels", async () => {
+  const slots=[];let index=0,effects=[],selected="one",defer=false,release;
+  const pending=new Promise(resolve=>{release=resolve;});
+  const equal=(a,b)=>a&&b&&a.length===b.length&&a.every((v,i)=>v===b[i]);
+  const hooks={
+    useState(initial){const i=index++;slots[i]??={value:typeof initial==="function"?initial():initial};return[slots[i].value,v=>{slots[i].value=typeof v==="function"?v(slots[i].value):v;}];},
+    useRef(initial){const i=index++;slots[i]??={current:initial};return slots[i];},
+    useCallback(fn,deps){const i=index++;if(!slots[i]||!equal(slots[i].deps,deps))slots[i]={deps,value:fn};return slots[i].value;},
+    useEffect(fn,deps){const i=index++;if(!slots[i]||!equal(slots[i].deps,deps)){const old=slots[i];slots[i]={deps};effects.push(()=>{old?.cleanup?.();slots[i].cleanup=fn();});}},
+  };
+  const options=[];
+  const api={get(url,opts){
+    options.push(opts);const device=new URLSearchParams(url.split("?")[1]).get("device_id"),day="2026-09-30";
+    let data=url.includes("/summary?")?{device_id:device,as_of_operating_date:day,calculation:{mode:"MANUAL",version:1}}
+      :url.includes("/graph/comparison?")?{device_id:device,mode:"MANUAL",version:1,operating_date:day}
+      :url.includes("/allocation?")?{allocation:{owner:device}}:{meter_id:"M1",rows:[],events:[]};
+    if(url.includes("/pi-events?")&&device==="one"&&defer)return pending.then(()=>({data}));
+    if(url.includes("/pi-events?")&&device==="two")data={events:{invalid:true}};
+    return Promise.resolve({data});
+  }};
+  const useEnergy=loadTsx("frontend/src/components/ops/energy/useEnergy.ts","useEnergy",{react:hooks,"@/lib/api":api,"./types":{DEFAULT_MONTHS:6,isAllocationEvent:()=>false},"../types":{errorText:e=>({detail:String(e)})}});
+  const render=()=>{index=0;const out=useEnergy("1",selected);const work=effects;effects=[];work.forEach(fn=>fn());return out;};
+  const flush=()=>new Promise(resolve=>setImmediate(resolve));
+  render();await flush();let result=render();assert.equal(result.allocation.owner,"one");
+  defer=true;const old=result.refresh();await flush();result=render();
+  assert.equal(result.loading,false);assert.equal(result.comparison.device_id,"one");assert.equal(result.allocation,null,"optional panels cleared while loading");
+  selected="two";result=render();assert.equal(result.summary,null);assert.equal(result.allocation,null);
+  await flush();result=render();assert.equal(result.loading,false);assert.equal(result.comparison.device_id,"two");assert.equal(result.allocation.owner,"two");assert.equal(result.events.length,0);assert.match(result.error,/Event history response unavailable/);
+  release();await old;await flush();result=render();assert.equal(result.allocation.owner,"two");assert.equal(result.comparison.device_id,"two");
+  assert.ok(options.every(o=>o.timeout===12000));for(const slot of slots)slot?.cleanup?.();
 });

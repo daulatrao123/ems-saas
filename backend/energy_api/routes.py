@@ -327,13 +327,17 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         return frm, to, today
 
     @router.get("/graph/comparison")
-    def graph_comparison(society_id: str, device_id: str, days: int = 30, user: dict = Depends(get_current_user)):
+    def graph_comparison(society_id: str, device_id: str, days: int = 30, month: str = None, user: dict = Depends(get_current_user)):
         sid = access(user, society_id)
         if days not in (7, 30):
             raise HTTPException(400, "days must be 7 or 30")
+        selected_month = _bill_month(month) if month is not None else None
         def fn(cur):
-            dev = device(cur, sid, device_id); did = str(dev["id"])
-            today = Q.device_today(cur, did, datetime.now(timezone.utc).date())
+            dev = device(cur, sid, device_id, ensure_meters=selected_month is None); did = str(dev["id"])
+            calendar_today = datetime.now(timezone.utc).date()
+            today = Q.device_today(cur, did, calendar_today)
+            if selected_month is not None:
+                return C.month_overview(cur, dev, meters_of(cur, did), today, selected_month, calendar_today)
             return C.overview(cur, dev, meters_of(cur, did), today, days)
         return run(fn)
 
