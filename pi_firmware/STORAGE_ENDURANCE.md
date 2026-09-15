@@ -79,6 +79,40 @@ Budget: 50 MB/day (≈ 178 GB / 10 years). Both runs are well inside.
 proofs.** Real NAND wear depends on the card's controller / FTL write
 amplification, workload, power-loss behaviour and SMART telemetry.
 
+### 5.1 Controller health reporting (CPU / observed boots / watchdog)
+
+- CPU temperature and watchdog evidence are read-only samples, cached at the
+  existing `SYNC_INTERVAL_S` cadence. Linux boot ID is read once per process
+  initialization. These reads use virtual OS interfaces / read-only `systemctl
+  show`; the sampler never opens `/dev/watchdog`, pets/arms a watchdog, logs on
+  each sample, creates a timer, or calls `save_state`.
+- The observed OS-boot record is bounded metadata in the existing checksummed
+  `current_state.json` document and existing backup/rename/fsync path. It does
+  not add a data file or write trigger. A changed boot ID increments the RAM
+  record; the displayed count stays UNKNOWN until an existing guarded state
+  commit acknowledges it. Restarting the service on the same boot ID does not
+  increment it. This is boots observed since tracking began, not lifetime boots.
+- CPU/watchdog samples are not persisted to local state. Cloud health uses a
+  bounded `controller_health` entry inside the existing `pi_state.storage_health`
+  JSON snapshot and the existing 29-parameter sync upsert, not a new table,
+  history stream, event stream, migration, or extra database write/query cycle.
+  Missing storage reports retain the existing storage fields; unknown/legacy
+  controller reports clear unverified controller-health claims.
+- Existing thresholds, write bands, budgets and safety-critical exemptions are
+  unchanged. The small boot-record payload is included in existing state-write
+  byte accounting. Fewer writes or a longer physical media lifetime are **not**
+  claimed: added metadata has a small bounded byte cost even though write
+  cadence does not increase.
+- Offline regression: 86,400 simulated per-second snapshots cause zero sampler
+  save calls; one boot-ID read and 1,440 CPU/watchdog/systemd samples at the
+  existing 60-second cadence. Boot metadata was under 200 bytes and normalized
+  cloud health under 1 KiB in the tested fixture. Storage write operations,
+  scheduler methods, resource limits and service policy match the task-start
+  baseline. These are software checks, not a physical endurance/recovery test.
+- Missing modules/old state support, unavailable sensors, unverified watchdog
+  evidence or uncommitted boot tracking remain UNKNOWN. Watchdog recovery
+  remains NOT VERIFIED; this feature does not change watchdog/restart behavior.
+
 ## 6. OS image requirements (documentation only — not changed by firmware)
 
 ### 6.1 `noatime` on the data mount

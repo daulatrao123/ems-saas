@@ -184,6 +184,10 @@ class PiStateManager:
         self.active_slot = None
         self.last_usage_date = None
         self.last_reset_period = None
+        # Optional v4 metadata; persisted only by the existing state-write path.
+        self.health_boot = None
+        self.persisted_health_boot = None
+        self.health_state_unavailable = False
 
         self.slots = {
             code: SlotState(code)
@@ -219,6 +223,7 @@ class PiStateManager:
 
             "last_usage_date": self.last_usage_date,
             "last_reset_period": self.last_reset_period,
+            "health_boot": self.health_boot,
 
             "slots": {
                 code: state.to_dict()
@@ -277,10 +282,12 @@ class PiStateManager:
             BACKUP_STATE_FILE,
             RECOVERY_STATE_FILE,
         ]
+        any_existing = False
 
         for path in candidates:
             if not os.path.exists(path):
                 continue
+            any_existing = True
 
             try:
                 with open(
@@ -300,6 +307,8 @@ class PiStateManager:
                 )
                 self.last_usage_date = data.get("last_usage_date")
                 self.last_reset_period = data.get("last_reset_period")
+                self.health_boot = data.get("health_boot")
+                self.persisted_health_boot = self.health_boot
 
                 system = data.get(
                     "system_state",
@@ -351,6 +360,7 @@ class PiStateManager:
                         path,
                     )
 
+                self.health_state_unavailable = not valid
                 return valid
 
             except Exception as exc:
@@ -360,6 +370,7 @@ class PiStateManager:
                     exc,
                 )
 
+        self.health_state_unavailable = any_existing
         return False
 
     # ------------------------------------------------------------
@@ -438,6 +449,7 @@ class PiStateManager:
                 )
 
                 self.dirty = False
+                self.persisted_health_boot = data.get("health_boot")
 
                 return True
 

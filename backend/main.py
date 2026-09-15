@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
 from provisioning import build_provisioning_zip, service_unit_sha256
 from energy_api import ingest as energy_ingest
+import health_read_model
 from energy_api.routes import create_router as create_energy_router
 import logging
 _seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
@@ -1606,7 +1607,11 @@ def pi_sync(
             hardware_fault = payload.get("hardware_fault")
             hardware_fault = str(hardware_fault)[:500] if hardware_fault else None
             storage_health = payload.get("storage_health")
-            storage_health = Json(normalize_storage_health(storage_health)) if isinstance(storage_health, dict) else None
+            health_report = health_read_model.normalize_report(payload.get("controller_health"), now)
+            # Extend the existing bounded JSON snapshot; no extra query, row,
+            # history, event, write cadence or schema migration.
+            storage_health = Json({**(normalize_storage_health(storage_health) if isinstance(storage_health, dict) else {}),
+                                   "controller_health": health_report})
 
             cur.execute("SELECT config_version, reset_day FROM societies WHERE id = %s", (society_id,))
             soc = cur.fetchone()
@@ -1693,11 +1698,11 @@ def pi_sync(
                            ota_desired_version=EXCLUDED.ota_desired_version, ota_state=EXCLUDED.ota_state, ota_version=EXCLUDED.ota_version,
                            ota_attempts=EXCLUDED.ota_attempts, ota_last_error=EXCLUDED.ota_last_error, ota_updated_at=EXCLUDED.ota_updated_at,
                            last_good_firmware_version=EXCLUDED.last_good_firmware_version, hardware_fault=EXCLUDED.hardware_fault,
-                           storage_health=COALESCE(EXCLUDED.storage_health, pi_state.storage_health)""",
+                           storage_health=COALESCE(pi_state.storage_health, '{}'::jsonb) || EXCLUDED.storage_health""",
                         (device_id, payload.get("active_slot", payload.get("activeWing")), int(payload.get("resetDay", DEFAULT_RESET_DAY)),
                          bool(payload.get("emergencyStop", False)), int(payload.get("uptimeSeconds", 0)),
-                         float(payload.get("cpuTemp", 0)), float(payload.get("diskFreeMB", 0)), now, int(payload.get("bootCount", 0)),
-                         payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), bool(payload.get("watchdogEnabled", False)),
+                         health_report["cpu"]["celsius"], float(payload.get("diskFreeMB", 0)), now, health_report["boot"]["count"],
+                         payload.get("lastShutdownReason", ""), payload.get("clockSource", ""), health_read_model.watchdog_enabled(health_report),
                          payload.get("lastRebootReason", ""), cloud_config_version,
                          desired_hash, eff_av, eff_ah, eff_at, config_state, raw_err,
                          ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good, hardware_fault, storage_health))
@@ -2206,6 +2211,7 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                         "visible": slot_is_visible(c, st),
                     }
 
+                controller_health = health_read_model.dashboard_view((pi or {}).get("storage_health"), datetime.now(timezone.utc), PI_ONLINE_THRESHOLD_SECONDS)
                 devices_data.append({
                     "id": str(dev["id"]),
                     "name": dev["name"],
@@ -2213,7 +2219,7 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "active_slot": pi.get("active_slot") if pi else None,
                     "slots": slots_data,
                     "hardware_fault": pi.get("hardware_fault") if pi else None,
-                    "storage_health": pi.get("storage_health") if pi else None,
+                    "storage_health": ({k: v for k, v in (pi.get("storage_health") or {}).items() if k != "controller_health"} or None) if pi else None,
                     # T7 convergence evidence (read-only exposure; no UI yet)
                     "config_version": pi.get("config_version") if pi else None,
                     "desired_config_hash": pi.get("desired_config_hash") if pi else None,
@@ -2228,9 +2234,10 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "firmware_version": dev.get("firmware_version"),
                     "last_sync": pi["last_sync"].isoformat() if pi and pi.get("last_sync") else None,
                     "telemetry": {
-                        "cpu_temp": pi.get("cpu_temp") if pi else None,
+                        "cpu_temp": controller_health["cpu"]["celsius"],
                         "uptime_seconds": pi.get("uptime_seconds") if pi else None,
-                        "boot_count": pi.get("boot_count") if pi else None,
+                        "boot_count": controller_health["boot"]["count"],
+                        "health": controller_health,
                     },
                 })
 

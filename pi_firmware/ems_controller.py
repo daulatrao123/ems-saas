@@ -69,6 +69,13 @@ EXIT_SECONDARY_STORAGE = 4
 FIRMWARE_VERSION = "7.0.0"
 
 
+try:
+    from health_telemetry import HealthTelemetry
+except ImportError:
+    # Controller-only legacy updates must stay operational, never invent health.
+    HealthTelemetry = None
+
+
 class EMSController:
     """
     Single Raspberry Pi runtime entry point.
@@ -132,6 +139,7 @@ class EMSController:
         self._applied_at = None
         self._config_error = None
         self._restore_applied_config()
+        self.health = HealthTelemetry(self.state, SYNC_INTERVAL_S) if HealthTelemetry else None
 
         # Signed OTA (A/B slots managed by ota_manager; activation = process restart).
         self.firmware_version = ota_manager.running_version(FIRMWARE_VERSION)
@@ -402,6 +410,7 @@ class EMSController:
     # ============================================================
 
     def _build_snapshot(self):
+        health = self.health.snapshot() if self.health else None
         slots = {}
 
         for slot in SUPPORTED_SLOTS:
@@ -491,7 +500,7 @@ class EMSController:
             "uptimeSeconds": int(
                 time.monotonic()
             ),
-            "cpuTemp": 0.0,
+            "cpuTemp": health["cpu"]["celsius"] if health else None,
             "diskFreeMB": disk_free_mb,
             "storageState": storage_state,
             "storageUsedPercent": round(
@@ -503,8 +512,10 @@ class EMSController:
                 ),
                 2,
             ),
-            "bootCount": 0,
-            "watchdogEnabled": True,
+            "bootCount": health["boot"]["count"] if health else None,
+            # Nullable legacy flag reflects hardware runtime evidence only.
+            "watchdogEnabled": (True if health["watchdog"]["hardware_state"] == "ACTIVE" else False if health["watchdog"]["hardware_state"] == "INACTIVE" and health["watchdog"]["service_timeout_us"] == 0 else None) if health else None,
+            "controller_health": health,
             "clockSource": "system",
             "slots": slots,
             # Retain the wire shape for older servers; physical toggles are retired.

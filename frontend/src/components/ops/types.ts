@@ -1,7 +1,13 @@
 // physical_toggle = CONTACTOR FEEDBACK (historical wire name); toggle_input is retired compatibility metadata, never a control/display input.
 // disabled = LOGICAL slot enable (admin configuration). Three separate concepts — never derive one from another.
 export type Slot = { display_name: string; target_days: number; used_days: number; physical_toggle: string; toggle_input?: string; disabled: boolean; visible?: boolean; feedback_enabled?: boolean };
-export type Telemetry = { cpu_temp: number | null; uptime_seconds: number | null; boot_count: number | null };
+export type ControllerHealth = {
+  version: number; sampled_at: string | null; status: "CURRENT" | "STALE" | "UNKNOWN"; max_age_seconds: number;
+  cpu: { celsius: number | null; source: string };
+  boot: { count: number | null; tracking_since: string | null; status: string };
+  watchdog: { service_timeout_us: number | null; service_state: string; hardware_state: string; hardware_timeout_seconds: number | null; recovery: "NOT_VERIFIED" };
+};
+export type Telemetry = { cpu_temp: number | null; uptime_seconds: number | null; boot_count: number | null; health?: ControllerHealth };
 export type Device = {
   id: string; name: string; connected: boolean; active_slot: string | null; slots: Record<string, Slot>;
   config_state?: string | null; config_error?: string | null; ota_state?: string | null; storage_state?: string | null;

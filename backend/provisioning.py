@@ -39,6 +39,7 @@ FIRMWARE_FILES = (
     "gpio_input_diag.py",
     "lcd_display.py",
     "storage_health.py",
+    "health_telemetry.py",
     "logger.py",
     "memory_manager.py",
     "offline_queue.py",
@@ -119,6 +120,7 @@ REQUIRED_FILES=(
   "ems-controller.env"
 
   "firmware/ems_controller.py"
+  "firmware/health_telemetry.py"
   "firmware/api_client.py"
   "firmware/config.py"
   "firmware/config_hash.py"
@@ -552,6 +554,7 @@ MANIFEST.sha256
 
 firmware/
   ems_controller.py
+  health_telemetry.py
   api_client.py
   config.py
   config_hash.py
