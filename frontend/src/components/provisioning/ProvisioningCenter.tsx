@@ -1,10 +1,11 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import api from "@/lib/api";
 import { SocietyDevice } from "./AdminDevices";
 import { Confirm, ConfirmDialog } from "@/components/ops/ConfirmDialog";
 import { Dot, btn, input, label, panel, tone } from "@/components/ops/DashboardHeader";
-import { ago, errorText } from "@/components/ops/types";
+import { ago, fmtDateTime, errorText } from "@/components/ops/types";
+import { useProvisioningDevices } from "./useProvisioningDevices";
 
 type Issued = { key_id: string; api_key: string };   // React state only; never persisted
 
@@ -34,7 +35,7 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
     <article data-testid={`prov-device-${d.id}`} className={`${panel} p-4 min-w-0 [overflow-wrap:anywhere]`}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div><div className="text-base font-bold text-white">{d.name}</div><div className="font-mono text-[11px] text-gray-500">{d.hardware_profile} · society #{sid} · {d.status}</div></div>
-        <span data-testid={`prov-online-${d.id}`} className={`flex items-center gap-2 font-mono text-xs font-bold ${d.online ? "text-emerald-400" : "text-red-400"}`}><Dot on={d.online} />{d.online ? "ONLINE" : "OFFLINE"} <span className="text-gray-500 font-normal">· last sync {ago(d.last_sync)}</span></span>
+        <span data-testid={`prov-online-${d.id}`} className={`flex flex-wrap items-center gap-2 font-mono text-xs font-bold ${d.online ? "text-emerald-400" : "text-red-400"}`}><Dot on={d.online} />{d.online ? "ONLINE" : "OFFLINE"} <span data-testid={`prov-last-sync-${d.id}`} title={fmtDateTime(d.last_sync)} className="text-gray-500 font-normal">· last sync {ago(d.last_sync)}</span></span>
       </div>
       <dl className="mt-3 grid grid-cols-1 sm:grid-cols-[130px_minmax(0,1fr)] gap-y-1.5 font-mono text-[11px]">
         <dt className="text-gray-500">DEVICE ID</dt>
@@ -71,10 +72,8 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
 }
 
 export function ProvisioningCenter({ societyId }: { societyId: string }) {
-  const [devices, setDevices] = useState<SocietyDevice[]>([]); const [confirm, setConfirm] = useState<Confirm | null>(null);
+  const { devices, error, loading, load } = useProvisioningDevices(societyId); const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [msg, setMsg] = useState<{ t: string; ok: boolean } | null>(null); const [name, setName] = useState(""); const [busy, setBusy] = useState(false);
-  const load = useCallback(() => api.get(`/api/admin/devices?society_id=${societyId}`).then((r) => setDevices(r.data.devices || [])).catch(() => setDevices([])), [societyId]);
-  useEffect(() => { Promise.resolve().then(load); }, [load]);
   const notify = (t: string, ok: boolean) => { setMsg({ t, ok }); setTimeout(() => setMsg(null), 5000); };
   const register = async () => {   // new device: register + credential issued once -> then DOWNLOAD builds the package (rotates)
     setBusy(true);
@@ -86,13 +85,15 @@ export function ProvisioningCenter({ societyId }: { societyId: string }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div><div className={label}>Pi Provisioning Center</div><div className="text-[11px] text-gray-500">Register → download installer ZIP → copy to Pi → <span className="font-mono">sudo ./install.sh</span> → ONLINE after first authenticated sync.</div></div>
         <div className="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
+          <button data-testid="prov-refresh" disabled={loading} onClick={() => void load()} className={`${btn} ${tone.gray}`}>{loading ? "LOADING…" : "REFRESH"}</button>
           <input data-testid="prov-register-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="New device name" className={`${input} w-52 min-w-0 max-w-full`} />
           <button data-testid="prov-register-submit" disabled={busy || !name.trim()} onClick={register} className={`${btn} ${tone.amber}`}>REGISTER DEVICE</button>
         </div>
       </div>
       {msg && <div data-testid="prov-message" className={`border px-3 py-2 font-mono text-xs ${msg.ok ? "border-emerald-500/40 text-emerald-300" : "border-red-500/40 text-red-300"}`}>{msg.t}</div>}
+      {error && <div data-testid="prov-load-error" role="alert" className="text-xs text-red-300">{error}</div>}
       <div className="grid gap-3 xl:grid-cols-2">{devices.map((d) => <DeviceCard key={d.id} d={d} sid={societyId} onChanged={load} ask={setConfirm} notify={notify} />)}</div>
-      {devices.length === 0 && <div className="text-sm text-gray-500">No registered Pi devices in this society.</div>}
+      {!loading && !error && devices.length === 0 && <div data-testid="prov-empty" className="text-sm text-gray-500">No registered Pi devices in this society.</div>}
       <ConfirmDialog c={confirm} onClose={() => setConfirm(null)} />
     </section>
   );

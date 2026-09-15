@@ -7,6 +7,7 @@ import calendar
 from datetime import date, timedelta
 
 from . import queries as Q
+from .consumption_scope import consumption_scope
 
 
 def balance(generation, consumption):
@@ -45,6 +46,8 @@ def wing_rows(cur, did, wing, mid, meters, frm, to, mode):
 def overview(cur, dev, meters, today, days):
     did, mode = str(dev["id"]), dev["energy_calculation_mode"]
     frm = today - timedelta(days=days - 1)
+    scope = consumption_scope(cur, did)
+    included = scope["included_wings"]
     wings = {}
     for wing, mid in zip(Q.WINGS, ("M2", "M3", "M4", "M5")):
         rows = wing_rows(cur, did, wing, mid, meters, frm, today, mode)
@@ -58,11 +61,11 @@ def overview(cur, dev, meters, today, days):
         row = measured.get(day)
         gen = float(row["generation_kwh"]) if meters["M1"]["enabled"] and row and row["generation_source"] == "PHYSICAL" and row["generation_kwh"] is not None else None
         gen = round(gen, 4) if Q._physical(gen) else None
-        consumption = [wings[w]["rows"][i]["consumed_kwh"] for w in Q.WINGS]
-        cons = round(sum(consumption), 4) if all(v is not None for v in consumption) else None
-        missing = [w for w in Q.WINGS if wings[w]["rows"][i]["consumed_kwh"] is None]
+        consumption = [wings[w]["rows"][i]["consumed_kwh"] for w in included]
+        cons = round(sum(consumption), 4) if included and all(v is not None for v in consumption) else None
+        missing = [w for w in included if wings[w]["rows"][i]["consumed_kwh"] is None]
         generation_reason = None if gen is not None else "M1_DISABLED" if not meters["M1"]["enabled"] else "PHYSICAL_GENERATION_UNAVAILABLE"
-        consumption_reason = "INCOMPLETE_WING_CONSUMPTION" if missing else None
+        consumption_reason = "NO_ENABLED_WINGS" if not included else "INCOMPLETE_WING_CONSUMPTION" if missing else None
         society.append({"date": day, "generated_kwh": gen, "generation_source": "PHYSICAL" if gen is not None else "UNAVAILABLE",
                         "consumed_kwh": cons, "consumption_source": ("HISTORICAL" if mode == "MANUAL" else "PHYSICAL") if cons is not None else "UNAVAILABLE",
                         "generation_minus_consumption_kwh": balance(gen, cons), "generation_reason": generation_reason,
@@ -70,7 +73,7 @@ def overview(cur, dev, meters, today, days):
                         "missing_consumption_wings": missing})
     return {"device_id": did, "mode": mode, "version": dev["energy_calculation_version"], "operating_date": today.isoformat(),
             "consumption_basis": "MONTHLY_BILL_DAILY_REFERENCE" if mode == "MANUAL" else "PHYSICAL_CONSUMPTION_METERS",
-            "wings": wings, "society": {"today": society[-1], "rows": society}}
+            "wings": wings, "society": {"today": society[-1], "rows": society}, **scope}
 
 
 def month_overview(cur, dev, meters, operating_day, month, calendar_today):

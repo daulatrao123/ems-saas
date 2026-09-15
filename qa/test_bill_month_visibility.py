@@ -62,6 +62,11 @@ class BillMonthCursor:
             self._rows = [deepcopy(r) for r in self.state["meters"].get(did, [])]
             return
 
+        if q.startswith("select slot, disabled from slot_configs where device_id=%s"):
+            did = str(params[0])
+            self._rows = [deepcopy(r) for r in self.state.get("slot_configs", {}).get(did, [])]
+            return
+
         if q.startswith("select max(operating_date) as d from energy_daily where device_id=%s and status='open'"):
             did = str(params[0])
             days = [r["operating_date"] for r in self.state["daily"].get(did, []) if r["status"] == "OPEN"]
@@ -326,6 +331,7 @@ class BillMonthVisibilityRegression(unittest.TestCase):
                 (self.did, "D"): [],
                 (self.other, "A"): [{"bill_month": date(2026, 9, 1), "consumption_kwh": 1234.0, "days": 30, "note": "other-device", "source": "HISTORICAL", "created_by": "u-admin", "updated_by": "u-admin", "created_at": now, "updated_at": now}],
             },
+            "slot_configs": {self.did: [], self.other: []},
         }
 
         for guard in (

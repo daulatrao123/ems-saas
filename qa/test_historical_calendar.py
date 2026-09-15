@@ -53,6 +53,11 @@ class FakeCursor:
             self._rows = deepcopy(self.state["meters"])
             return
 
+        if q.startswith("select slot, disabled from slot_configs where device_id=%s"):
+            did = str(params[0])
+            self._rows = deepcopy(self.state.get("slot_configs", {}).get(did, []))
+            return
+
         if q.startswith("select max(bill_month) as month from energy_bill_history"):
             _did, wing, cutoff = params
             rows = [r for r in self.state["bill_rows"].get(wing, []) if r["bill_month"] <= cutoff]
@@ -267,6 +272,7 @@ class HistoricalCalendarRegression(unittest.TestCase):
                 ],
                 "D": [],
             },
+            "slot_configs": {self.device_id: []},
         }
 
         def get_db():

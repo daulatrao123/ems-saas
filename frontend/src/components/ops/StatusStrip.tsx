@@ -33,7 +33,7 @@ export function StatusStrip({ device, resetDay }: { device: Device | null; reset
       <Stat id="cpu" name="CPU Temp" value={cpu} sub={health?.sampled_at ? `${freshness === "STALE" && measured != null ? `Last ${measured.toFixed(1)}°C · ` : ""}Sampled ${fmtDateTime(health.sampled_at)}` : "Measurement unavailable"} tone={freshness !== "CURRENT" || measured == null ? "text-gray-500" : undefined} />
       <Stat id="uptime" name="Uptime" value={up} tone={up === "N/A" ? "text-gray-500" : undefined} />
       <Stat id="boots" name="Boots since tracking began" value={boots} sub={health?.boot.tracking_since ? `${freshness === "STALE" && count != null ? `Last ${count} · ` : ""}Since ${fmtDateTime(health.boot.tracking_since)}` : "Observed OS boots · unknown"} tone={freshness !== "CURRENT" || count == null ? "text-gray-500" : undefined} />
-      <Stat id="last-sync" name="Last Sync" value={device?.last_sync ? ago(device.last_sync) : "never"} sub={device?.config_state ? `config ${device.config_state}` : undefined} tone={device?.connected ? "text-emerald-400" : "text-red-400"} />
+      <Stat id="last-sync" name="Last Sync" value={device?.last_sync ? ago(device.last_sync) : "never"} sub={`${fmtDateTime(device?.last_sync)}${device?.config_state ? ` · config ${device.config_state}` : ""}`} tone={device?.connected ? "text-emerald-400" : "text-red-400"} />
     </div>
     <WatchdogHealth health={health} connected={device?.connected === true} />
     </div>

@@ -9,6 +9,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from . import queries as Q
+from .consumption_scope import consumption_scope
 
 FORMULA = "SUM(monthly_kwh / actual_calendar_days) / valid_months"
 
@@ -130,10 +131,12 @@ def allocation_reference(generation, targets, enabled, limit):
 def overview(cur, dev, meters, today, *, calendar_today):
     did = str(dev["id"])
     wings = {w: wing_reference(cur, did, w, today, meters[mid]["enabled"], calendar_today=calendar_today) for w, mid in zip(Q.WINGS, ("M2", "M3", "M4", "M5"))}
-    history = [wings[w]["history"]["reference_daily_kwh"] for w in Q.WINGS]
-    effective = [wings[w]["effective"]["daily_kwh"] for w in Q.WINGS]
-    all_history, all_effective = all(v is not None for v in history), all(v is not None for v in effective)
-    sources = {wings[w]["effective"]["source"] for w in Q.WINGS}
+    scope = consumption_scope(cur, did)
+    included = scope["included_wings"]
+    history = [wings[w]["history"]["reference_daily_kwh"] for w in included]
+    effective = [wings[w]["effective"]["daily_kwh"] for w in included]
+    all_history, all_effective = bool(included) and all(v is not None for v in history), bool(included) and all(v is not None for v in effective)
+    sources = {wings[w]["effective"]["source"] for w in included}
     cur.execute("SELECT generation_kwh, generation_source FROM energy_daily WHERE device_id=%s AND operating_date=%s", (did, today))
     measured = cur.fetchone()
     generation = measured["generation_kwh"] if meters["M1"]["enabled"] and measured and measured["generation_source"] == "PHYSICAL" else None
@@ -148,4 +151,4 @@ def overview(cur, dev, meters, today, *, calendar_today):
     return {"wings": wings, "society_historical_daily_kwh": rounded(sum(history)) if all_history else None,
             "society_reference_daily_kwh": rounded(sum(effective)) if all_effective else None,
             "society_reference_source": next(iter(sources)) if all_effective and len(sources) == 1 else "MIXED_REFERENCE" if all_effective else "UNAVAILABLE",
-            "grid": grid, "allocation": allocation}
+            "grid": grid, "allocation": allocation, **scope}

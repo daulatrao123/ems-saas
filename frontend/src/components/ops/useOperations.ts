@@ -1,7 +1,8 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import api from "@/lib/api";
-import { CommandRow, Dashboard, EventRow, LastResponse, errorText } from "./types";
+import { LastResponse, errorText } from "./types";
+import { useOperationsRead } from "./useOperationsRead";
 
 export type QueueFn = (deviceId: string, command: string, slot: string, params?: Record<string, unknown>) => Promise<boolean>;
 // LOGICAL slot enable/disable (slot_configs.disabled). Never touches GPIO, toggle or contactor state.
@@ -9,52 +10,15 @@ export type SlotConfigFn = (deviceId: string, slot: string, patch: { disabled?: 
 
 // Single data source for the operational dashboard. Explicit, targeted refreshes only — no polling.
 export function useOperations(societyId: string | null) {
-  const [dash, setDash] = useState<Dashboard | null>(null);
-  const [commands, setCommands] = useState<Record<string, CommandRow[]>>({});
-  const [events, setEvents] = useState<EventRow[]>([]);
+  const { dash, commands, events, error, panelErrors, loading, loadDashboard, loadCommands, loadEvents, refreshAll } = useOperationsRead(societyId);
   const [last, setLast] = useState<LastResponse | null>(null);
-  const [error, setError] = useState<string>("");
-  const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<Set<string>>(new Set());  // `${deviceId}:${command}:${slot}` in flight
   const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
 
-  const readDashboard = useCallback(async (sid: string): Promise<Dashboard> => {
-    const [dashboard, inventory] = await Promise.all([
-      api.get(`/api/admin/dashboard?society_id=${sid}`),
-      api.get(`/api/admin/devices?society_id=${sid}`).catch(() => null),
-    ]);
-    const metadata: { id: string; feedback_hardware_installed?: boolean }[] = inventory?.data?.devices || [];
-    return { ...dashboard.data, devices: (dashboard.data as Dashboard).devices.map((device) => {
-      const installed = metadata.find((item) => item.id === device.id)?.feedback_hardware_installed;
-      return { ...device, feedback_hardware_installed: typeof installed === "boolean" ? installed : device.feedback_hardware_installed };
-    }) };
-  }, []);
-  const loadDashboard = useCallback(async (sid: string) => {
-    try { setDash(await readDashboard(sid)); setError(""); }
-    catch (e) { setError(errorText(e).detail); }
-  }, [readDashboard]);
-  const loadCommands = useCallback(async (sid: string, deviceId: string) => {
-    try { const r = await api.get(`/api/admin/pi-commands?society_id=${sid}&device_id=${deviceId}&limit=25`); setCommands((c) => ({ ...c, [deviceId]: r.data.commands })); } catch { /* shown via error state */ }
-  }, []);
-  const loadEvents = useCallback(async (sid: string) => {
-    try { setEvents((await api.get(`/api/admin/pi-events?society_id=${sid}&latest=50`)).data.events); } catch { /* optional */ }
-  }, []);
-
-  const refreshAll = useCallback(async (sid: string) => {
-    const r = await readDashboard(sid).catch((e) => { setError(errorText(e).detail); return null; });
-    if (r) { setDash(r); await Promise.all([...r.devices.map((d) => loadCommands(sid, d.id)), loadEvents(sid)]); }
-    setLoading(false);
-  }, [readDashboard, loadCommands, loadEvents]);
-
   useEffect(() => {
     const pending = timers.current;
-    if (societyId) Promise.resolve().then(() => refreshAll(societyId));   // async fetch; state updates happen in callbacks
-    const metadataChanged = (event: Event) => {
-      if (societyId && (event as CustomEvent<{ societyId: string }>).detail?.societyId === societyId) void loadDashboard(societyId);
-    };
-    window.addEventListener("ems-device-metadata-changed", metadataChanged);
-    return () => { pending.forEach(clearTimeout); window.removeEventListener("ems-device-metadata-changed", metadataChanged); };
-  }, [societyId, refreshAll, loadDashboard]);
+    return () => { pending.forEach(clearTimeout); };
+  }, [societyId]);
 
   const queue: QueueFn = useCallback(async (deviceId, command, slot, params = {}) => {
     if (!societyId) return false;
@@ -99,5 +63,5 @@ export function useOperations(societyId: string | null) {
   }, [societyId, pending, loadDashboard]);
 
   const isPending = (deviceId: string, command: string, slot = "") => pending.has(`${deviceId}:${command}:${slot}`);
-  return { dash, commands, events, last, error, loading, queue, setSlotConfig, isPending, refresh: () => societyId && refreshAll(societyId) };
+  return { dash, commands, events, last, error, panelErrors, loading, queue, setSlotConfig, isPending, refresh: () => societyId && refreshAll(societyId) };
 }

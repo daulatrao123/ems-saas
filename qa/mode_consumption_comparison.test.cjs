@@ -53,6 +53,51 @@ function loadTsx(relPath, exportName, mocks = {}) {
   const module = { exports: {} };
   const req = (id) => {
     if (id in mocks) return mocks[id];
+    if (id === "./scopeValidation") return { scopeValid: loadTsx("frontend/src/components/ops/energy/scopeValidation.ts", "scopeValid") };
+    if (id === "./ConsumptionScopeLabel") return { ConsumptionScopeLabel: () => ({ type: "div", props: { "data-testid": "scope-label" } }) };
+    if (id === "../readRequest") {
+      const api = mocks["@/lib/api"];
+      return {
+        readRequest: (url, signal) => {
+          if (!api || typeof api.get !== "function") throw new Error("readRequest mock requires @/lib/api.get");
+          return api.get(url, { signal, timeout: 12000 });
+        },
+        record: (v) => !!v && typeof v === "object" && !Array.isArray(v),
+        text: (v) => typeof v === "string",
+        finite: (v) => typeof v === "number" && Number.isFinite(v),
+        nullableNumber: (v) => v === null || (typeof v === "number" && Number.isFinite(v)),
+      };
+    }
+    if (id === "./readRequest") {
+      return {
+        finite: (v) => typeof v === "number" && Number.isFinite(v),
+        text: (v) => typeof v === "string",
+        record: (v) => !!v && typeof v === "object" && !Array.isArray(v),
+      };
+    }
+    if (id === "./readValidation") {
+      return {
+        summaryValid: loadTsx("frontend/src/components/ops/energy/readValidation.ts", "summaryValid"),
+        comparisonValid: loadTsx("frontend/src/components/ops/energy/readValidation.ts", "comparisonValid"),
+        monthlyValid: loadTsx("frontend/src/components/ops/energy/readValidation.ts", "monthlyValid"),
+        allocationValid: loadTsx("frontend/src/components/ops/energy/readValidation.ts", "allocationValid"),
+        eventsValid: loadTsx("frontend/src/components/ops/energy/readValidation.ts", "eventsValid"),
+        entriesValid: loadTsx("frontend/src/components/ops/energy/readValidation.ts", "entriesValid"),
+      };
+    }
+    if (id === "../operationsValidation") {
+      return { eventsValid: loadTsx("frontend/src/components/ops/operationsValidation.ts", "eventsValid") };
+    }
+    if (id === "./useEnergyHistory") {
+      return { useEnergyHistory: loadTsx("frontend/src/components/ops/energy/useEnergyHistory.ts", "useEnergyHistory", mocks) };
+    }
+    if (id === "./types") {
+      return {
+        DEFAULT_MONTHS: 6,
+        WINGS: ["A", "B", "C", "D"],
+        isAllocationEvent: () => false,
+      };
+    }
     if (id === "./comparisonLabels") return {
       missingReason: loadTsx("frontend/src/components/ops/energy/comparisonLabels.ts", "missingReason"),
       monthLabel: loadTsx("frontend/src/components/ops/energy/comparisonLabels.ts", "monthLabel"),
@@ -62,6 +107,49 @@ function loadTsx(relPath, exportName, mocks = {}) {
   vm.runInNewContext(out, { module, exports: module.exports, require: req, console, URLSearchParams, AbortController, setInterval: () => 1, clearInterval: () => {} }, { filename: `${exportName}.compiled.cjs` });
   return module.exports[exportName];
 }
+
+const WINGS = ["A", "B", "C", "D"];
+const meterFor = (w) => ({ A: "M2", B: "M3", C: "M4", D: "M5" }[w]);
+const metric = (kwh, status = "PHYSICAL") => ({
+  status,
+  today: { kwh, status },
+  yesterday: { kwh, status },
+  this_month: { kwh, status },
+  previous_month: { kwh, status },
+  this_year: { kwh, status },
+  lifetime: { kwh, status },
+  reset_period: { kwh, status },
+});
+function summaryFixture(deviceId, mode, version, day) {
+  return {
+    device_id: deviceId,
+    as_of_operating_date: day,
+    calculation: { mode, version, operating_date: day },
+    generation_meter: { generation: metric(100), unattributed: null },
+    wings: Object.fromEntries(WINGS.map((w) => [w, {
+      wing: w,
+      consumption_meter: { meter_id: meterFor(w), enabled: true, comm_status: "ONLINE" },
+      generation: metric(10),
+      consumption: metric(9, mode === "MANUAL" ? "HISTORICAL" : "PHYSICAL"),
+      required_generation: { target_kwh_per_day: 10, achievement_percent: 100, status: "OK" },
+    }])),
+  };
+}
+function point(day, consumed, mode) {
+  return {
+    date: day,
+    generated_kwh: 100,
+    consumed_kwh: consumed,
+    generation_minus_consumption_kwh: 100 - consumed,
+    generation_source: "PHYSICAL",
+    consumption_source: mode === "MANUAL" ? "HISTORICAL" : "PHYSICAL",
+  };
+}
+function comparisonFixture(deviceId, mode, version, day, consumed) {
+  const wingSeries = Object.fromEntries(WINGS.map((w) => [w, { wing: w, today: point(day, consumed, mode), rows: [point(day, consumed, mode)] }]));
+  return { device_id: deviceId, mode, version, operating_date: day, society: { today: point(day, consumed, mode), rows: [point(day, consumed, mode)] }, wings: wingSeries };
+}
+const allocationFixture = (flag) => ({ enabled: true, sequence: [...WINGS], wings: Object.fromEntries(WINGS.map((w) => [w, { generation_attribution_enabled: w === "A" ? flag : true }])) });
 
 test("EnergyComparisonChart renders both series; missing bars stay absent; zero/negative handled", () => {
   const chartSrc = fs.readFileSync(path.join(__dirname, "..", "frontend", "src", "components", "ops", "energy", "EnergyComparisonChart.tsx"), "utf8");
@@ -236,9 +324,12 @@ test("useEnergy runtime rejects mismatched/delayed comparisons and refreshes bil
   const api = { get(url) {
     const did=new URLSearchParams(url.split("?")[1]).get("device_id"), value=server[did];
     const day="2026-09-30";
-    const data=url.includes("/summary?") ? {device_id:did,as_of_operating_date:day,calculation:{mode:value.mode,version:value.version}}
-      : url.includes("/graph/comparison?") ? {device_id:did,mode:value.mode,version:value.version,operating_date:day,society:{today:{consumed_kwh:value.bill}},...mismatch}
-      : {device_id:did,rows:[],events:[],allocation:{}};
+    const data=url.includes("/summary?") ? summaryFixture(did, value.mode, value.version, day)
+      : url.includes("/graph/comparison?") ? { ...comparisonFixture(did, value.mode, value.version, day, value.bill), ...mismatch }
+      : url.includes("/generation/monthly?") ? { meter_id: "M1", rows: [{ month: "2026-09", generation_kwh: 100, source: "PHYSICAL" }] }
+      : url.includes("/allocation?") ? { allocation: allocationFixture(true) }
+      : url.includes("/adjustments?") ? { rows: [] }
+      : { events: [] };
     return deferOne && did==="one" ? gate.then(()=>({data})) : Promise.resolve({data});
   }};
   const useEnergy=loadTsx("frontend/src/components/ops/energy/useEnergy.ts","useEnergy",{
@@ -246,7 +337,8 @@ test("useEnergy runtime rejects mismatched/delayed comparisons and refreshes bil
   });
   const render=()=>{index=0;const value=useEnergy("1",selected);const work=effects;effects=[];work.forEach(fn=>fn());return value;};
   const flush=()=>new Promise(resolve=>setImmediate(resolve));
-  render();await flush();let result=render();
+  const settle = async (ok) => { let out = render(); for (let i = 0; i < 6 && !ok(out); i++) { await flush(); out = render(); } return out; };
+  render();await flush();let result=await settle((r) => !!r.comparison);
   assert.equal(result.comparison.society.today.consumed_kwh,10);
   for(const bad of [{mode:"AUTO"},{version:999},{operating_date:"2026-09-29"},{device_id:"foreign"}]) {
     mismatch=bad;await result.refresh();result=render();
@@ -257,9 +349,9 @@ test("useEnergy runtime rejects mismatched/delayed comparisons and refreshes bil
   server.one.bill=31;await result.refresh();result=render();
   assert.equal(result.comparison.society.today.consumed_kwh,31);
   deferOne=true;const oldRefresh=result.refresh();await flush();
-  selected="two";result=render();assert.equal(result.comparison,null,"old device masked immediately");await flush();result=render();
+  selected="two";result=render();assert.equal(result.comparison,null,"old device masked immediately");result=await settle((r) => r.comparison?.device_id === "two");
   assert.equal(result.comparison.device_id,"two");
-  release();await oldRefresh;await flush();result=render();
+  release();await oldRefresh;result=await settle((r) => r.comparison?.device_id === "two");
   assert.equal(result.comparison.device_id,"two","late device one cannot overwrite device two");
   assert.equal(result.comparison.society.today.consumed_kwh,20);
   for(const slot of slots) slot?.cleanup?.();
@@ -356,9 +448,12 @@ test("useEnergy publishes core data despite pending history and never leaks old-
   const options=[];
   const api={get(url,opts){
     options.push(opts);const device=new URLSearchParams(url.split("?")[1]).get("device_id"),day="2026-09-30";
-    let data=url.includes("/summary?")?{device_id:device,as_of_operating_date:day,calculation:{mode:"MANUAL",version:1}}
-      :url.includes("/graph/comparison?")?{device_id:device,mode:"MANUAL",version:1,operating_date:day}
-      :url.includes("/allocation?")?{allocation:{owner:device}}:{meter_id:"M1",rows:[],events:[]};
+    let data=url.includes("/summary?") ? summaryFixture(device, "MANUAL", 1, day)
+      :url.includes("/graph/comparison?") ? comparisonFixture(device, "MANUAL", 1, day, 10)
+      :url.includes("/allocation?") ? { allocation: allocationFixture(device === "one") }
+      :url.includes("/generation/monthly?") ? { meter_id:"M1",rows:[{month:"2026-09",generation_kwh:50,source:"PHYSICAL"}] }
+      :url.includes("/adjustments?") ? { rows: [] }
+      : { events: [] };
     if(url.includes("/pi-events?")&&device==="one"&&defer)return pending.then(()=>({data}));
     if(url.includes("/pi-events?")&&device==="two")data={events:{invalid:true}};
     return Promise.resolve({data});
@@ -366,11 +461,12 @@ test("useEnergy publishes core data despite pending history and never leaks old-
   const useEnergy=loadTsx("frontend/src/components/ops/energy/useEnergy.ts","useEnergy",{react:hooks,"@/lib/api":api,"./types":{DEFAULT_MONTHS:6,isAllocationEvent:()=>false},"../types":{errorText:e=>({detail:String(e)})}});
   const render=()=>{index=0;const out=useEnergy("1",selected);const work=effects;effects=[];work.forEach(fn=>fn());return out;};
   const flush=()=>new Promise(resolve=>setImmediate(resolve));
-  render();await flush();let result=render();assert.equal(result.allocation.owner,"one");
+  const settle = async (ok) => { let out = render(); for (let i = 0; i < 6 && !ok(out); i++) { await flush(); out = render(); } return out; };
+  render();await flush();let result=await settle((r) => !!r.allocation && !!r.comparison);assert.equal(result.allocation.wings.A.generation_attribution_enabled,true);
   defer=true;const old=result.refresh();await flush();result=render();
-  assert.equal(result.loading,false);assert.equal(result.comparison.device_id,"one");assert.equal(result.allocation,null,"optional panels cleared while loading");
+  assert.equal(result.loading,false);assert.equal(result.comparison.device_id,"one");assert.equal(result.allocation.wings.A.generation_attribution_enabled,true,"allocation publishes independently of hanging event history");
   selected="two";result=render();assert.equal(result.summary,null);assert.equal(result.allocation,null);
-  await flush();result=render();assert.equal(result.loading,false);assert.equal(result.comparison.device_id,"two");assert.equal(result.allocation.owner,"two");assert.equal(result.events.length,0);assert.match(result.error,/Event history response unavailable/);
-  release();await old;await flush();result=render();assert.equal(result.allocation.owner,"two");assert.equal(result.comparison.device_id,"two");
+  result = await settle((r) => r.comparison?.device_id === "two" && !!r.allocation);assert.equal(result.loading,false);assert.equal(result.comparison.device_id,"two");assert.equal(result.allocation.wings.A.generation_attribution_enabled,false);assert.equal(result.events.length,0);assert.equal(result.panelErrors.length,1);assert.match(result.panelErrors[0],/Event history unavailable/);
+  release();await old;result = await settle((r) => r.comparison?.device_id === "two" && !!r.allocation);assert.equal(result.allocation.wings.A.generation_attribution_enabled,false);assert.equal(result.comparison.device_id,"two");
   assert.ok(options.every(o=>o.timeout===12000));for(const slot of slots)slot?.cleanup?.();
 });

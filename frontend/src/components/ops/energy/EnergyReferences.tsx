@@ -5,6 +5,7 @@ import { BillHistoryDialog } from "./BillHistoryDialog";
 import { GridReferencePanel } from "./GridReferencePanel";
 import { EnergySummary, WingCode, WINGS } from "./types";
 import { dailyRate, referenceSource } from "./referenceTypes";
+import { ConsumptionScopeLabel } from "./ConsumptionScopeLabel";
 
 export function EnergyReferences({ societyId, societyName, controllerName, summary, readOnly, refresh, onSavedMonth, children }: {
   societyId: string; societyName: string; controllerName: string; summary: EnergySummary; readOnly: boolean; refresh: () => void; onSavedMonth: (month: string) => void; children: ReactNode;
@@ -15,6 +16,7 @@ export function EnergyReferences({ societyId, societyName, controllerName, summa
     {children}
     <details data-testid="historical-consumption-section" className="border-t border-[#1e2a3a] pt-4 space-y-4">
       <summary data-testid="historical-consumption-title" className="text-base font-bold text-white cursor-pointer">Historical averages · separate from selected-month values</summary>
+      <ConsumptionScopeLabel data={data} scope="society-reference" />
       <dl className="flex flex-wrap gap-x-10 gap-y-3 text-xs">
         <div><dt className="text-gray-400">Society historical baseline</dt><dd data-testid="society-historical-baseline" className="text-lg text-cyan-200 mt-1">{dailyRate(data.society_historical_daily_kwh)}</dd></div>
         <div><dt className="text-gray-400">Reference daily consumption</dt><dd data-testid="society-consumption-reference" className="text-lg text-white mt-1">{dailyRate(data.society_reference_daily_kwh)}</dd></div>

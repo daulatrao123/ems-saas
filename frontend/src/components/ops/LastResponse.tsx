@@ -11,6 +11,9 @@ export function LastResponse({ last, row: storedRow, scope = "last-response", em
   // A logical slot-config save is newer than any stored Pi command row -> show the save, not the stale row.
   const configNewer = !!last && last.kind === "queued" && last.command_id === "config" && (!storedRow || !storedRow.created_at || new Date(last.at) > new Date(storedRow.created_at));
   const row = configNewer ? null : storedRow;
+  const contactorVerified = row?.result === "VERIFIED_ON" || row?.result === "VERIFIED_OFF";
+  const gpioConfirmed = row?.result === "GPIO_CONFIRMED";
+  const verificationLabel = contactorVerified ? "CONTACTOR VERIFIED" : gpioConfirmed ? "GPIO CONFIRMED" : "ACKNOWLEDGED";
   return (
     <section data-testid={scope} className={embedded ? "border-t border-[#1e2a3a] pt-3 min-w-0" : `${panel} p-4`}>
       <div data-testid={`${scope}-heading`} className={label}>{embedded ? "Last Command" : "Device Response"}</div>
@@ -24,12 +27,12 @@ export function LastResponse({ last, row: storedRow, scope = "last-response", em
             {row ? (
               <>
                 <Row scope={scope} k="SEQUENCE" v={`#${row.sequence_no}`} />
-                <Row scope={scope} k="STATUS" v={`${row.status.toUpperCase()}${TERMINAL.has(row.status) ? "" : " …"}`} tone={statusTone(row.status)} />
+                <Row scope={scope} k="STATUS" v={`${row.status === "hardware_verified" ? verificationLabel : row.status.toUpperCase()}${TERMINAL.has(row.status) ? "" : " …"}`} tone={statusTone(row.status)} />
                 <Row scope={scope} k="RESULT" v={row.result || "—"} tone={row.result ? "text-cyan-300" : "text-gray-500"} />
                 {row.error && <Row scope={scope} k="ERROR" v={row.error} tone="text-red-400" />}
                 <Row scope={scope} k="REQUESTED" v={fmtTime(row.created_at)} />
                 <Row scope={scope} k="DELIVERED" v={fmtTime(row.delivered_at)} />
-                {row.hardware_verified_at && <Row scope={scope} k="HW VERIFIED" v={fmtTime(row.hardware_verified_at)} tone="text-emerald-300" />}
+                {row.hardware_verified_at && <Row scope={scope} k={verificationLabel} v={fmtTime(row.hardware_verified_at)} tone={contactorVerified ? "text-emerald-300" : "text-gray-300"} />}
                 <Row scope={scope} k="COMPLETED" v={fmtTime(row.completed_at)} />
                 {Object.keys(row.params || {}).length > 0 && <Row scope={scope} k="PARAMS" v={JSON.stringify(row.params)} />}
               </>

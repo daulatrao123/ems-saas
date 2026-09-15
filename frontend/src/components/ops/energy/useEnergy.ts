@@ -1,64 +1,62 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import api from "@/lib/api";
-import { EventRow, errorText } from "../types";
-import { AllocationConfig, CalculationMode, DEFAULT_MONTHS, EnergySummary, EnergyComparison, ManualEntry, ManualEntryInput, MonthlyGeneration, isAllocationEvent } from "./types";
+import { errorText } from "../types";
+import { CalculationMode, EnergySummary, EnergyComparison, ManualEntryInput } from "./types";
+import { readRequest } from "../readRequest";
+import { summaryValid, comparisonValid } from "./readValidation";
+import { useEnergyHistory } from "./useEnergyHistory";
 
 // One device-scoped source. Mode writes are calculation-only; manual writes append
 // existing adjustments. Neither path uses hardware commands or allocation writes.
 export function useEnergy(societyId: string | null, deviceId: string | null) {
   const key = `${societyId}:${deviceId}`;
   const request = useRef(0);
+  const controller = useRef(new AbortController());
+  const history = useEnergyHistory();
+  const loadHistory = history.load;
   const pendingWrites = useRef(new Set<string>());
   const [busyKeys, setBusyKeys] = useState<string[]>([]);
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
   const [summary, setSummary] = useState<EnergySummary | null>(null);
   const [comparison, setComparison] = useState<EnergyComparison | null>(null);
-  const [monthly, setMonthly] = useState<MonthlyGeneration | null>(null);
-  const [allocation, setAllocation] = useState<AllocationConfig | null>(null);
-  const [events, setEvents] = useState<EventRow[]>([]);
-  const [entries, setEntries] = useState<ManualEntry[]>([]);
   const [write, setWrite] = useState<{ key: string; token: number; busy: boolean; error: string; notice: string } | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     const version = ++request.current;
-    if (!societyId || !deviceId) { setLoading(false); return; }
+    controller.current.abort(); controller.current = new AbortController();
+    const signal = controller.current.signal;
+    const current = () => version === request.current && !signal.aborted;
+    if (!societyId || !deviceId) { setSummary(null); setComparison(null); setLoading(false); return; }
     const q = `society_id=${societyId}&device_id=${deviceId}`;
-    setLoading(true);
-    setMonthly(null); setAllocation(null); setEvents([]); setEntries([]);
-    const read = (url: string) => api.get(url, { timeout: 12000 });
-    const core = Promise.allSettled([read(`/api/energy/summary?${q}`), read(`/api/energy/graph/comparison?${q}&days=30`)]);
-    const secondary = Promise.allSettled([
-      read(`/api/energy/generation/monthly?${q}&months=${DEFAULT_MONTHS}`), read(`/api/energy/allocation?${q}`),
-      read(`/api/admin/pi-events?${q}&latest=100`), read(`/api/energy/adjustments?${q}&limit=50`),
-    ]);
-    const [s, c] = await core;
-    if (version !== request.current) return;
-    const validSummary = s.status === "fulfilled" && s.value.data?.device_id === deviceId;
-    setSummary(validSummary ? s.value.data : null);
-    const validComparison = validSummary && c.status === "fulfilled" && c.value.data?.device_id === deviceId
+    setLoading(true); setSummary(null); setComparison(null); setError("");
+    loadHistory(q, signal, current);
+    const comparisonRead = readRequest(`/api/energy/graph/comparison?${q}&days=30`, signal)
+      .then((value) => ({ status: "fulfilled" as const, value }), (reason) => ({ status: "rejected" as const, reason }));
+    let snapshot: EnergySummary | null = null;
+    try {
+      const { data } = await readRequest(`/api/energy/summary?${q}`, signal);
+      if (!current()) return;
+      if (!summaryValid(data, deviceId)) throw new Error("Invalid energy summary");
+      snapshot = data; setSummary(data);
+    } catch (e) { if (current()) setError(`Energy summary unavailable: ${errorText(e).detail}`); }
+    finally { if (current()) { setLoadedKey(`${societyId}:${deviceId}`); setLoading(false); } }
+    // Summary and each optional panel publish independently; comparison still
+    // requires matching device/mode/version/day before becoming visible.
+    const c = await comparisonRead;
+    if (!current() || !snapshot) return;
+    const s = { value: { data: snapshot } };
+    const validComparison = c.status === "fulfilled" && comparisonValid(c.value.data) && c.value.data.device_id === deviceId
       && c.value.data.mode === s.value.data.calculation?.mode && c.value.data.version === s.value.data.calculation?.version
-      && c.value.data.operating_date === s.value.data.as_of_operating_date;
-    setComparison(validComparison ? c.value.data : null);
-    const coreFailed = [s, c].find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
-    setError(coreFailed ? errorText(coreFailed.reason).detail : !validSummary ? "Energy ownership unavailable for this device" : !validComparison ? "Comparison unavailable for the current mode/day; refresh energy data" : "");
-    setLoadedKey(`${societyId}:${deviceId}`);
-    setLoading(false);
-    // Optional panels cannot prevent saved-bill/current comparison visibility.
-    const [m, a, e, j] = await secondary;
-    if (version !== request.current) return;
-    setMonthly(m.status === "fulfilled" && m.value.data?.meter_id === "M1" ? m.value.data : null);
-    setAllocation(a.status === "fulfilled" ? a.value.data?.allocation : null);
-    setEvents(e.status === "fulfilled" && Array.isArray(e.value.data?.events) ? (e.value.data.events as EventRow[]).filter((r) => r && isAllocationEvent(r.level)) : []);
-    setEntries(j.status === "fulfilled" && Array.isArray(j.value.data?.rows) ? j.value.data.rows : []);
-    const failed = [m, a, e, j].find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
-    const detail = failed ? `Optional energy history unavailable: ${errorText(failed.reason).detail}` : e.status === "fulfilled" && !Array.isArray(e.value.data?.events) ? "Event history response unavailable" : "";
-    if (detail) setError((currentError) => currentError || detail);
-  }, [societyId, deviceId]);
+      && c.value.data.operating_date === s.value.data.as_of_operating_date
+      && (!snapshot.references?.included_wings || JSON.stringify(c.value.data.included_wings) === JSON.stringify(snapshot.references.included_wings));
+    setComparison(validComparison ? c.value.data as EnergyComparison : null);
+    if (!validComparison) setError("Comparison unavailable for the current mode/day; refresh energy data");
+  }, [societyId, deviceId, loadHistory]);
 
-  useEffect(() => { const counter = request; Promise.resolve().then(load); return () => { ++counter.current; }; }, [load]);
+  useEffect(() => { let active = true; const counter = request, reads = controller; Promise.resolve().then(() => { if (active) void load(); }); return () => { active = false; ++counter.current; reads.current.abort(); }; }, [load]);
   // A response from another selection must never be rendered, even for one frame.
   const current = loadedKey === key && !!societyId && !!deviceId;
   const mutate = async (mode: CalculationMode | null, entry?: ManualEntryInput) => {
@@ -85,8 +83,8 @@ export function useEnergy(societyId: string | null, deviceId: string | null) {
     }
     return saved;
   };
-  return { summary: current ? summary : null, comparison: current ? comparison : null, monthly: current ? monthly : null, allocation: current ? allocation : null,
-    events: current ? events : [], entries: current ? entries : [], error: current ? error : "", loading: loading || !current,
+  return { summary: current ? summary : null, comparison: current ? comparison : null, monthly: current ? history.monthly : null, allocation: current ? history.allocation : null,
+    events: current ? history.events : [], entries: current ? history.entries : [], panelErrors: current ? history.panelErrors : [], error: current ? error : "", loading: !!societyId && !!deviceId && (loading || !current),
     refresh: () => { setWrite((previous) => previous?.key === key ? { ...previous, error: "", notice: "" } : previous); return load(); },
     saving: busyKeys.includes(key), saveError: write?.key === key ? write.error : "", notice: write?.key === key ? write.notice : "",
     setMode: (mode: CalculationMode) => mutate(mode), addEntry: (entry: ManualEntryInput) => mutate(null, entry) };

@@ -2186,7 +2186,7 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
             soc = cur.fetchone()
             if not soc:
                 raise HTTPException(404, "Society not found")
-            cur.execute("SELECT id, name, firmware_version FROM pi_devices WHERE society_id = %s ORDER BY name ASC", (sid,))
+            cur.execute("SELECT id, name, firmware_version, feedback_hardware_installed FROM pi_devices WHERE society_id = %s ORDER BY name ASC", (sid,))
             devs = cur.fetchall()
 
             devices_data = []
@@ -2206,6 +2206,7 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                         "status": "ACTIVE" if pi and pi.get("active_slot") == c["slot"] else "IDLE",
                         "display_name": c["display_name"],
                         "disabled": c["disabled"],
+                        "feedback_enabled": c.get("feedback_enabled") is True,
                         "physical_toggle": st.get("physical_toggle", "UNKNOWN"),  # contactor feedback
                         "toggle_input": st.get("toggle_input") or "UNKNOWN",      # physical toggle (Pi telemetry)
                         "visible": slot_is_visible(c, st),
@@ -2232,6 +2233,7 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "storage_state": ("FAILED" if pi.get("disk_free_mb", 0) < 0 else "OK") if pi and pi.get("disk_free_mb") is not None else "UNKNOWN",
                     # Real Pi-reported telemetry already stored by /api/pi/sync (read-only exposure; None = never reported)
                     "firmware_version": dev.get("firmware_version"),
+                    "feedback_hardware_installed": dev.get("feedback_hardware_installed") is True,
                     "last_sync": pi["last_sync"].isoformat() if pi and pi.get("last_sync") else None,
                     "telemetry": {
                         "cpu_temp": controller_health["cpu"]["celsius"],

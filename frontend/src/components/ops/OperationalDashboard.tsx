@@ -8,7 +8,6 @@ import { LcdMessagePanel } from "./LcdMessagePanel";
 import { SlotCard, SlotOperations } from "./SlotCard";
 import { SystemControls, ResetDayControl } from "./SystemControls";
 import { UnitAllotment } from "./UnitAllotment";
-import { LcdControl } from "./LcdControl";
 import { LastResponse } from "./LastResponse";
 import { OperationalLogs } from "./OperationalLogs";
 import { Confirm, ConfirmDialog } from "./ConfirmDialog";
@@ -30,16 +29,16 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
   const mode = energy.summary?.calculation?.mode;
   const reportedWing = energy.summary?.generation_meter?.active_generation_wing;
   const activeGenerationWing = device?.connected && device.feedback_hardware_installed === true && !device.hardware_fault
-    && (!reportedWing || device.slots[reportedWing]?.feedback_enabled !== false) ? reportedWing : undefined;
+    && reportedWing && device.slots[reportedWing]?.feedback_enabled === true ? reportedWing : undefined;
   if (ops.loading && !ops.dash) return <div data-testid="ops-loading" className="p-10 text-center text-gray-500 font-mono text-sm">LOADING OPERATIONS…</div>;
-  if (!ops.dash) return <div data-testid="ops-error" className={`${panel} m-6 p-6 text-red-400 font-mono text-sm`}>{ops.error || "Dashboard unavailable"}</div>;
+  if (!ops.dash) return <div data-testid="ops-error" className={`${panel} m-6 p-6 text-red-400 font-mono text-sm`}>{ops.error || "Dashboard unavailable"}<button data-testid="ops-retry" className={`${btn} ${tone.gray} ml-3`} onClick={() => void ops.refresh()}>RETRY</button></div>;
   const cmds = device ? ops.commands[device.id] || [] : [];
   const lastRow = cmds.find((c) => !SLOT_CODES.includes(c.slot)) || null;
   const last = ops.last?.device_id === device?.id ? ops.last : null;
   const lastFor = (code: string) => cmds.find((c) => c.slot === code) || undefined;
   const renderWings = () => device && (
     <div data-testid="slot-grid" className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-      {WINGS.map((c) => <SlotCard key={`${device.id}:${c}:${mode}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={ops.setSlotConfig} isPending={ops.isPending} readOnly={readOnly}
+      {WINGS.map((c) => <SlotCard key={`${device.id}:${c}:${mode}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={async (...args) => { const saved = await ops.setSlotConfig(...args); if (saved) void energy.refresh(); return saved; }} isPending={ops.isPending} readOnly={readOnly}
         lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} wing={energy.summary?.wings?.[c]} allocation={energy.allocation}
         mode={mode} comparison={energy.comparison?.wings[c]?.wing === c ? energy.comparison.wings[c] : undefined} activeGenerationWing={activeGenerationWing}
         excessEnabled={energy.summary?.references?.grid.enabled === true} />)}
@@ -53,8 +52,9 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
   );
   return (
     <div data-testid="operational-dashboard" className="space-y-3 min-w-0 [&_input]:min-w-0 [&_input]:max-w-full">
-      <DashboardHeader dash={ops.dash} device={device} backHref={backHref} onRefresh={() => ops.refresh()} readOnly={readOnly} />
+      <DashboardHeader dash={ops.dash} device={device} backHref={backHref} onRefresh={() => { void ops.refresh(); void energy.refresh(); }} readOnly={readOnly} />
       {ops.error && <div data-testid="ops-inline-error" className="border border-red-500/40 bg-red-500/10 px-4 py-2 font-mono text-xs text-red-300">{ops.error}</div>}
+      {ops.panelErrors.length > 0 && <div data-testid="ops-history-errors" role="alert" className="text-xs text-amber-300">{ops.panelErrors.join(" · ")}</div>}
       {devices.length > 1 && (
         <div data-testid="device-tabs" className="flex flex-wrap gap-1">
           {devices.map((d) => <button key={d.id} data-testid={`device-tab-${d.id}`} onClick={() => setSelectedDeviceId(d.id)} className={`${btn} ${d.id === device?.id ? tone.cyan : tone.gray}`}>{d.name} <span className={d.connected ? "text-emerald-400" : "text-red-400"}>●</span></button>)}
@@ -64,7 +64,7 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
       {device && (
         <div className="grid gap-4 lg:grid-cols-2">
           <StoragePanel device={device} />
-          {societyId && <LcdMessagePanel societyId={societyId} device={device} readOnly={readOnly} />}
+          {societyId && <LcdMessagePanel key={`${societyId}:${device.id}`} societyId={societyId} device={device} readOnly={readOnly} />}
         </div>
       )}
       {device?.hardware_fault && (
@@ -81,11 +81,10 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
             {readOnly && renderDayControls()}
             {!readOnly && <UnitAllotment key={device.id} device={device} queue={ops.queue} isPending={ops.isPending} ask={setConfirm}>{renderDayControls}</UnitAllotment>}
           </details>
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
               <LastResponse last={last && !SLOT_CODES.includes(last.slot) ? last : null} row={lastRow} />
               {!readOnly && <SystemControls deviceId={device.id} queue={ops.queue} isPending={ops.isPending} ask={setConfirm} />}
               {!readOnly && <ResetDayControl deviceId={device.id} current={ops.dash.reset_day} queue={ops.queue} isPending={ops.isPending} ask={setConfirm} />}
-              {!readOnly && <LcdControl deviceId={device.id} queue={ops.queue} isPending={ops.isPending} />}
           </div>
           <OperationalLogs commands={cmds} events={ops.events} />
         </>

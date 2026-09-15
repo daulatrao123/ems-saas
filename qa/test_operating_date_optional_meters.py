@@ -58,6 +58,23 @@ class FakeCursor:
             self._rows = [dict(r) for r in self.state["meters"]]
             return
 
+        if q.startswith("select slot, disabled from slot_configs where device_id=%s"):
+            slot_cfg = self.state.get("slot_configs", [])
+            rows = slot_cfg.get(params[0], []) if isinstance(slot_cfg, dict) else slot_cfg
+            self._rows = [{"slot": r["slot"], "disabled": r.get("disabled")} for r in rows]
+            return
+
+        if q.startswith("select operating_date, generation_kwh, generation_source from energy_daily where device_id=%s and operating_date between %s and %s order by operating_date"):
+            did, frm, to = params
+            rows = [
+                {"operating_date": r["operating_date"], "generation_kwh": r.get("generation_kwh"), "generation_source": r.get("generation_source")}
+                for r in self.state["daily"]
+                if r["device_id"] == did and frm <= r["operating_date"] <= to
+            ]
+            rows.sort(key=lambda r: r["operating_date"])
+            self._rows = rows
+            return
+
         if q.startswith("insert into energy_meters"):
             # ensure_meter_rows bootstrap path for router.device(...)
             return
@@ -82,7 +99,7 @@ class FakeCursor:
 
         if "from energy_adjustments a left join users u" in q:
             did, limit = params
-            rows = [r for r in self.state["adjustments"] if r["device_id"] == did]
+            rows = [r for r in self.state.get("adjustments", []) if r["device_id"] == did]
             rows.sort(key=lambda r: (r["operating_date"], r["id"]), reverse=True)
             out = []
             for r in rows[: int(limit)]:
@@ -122,7 +139,7 @@ class FakeCursor:
         if q.startswith("select operating_date, kind, sum(value_kwh) as v from energy_adjustments"):
             did, wing, frm, to = params
             grouped = {}
-            for a in self.state["adjustments"]:
+            for a in self.state.get("adjustments", []):
                 if a["device_id"] != did or a["wing"] != wing or not (frm <= a["operating_date"] <= to):
                     continue
                 key = (a["operating_date"], a["kind"])
@@ -361,6 +378,7 @@ class OperatingDateAndOptionalMetersRegression(unittest.TestCase):
             "commits": 0,
             "rollbacks": 0,
             "closed": 0,
+            "slot_configs": [],
             "users": {"u-admin": "admin@example.com"},
             "device": {
                 "id": self.did,
