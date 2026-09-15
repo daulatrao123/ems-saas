@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { CommandRow, Device, Slot, LastResponse as Response } from "./types";
 import { QueueFn, SlotConfigFn } from "./useOperations";
 import { btn, input, label, panel, tone } from "./DashboardHeader";
