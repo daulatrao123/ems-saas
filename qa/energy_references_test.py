@@ -516,10 +516,10 @@ def main() -> int:
     missing_quota = q(admin, "GET", f"/energy/summary?society_id={sid}&device_id={dev_a}").json()["references"]["allocation"]
     check("22 missing required quota => UNAVAILABLE and grid0", missing_quota["status"] == "UNAVAILABLE" and missing_quota["reason"] == "REQUIRED_WING_QUOTA_UNAVAILABLE" and float(missing_quota["grid_allocation_kwh"]) == 0.0)
 
-    # MANUAL mode: no common manual generation.
+    # MANUAL uses physical M1 too; missing D quota still blocks excess/Grid.
     db_exec("UPDATE pi_devices SET energy_calculation_mode='MANUAL' WHERE id=%s", (dev_a,))
     manual = q(admin, "GET", f"/energy/summary?society_id={sid}&device_id={dev_a}").json()["references"]["allocation"]
-    check("23 MANUAL mode generation/excess unavailable and grid0", manual["generation_kwh"] is None and manual["excess_kwh"] is None and float(manual["grid_allocation_kwh"]) == 0.0 and manual["reason"] == "SOCIETY_GENERATION_UNAVAILABLE")
+    check("23 MANUAL uses physical M1; missing quota keeps excess unavailable and grid0", manual["generation_kwh"] == 1000 and manual["generation_source"] == "PHYSICAL" and manual["required_kwh"] is None and manual["excess_kwh"] is None and float(manual["grid_allocation_kwh"]) == 0.0 and manual["reason"] == "REQUIRED_WING_QUOTA_UNAVAILABLE")
 
     # Decimal boundary equality checks.
     db_exec("DELETE FROM energy_generation_targets WHERE device_id=%s", (dev_a,))

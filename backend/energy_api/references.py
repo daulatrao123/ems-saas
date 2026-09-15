@@ -136,7 +136,7 @@ def overview(cur, dev, meters, today, *, calendar_today):
     sources = {wings[w]["effective"]["source"] for w in Q.WINGS}
     cur.execute("SELECT generation_kwh, generation_source FROM energy_daily WHERE device_id=%s AND operating_date=%s", (did, today))
     measured = cur.fetchone()
-    generation = measured["generation_kwh"] if dev["energy_calculation_mode"] == "AUTO" and meters["M1"]["enabled"] and measured and measured["generation_source"] == "PHYSICAL" else None
+    generation = measured["generation_kwh"] if meters["M1"]["enabled"] and measured and measured["generation_source"] == "PHYSICAL" else None
     targets = {}
     for w in Q.WINGS:
         row = Q.latest_target(cur, did, w, today)

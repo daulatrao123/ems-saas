@@ -685,7 +685,8 @@ class OperatingDateAndOptionalMetersRegression(unittest.TestCase):
         self.assertEqual([r["generated_kwh"] for r in graph["rows"]], [8, None])
         self.assertEqual(graph["rows"][0]["generation_source"], "MANUAL")
         self.assertEqual(self.state["daily"][0]["generation_kwh"], 1000)
-        self.assertEqual(out["references"]["allocation"]["reason"], "SOCIETY_GENERATION_UNAVAILABLE")
+        self.assertEqual((out["references"]["allocation"]["generation_kwh"], out["references"]["allocation"]["generation_source"]), (1000, "PHYSICAL"))
+        self.assertEqual(out["references"]["allocation"]["reason"], "REQUIRED_WING_QUOTA_UNAVAILABLE")
 
     def test_missing_reference_and_target_independent_of_optional_meters(self):
         user = {"id": "u-admin", "role": "society_admin", "society_id": "1"}

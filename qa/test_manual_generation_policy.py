@@ -168,7 +168,7 @@ class ManualGenerationPolicyRegression(unittest.TestCase):
         self.assertIsNone(today["consumed_kwh"], "MANUAL_GENERATION 23 must not create consumption")
         self.assertEqual(today["consumption_source"], "UNAVAILABLE")
         self.assertEqual(summary["generation_meter"]["generation"]["today"]["kwh"], 10, "common M1 must not include manual wing23")
-        self.assertIsNone(summary["references"]["allocation"]["generation_kwh"])
+        self.assertEqual((summary["references"]["allocation"]["generation_kwh"], summary["references"]["allocation"]["generation_source"]), (10, "PHYSICAL"), "allocation uses physical M1, never manual wing23")
         self.post_adjustment(data={"society_id": "1", "device_id": self.did, "wing": "A", "kind": "MANUAL_CONSUMPTION", "operating_date": "2026-09-12", "value_kwh": 7, "reason": "consumption only"}, user=self._admin())
         after = self.summary(society_id="1", device_id=self.did, user=self._admin())["calculation"]["wings"]["A"]["today"]
         self.assertEqual((after["generated_kwh"], after["consumed_kwh"]), (23, 7))
