@@ -274,13 +274,14 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             wings = {}
             for w in WINGS:
                 m = meters[METER_WING_INV[w]]
-                cons = Q.metric_periods(cur, did, Q.wing_consumption_expr(w), today, dev["reset_day"]) if m["enabled"] else None
+                cons_eligible = Q.consumption_meter_eligible(m)
+                cons = Q.metric_periods(cur, did, Q.wing_consumption_expr(w), today, dev["reset_day"]) if cons_eligible else None
                 gen = Q.metric_periods(cur, did, Q.wing_generation_expr(w), today, dev["reset_day"]) if gen_on else None
                 t = Q.latest_target(cur, did, w, today)
                 gen_today = gen["today"]["kwh"] if gen else None
                 req = float(t["target_kwh_per_day"]) if t else None
-                wings[w] = {"wing": w, "consumption_meter": {"meter_id": m["meter_id"], "enabled": m["enabled"], "comm_status": m["comm_status"], "serial": m["serial"], "last_seen": m["last_seen"], "power_kw": m["power_kw"]},
-                            "consumption": cons or {"status": "UNAVAILABLE", "reason": "consumption meter disabled"},
+                wings[w] = {"wing": w, "consumption_meter": {"meter_id": m["meter_id"], "enabled": m["enabled"], "comm_status": m["comm_status"], "serial": m["serial"], "last_seen": m["last_seen"], "power_kw": m["power_kw"] if cons_eligible else None},
+                            "consumption": cons or {"status": "UNAVAILABLE", "reason": "consumption meter disabled" if not m["enabled"] else "consumption meter not ONLINE"},
                             "generation": gen or {"status": "UNAVAILABLE", "reason": "generation meter disabled"},
                             "required_generation": {"target_kwh_per_day": req, "adjustment_percent": float(t["adjustment_percent"]) if t else None,
                                                     "base_daily_average_kwh": float(t["base_daily_average_kwh"]) if t else None, "effective_from": t["effective_from"].isoformat() if t else None,
@@ -335,7 +336,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             dev = device(cur, sid, device_id); did = str(dev["id"]); meters = meters_of(cur, did)
             f, t, today = _range(cur, did, dev, frm, to, rng)
             mode = dev["energy_calculation_mode"] if basis == "calculation" else None
-            rows = Q.wing_graph_rows(cur, did, w, f, t, bool(meters["M1"]["enabled"]), bool(meters[METER_WING_INV[w]]["enabled"]), mode)
+            rows = Q.wing_graph_rows(cur, did, w, f, t, bool(meters["M1"]["enabled"]), Q.consumption_meter_eligible(meters[METER_WING_INV[w]]), mode)
             return {"wing": w, "from": f.isoformat(), "to": t.isoformat(), "as_of_operating_date": today.isoformat(), "unit": "kWh",
                     "basis": basis, "calculation_mode": mode,
                     "series": ["required_kwh", "generated_kwh", "consumed_kwh"], "rows": rows,

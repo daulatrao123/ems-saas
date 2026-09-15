@@ -9,6 +9,11 @@ MAX_DAILY_RANGE_DAYS = 400
 MAX_MONTHS = 60
 
 
+def consumption_meter_eligible(meter):
+    """Current physical consumption uses the Pi's existing per-meter ONLINE gate."""
+    return bool(meter and meter.get("enabled") and meter.get("comm_status") == "ONLINE")
+
+
 def reset_period_for(d, reset_day):
     reset_day = max(1, min(28, int(reset_day or 15)))
     if d.day >= reset_day:
@@ -167,7 +172,7 @@ is no authoritative common manual-generation measurement in this contract.
     wings = {}
     for wing, mid in zip(WINGS, ("M2", "M3", "M4", "M5")):
         rows = wing_graph_rows(cur, device_id, wing, today - timedelta(days=6), today,
-                              bool(meters["M1"]["enabled"]), bool(meters[mid]["enabled"]), mode)
+                              bool(meters["M1"]["enabled"]), consumption_meter_eligible(meters.get(mid)), mode)
         wings[wing] = {"wing": wing, "today": rows[-1],
                        "generation_trend": [{k: r[k] for k in ("date", "generated_kwh", "generation_source")} for r in rows]}
     return {"mode": mode, "version": version, "operating_date": today.isoformat(), "wings": wings,
