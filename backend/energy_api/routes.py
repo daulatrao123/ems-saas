@@ -269,7 +269,8 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         def fn(cur):
             dev = device(cur, sid, device_id); did = str(dev["id"]); meters = meters_of(cur, did)
             calendar_today = datetime.now(timezone.utc).date()
-            today = Q.device_today(cur, did, calendar_today)
+            pi_today = Q.device_today(cur, did, None)
+            today = pi_today or calendar_today  # preserve existing read-model fallback, never use it to authorize an entry
             gen_on = bool(meters["M1"]["enabled"])
             wings = {}
             for w in WINGS:
@@ -300,6 +301,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                                 "unattributed": unattr, "active_generation_wing": active, "attribution": attr if gen_on else None,
                                 "source": "PHYSICAL" if gen_total and gen_total["today"]["kwh"] is not None else "UNAVAILABLE"}
             return {"device_id": did, "as_of_operating_date": today.isoformat(), "reset_day": dev["reset_day"], "reset_period": Q.reset_period_for(today, dev["reset_day"]),
+                    "manual_generation_operating_date": pi_today.isoformat() if pi_today is not None else None,
                     "generation_meter": generation_meter, "wings": wings,
                     "calculation": Q.calculation_view(cur, did, dev["energy_calculation_mode"], dev["energy_calculation_version"], meters, today),
                     "references": R.overview(cur, dev, meters, today, calendar_today=calendar_today)}
@@ -357,9 +359,10 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                 rows = [{**dict(r), "operating_date": r["operating_date"].isoformat(), "generation_kwh": float(r["generation_kwh"]) if r["generation_kwh"] is not None else None,
                          "unattributed_generation_kwh": float(r["unattributed_generation_kwh"]), "fault_generation_kwh": float(r["fault_generation_kwh"])} for r in cur.fetchall()]
             else:
-                cols = ", ".join(f"SUM((wing_consumption->>'{w}')::numeric) AS cons_{w}, COUNT((wing_consumption->>'{w}')::numeric) AS cons_days_{w}, "
-                                 f"SUM((wing_generation->>'{w}')::numeric) AS gen_{w}" for w in WINGS)
-                cur.execute(f"""SELECT to_char(operating_date,'YYYY-MM') AS month, SUM(generation_kwh) AS generation_kwh, COUNT(generation_kwh) AS generation_days, {cols}
+                cols = ", ".join(f"SUM({Q.qualified_physical_expr(Q.wing_consumption_expr(w))}) AS cons_{w}, COUNT({Q.qualified_physical_expr(Q.wing_consumption_expr(w))}) AS cons_days_{w}, "
+                                 f"SUM({Q.qualified_physical_expr(Q.wing_generation_expr(w))}) AS gen_{w}" for w in WINGS)
+                value = Q.qualified_physical_expr("generation_kwh")
+                cur.execute(f"""SELECT to_char(operating_date,'YYYY-MM') AS month, SUM({value}) AS generation_kwh, COUNT({value}) AS generation_days, {cols}
                                 FROM energy_daily WHERE device_id=%s AND operating_date BETWEEN %s AND %s GROUP BY 1 ORDER BY 1""", (did, f, t))
                 rows = []
                 for r in cur.fetchall():
@@ -498,7 +501,18 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         if not reason: raise HTTPException(400, "reason is required for manual entries")
         if data.get("unit", "kWh") != "kWh": raise HTTPException(400, "unit must be kWh")
         def fn(cur):
-            did = str(device(cur, sid, data.get("device_id"))["id"])
+            did = str(device(cur, sid, data.get("device_id"), ensure_meters=False)["id"])
+            if kind == "MANUAL_GENERATION":
+                # Same latest-OPEN ordering as device_today, with no date fallback.
+                # Hold a read lock on this record until insert/audit commit so its
+                # OPEN state cannot be closed concurrently during acceptance.
+                cur.execute("""SELECT operating_date FROM energy_daily WHERE device_id=%s AND status='OPEN'
+                               ORDER BY operating_date DESC LIMIT 1 FOR SHARE""", (did,))
+                opened = cur.fetchone()
+                if not opened or opened["operating_date"] is None:
+                    raise HTTPException(409, "Authoritative OPEN Pi operating day is unavailable; manual generation cannot be recorded")
+                if od != opened["operating_date"]:
+                    raise HTTPException(409, f"Manual generation is allowed only for current Pi operating day {opened['operating_date'].isoformat()}; refresh before entering generation")
             cur.execute("""INSERT INTO energy_adjustments (device_id, wing, operating_date, kind, value_kwh, reason, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id, created_at""",
                         (did, w, od, kind, val, reason[:300], user.get("id")))
             r = cur.fetchone()

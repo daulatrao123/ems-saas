@@ -325,7 +325,9 @@ class HistoricalCalendarRegression(unittest.TestCase):
     def test_summary_and_bills_use_utc_calendar_for_history_only(self):
         user = {"id": "u-admin", "role": "society_admin", "society_id": "1"}
         with patch.object(routes, "datetime", FrozenDateTime), patch.object(routes, "ensure_meter_rows", lambda _cur, _did: None), patch.object(
-            routes.Q, "device_today", side_effect=lambda _cur, _did, fallback: self.stale_today if fallback == self.calendar_today else None
+            routes.Q,
+            "device_today",
+            side_effect=lambda _cur, _did, fallback: self.stale_today if fallback in (None, self.calendar_today) else None,
         ), patch.object(routes.Q, "metric_periods", side_effect=self._metric_periods), patch.object(
             routes.Q, "latest_target", side_effect=self._latest_target
         ), patch.object(routes.Q, "calculation_view", return_value={"mode": "AUTO", "version": 8, "operating_date": self.stale_today.isoformat(), "wings": {}}) as calculation_view:

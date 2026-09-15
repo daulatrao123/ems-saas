@@ -45,10 +45,27 @@ def period_ranges(today, reset_day):
     }
 
 
+def qualified_physical_expr(expr):
+    """Whitelist internal metrics and qualify each value BEFORE aggregation.
+
+PostgreSQL numeric NaN sorts above Infinity; [0, Infinity) therefore excludes
+NaN, infinities, negatives and NULL while retaining genuine physical zero.
+    """
+    if expr in ("generation_kwh", "unattributed_generation_kwh", "fault_generation_kwh") or expr in {wing_generation_expr(w) for w in WINGS}:
+        source = "generation_source"
+    else:
+        sources = {wing_consumption_expr(w): f"consumption_source->>'{w}'" for w in WINGS}
+        if expr not in sources:
+            raise ValueError("Unsupported physical energy metric")
+        source = sources[expr]
+    return f"(CASE WHEN {source}='PHYSICAL' AND {expr}>=0 AND {expr}<'Infinity'::numeric THEN {expr} END)"
+
+
 def _agg(cur, device_id, expr, frm, to, reset_period=None):
     where = "device_id=%s AND operating_date BETWEEN %s AND %s" if reset_period is None else "device_id=%s AND reset_period=%s"
     params = (device_id, frm, to) if reset_period is None else (device_id, reset_period)
-    cur.execute(f"SELECT SUM({expr}) AS total, COUNT({expr}) AS days FROM energy_daily WHERE {where}", params)
+    value = qualified_physical_expr(expr)
+    cur.execute(f"SELECT SUM({value}) AS total, COUNT({value}) AS days FROM energy_daily WHERE {where}", params)
     r = cur.fetchone()
     return (float(r["total"]) if r["days"] else None), int(r["days"] or 0)
 
@@ -133,9 +150,9 @@ and never treats manual entries as editable absolute daily totals.
         a = adj.get(d, {})
         gen_phys = float(r["gen"]) if r and r["gen"] is not None and generation_enabled else None
         cons_phys = float(r["cons"]) if r and r["cons"] is not None and consumption_enabled else None
+        gen_phys = gen_phys if r and r["generation_source"] == "PHYSICAL" and _physical(gen_phys) else None
+        cons_phys = cons_phys if r and r["cons_src"] == "PHYSICAL" and _physical(cons_phys) else None
         if calculation_mode is not None:
-            gen_phys = gen_phys if r and r["generation_source"] == "PHYSICAL" and _physical(gen_phys) else None
-            cons_phys = cons_phys if r and r["cons_src"] == "PHYSICAL" and _physical(cons_phys) else None
             if calculation_mode == "AUTO":
                 a = {}  # No automatic substitution or addition of manual entries.
             elif calculation_mode == "MANUAL":
@@ -201,8 +218,9 @@ def _r(v):
 
 # ---------------------------------------------------------------- monthly generation (generation only)
 def monthly_generation(cur, device_id, frm_month, to_month, today, generation_enabled):
-    cur.execute("""SELECT to_char(operating_date, 'YYYY-MM') AS month, SUM(generation_kwh) AS kwh,
-                          COUNT(generation_kwh) AS physical_days, COUNT(*) AS rows
+    value = qualified_physical_expr("generation_kwh")
+    cur.execute(f"""SELECT to_char(operating_date, 'YYYY-MM') AS month, SUM({value}) AS kwh,
+                          COUNT({value}) AS physical_days, COUNT(*) AS rows
                    FROM energy_daily WHERE device_id=%s AND operating_date BETWEEN %s AND %s GROUP BY 1 ORDER BY 1""",
                 (device_id, frm_month, month_bounds(to_month.year, to_month.month)[1]))
     got = {r["month"]: r for r in cur.fetchall()}

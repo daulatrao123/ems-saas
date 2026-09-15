@@ -36,6 +36,7 @@ export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, childr
       {mode === "AUTO" && en.summary && <AllocationTimeline events={en.events} operatingDate={en.summary.as_of_operating_date} />}
       {mode === "MANUAL" && entries.length > 0 && <section data-testid="manual-activity-history" className="border-t border-[#1e2a3a] pt-3">
         <h3 data-testid="manual-activity-title" className={label}>Manual generation activity · recent entries</h3>
+        <div data-testid="manual-activity-provenance" className="text-xs text-gray-400">Generation adjustments by operating day · not consumption or bills</div>
         <ol className="mt-2 space-y-2">
           {entries.map((entry) => <li key={entry.id} data-testid={`manual-activity-${entry.id}`} className="flex flex-wrap gap-x-4 gap-y-1 border-b border-[#1e2a3a] pb-2 text-[11px] text-gray-300">
             <span>{entry.operating_date} · Wing {entry.wing}</span><span data-testid={`manual-activity-value-${entry.id}`} className="font-mono text-amber-300">{fmtKwh(entry.value_kwh)} · MANUAL</span><span className="break-words min-w-0">{entry.reason}</span>

@@ -167,15 +167,86 @@ class FakeCursor:
             self._one = {"d": max(days)} if days else {"d": None}
             return
 
-        if q.startswith("select sum("):
+        if q.startswith("select operating_date from energy_daily where device_id=%s and status='open' order by operating_date desc limit 1 for share"):
+            did = params[0]
+            days = sorted(
+                [r["operating_date"] for r in self.state["daily"] if r["device_id"] == did and r["status"] == "OPEN"],
+                reverse=True,
+            )
+            self._one = {"operating_date": days[0]} if days else None
+            return
+
+        if q.startswith("select sum(") and " as total, count(" in q and " from energy_daily where " in q:
             did = params[0]
             rows = [r for r in self.state["daily"] if r["device_id"] == did]
             rows = [r for r in rows if r["reset_period"] == params[1]] if "reset_period=%s" in q else [r for r in rows if params[1] <= r["operating_date"] <= params[2]]
-            field = re.search(r"sum\(\(?(\w+)", q).group(1)
-            wing = re.search(r"->>'([abcd])'", q)
-            values = [r[field].get(wing.group(1).upper()) if wing else r[field] for r in rows]
+            values = [self._qualified_value(r, q) for r in rows]
             values = [v for v in values if v is not None]
             self._one = {"total": sum(values) if values else None, "days": len(values)}
+            return
+
+        if q.startswith("select to_char(operating_date, 'yyyy-mm') as month") and "count(*) as rows" in q:
+            did, frm, to = params
+            rows = [r for r in self.state["daily"] if r["device_id"] == did and frm <= r["operating_date"] <= to]
+            grouped = {}
+            for r in rows:
+                month = r["operating_date"].strftime("%Y-%m")
+                g = grouped.setdefault(month, {"month": month, "vals": []})
+                v = self._qualified_value(r, q)
+                if v is not None:
+                    g["vals"].append(v)
+            out = []
+            for month in sorted(grouped):
+                vals = grouped[month]["vals"]
+                out.append({"month": month, "kwh": sum(vals) if vals else None, "physical_days": len(vals), "rows": len([r for r in rows if r["operating_date"].strftime("%Y-%m") == month])})
+            self._rows = out
+            return
+
+        if q.startswith("select to_char(operating_date,'yyyy-mm') as month") and "as generation_kwh" in q and "as cons_a" in q:
+            for metric in ["generation_kwh"] + [f"{field}:{wing}" for wing in "ABCD" for field in ("wing_generation", "wing_consumption")]:
+                self._assert_qualification(q, metric)
+            did, frm, to = params
+            rows = [r for r in self.state["daily"] if r["device_id"] == did and frm <= r["operating_date"] <= to]
+            by_month = {}
+            for r in rows:
+                month = r["operating_date"].strftime("%Y-%m")
+                agg = by_month.setdefault(
+                    month,
+                    {
+                        "month": month,
+                        "generation_kwh": 0.0,
+                        "generation_days": 0,
+                        **{f"cons_{w.lower()}": 0.0 for w in "ABCD"},
+                        **{f"cons_days_{w.lower()}": 0 for w in "ABCD"},
+                        **{f"gen_{w.lower()}": 0.0 for w in "ABCD"},
+                    },
+                )
+                gv = self._qualified_metric(r, "generation_kwh")
+                if gv is not None:
+                    agg["generation_kwh"] += gv
+                    agg["generation_days"] += 1
+                for wing in "ABCD":
+                    cv = self._qualified_metric(r, f"wing_consumption:{wing}")
+                    if cv is not None:
+                        agg[f"cons_{wing.lower()}"] += cv
+                        agg[f"cons_days_{wing.lower()}"] += 1
+                    wgv = self._qualified_metric(r, f"wing_generation:{wing}")
+                    if wgv is not None:
+                        agg[f"gen_{wing.lower()}"] += wgv
+            out = []
+            for month in sorted(by_month):
+                a = by_month[month]
+                out.append(
+                    {
+                        "month": month,
+                        "generation_kwh": a["generation_kwh"] if a["generation_days"] else None,
+                        "generation_days": a["generation_days"],
+                        **{f"cons_{w.lower()}": a[f"cons_{w.lower()}"] for w in "ABCD"},
+                        **{f"cons_days_{w.lower()}": a[f"cons_days_{w.lower()}"] for w in "ABCD"},
+                        **{f"gen_{w.lower()}": a[f"gen_{w.lower()}"] if a[f"gen_{w.lower()}"] != 0.0 or self._month_has_qualified(rows, month, f"wing_generation:{w}") else None for w in "ABCD"},
+                    }
+                )
+            self._rows = out
             return
 
         if q.startswith("select max(bill_month) as month"):
@@ -199,6 +270,63 @@ class FakeCursor:
             return
 
         raise AssertionError(f"Unexpected SQL in offline test: {sql}")
+
+    @staticmethod
+    def _finite_non_negative(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f >= 0 and f != float("inf") and f != float("-inf") and f == f else None
+
+    def _qualified_metric(self, row, metric):
+        if metric.startswith("wing_consumption:"):
+            wing = metric.split(":", 1)[1]
+            if row["consumption_source"].get(wing) != "PHYSICAL":
+                return None
+            return self._finite_non_negative(row["wing_consumption"].get(wing))
+        if metric.startswith("wing_generation:"):
+            wing = metric.split(":", 1)[1]
+            if row.get("generation_source") != "PHYSICAL":
+                return None
+            return self._finite_non_negative(row["wing_generation"].get(wing))
+        if metric in {"generation_kwh", "unattributed_generation_kwh", "fault_generation_kwh"}:
+            if row.get("generation_source") != "PHYSICAL":
+                return None
+            return self._finite_non_negative(row.get(metric))
+        return None
+
+    def _qualified_value(self, row, normalized_sql):
+        wing_cons = re.search(r"wing_consumption->>'([abcd])'", normalized_sql)
+        if wing_cons:
+            metric = f"wing_consumption:{wing_cons.group(1).upper()}"
+        else:
+            wing_gen = re.search(r"wing_generation->>'([abcd])'", normalized_sql)
+            metric = f"wing_generation:{wing_gen.group(1).upper()}" if wing_gen else next((field for field in ("unattributed_generation_kwh", "fault_generation_kwh") if field in normalized_sql), "generation_kwh")
+        self._assert_qualification(normalized_sql, metric)
+        return self._qualified_metric(row, metric)
+
+    @staticmethod
+    def _assert_qualification(sql, metric):
+        # Do not silently return safe mock results if production SQL loses a guard.
+        # Independent expected SQL contract, not a call to the production helper.
+        if ":" in metric:
+            field, wing = metric.split(":")
+            expr = f"({field}->>'{wing.lower()}')::numeric"
+            source = f"consumption_source->>'{wing.lower()}'" if field == "wing_consumption" else "generation_source"
+        else:
+            expr, source = metric, "generation_source"
+        required = f"case when {source}='physical' and {expr}>=0 and {expr}<'infinity'::numeric then {expr} end"
+        if required not in sql:
+            raise AssertionError(f"Missing physical provenance/value guard for {metric}: {sql}")
+
+    def _month_has_qualified(self, rows, month, metric):
+        for r in rows:
+            if r["operating_date"].strftime("%Y-%m") != month:
+                continue
+            if self._qualified_metric(r, metric) is not None:
+                return True
+        return False
 
     def fetchone(self):
         return dict(self._one) if isinstance(self._one, dict) else self._one
