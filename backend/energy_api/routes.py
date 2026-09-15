@@ -501,7 +501,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         if not reason: raise HTTPException(400, "reason is required for manual entries")
         if data.get("unit", "kWh") != "kWh": raise HTTPException(400, "unit must be kWh")
         def fn(cur):
-            did = str(device(cur, sid, data.get("device_id"), ensure_meters=False)["id"])
+            did = str(device(cur, sid, data.get("device_id"), ensure_meters=(kind != "MANUAL_GENERATION"))["id"])
             if kind == "MANUAL_GENERATION":
                 # Same latest-OPEN ordering as device_today, with no date fallback.
                 # Hold a read lock on this record until insert/audit commit so its
