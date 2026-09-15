@@ -1,4 +1,4 @@
-// physical_toggle = CONTACTOR FEEDBACK (Pi telemetry, historical name); toggle_input = PHYSICAL TOGGLE input (Pi telemetry);
+// physical_toggle = CONTACTOR FEEDBACK (historical wire name); toggle_input is retired compatibility metadata, never a control/display input.
 // disabled = LOGICAL slot enable (admin configuration). Three separate concepts — never derive one from another.
 export type Slot = { display_name: string; target_days: number; used_days: number; physical_toggle: string; toggle_input?: string; disabled: boolean; visible?: boolean; feedback_enabled?: boolean };
 export type Telemetry = { cpu_temp: number | null; uptime_seconds: number | null; boot_count: number | null };

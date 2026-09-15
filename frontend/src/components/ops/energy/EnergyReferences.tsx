@@ -29,7 +29,7 @@ export function EnergyReferences({ societyId, summary, readOnly, refresh, childr
           <div data-testid={`wing-reference-source-${w}`} className="text-gray-500">{referenceSource(data.wings[w].effective.source)}{data.wings[w].effective.operating_date ? ` · ${data.wings[w].effective.operating_date}` : ""}</div>
         </div>)}
       </div>
-      <GridReferencePanel key={`${summary.device_id}:${data.grid.version}`} societyId={societyId} deviceId={summary.device_id} grid={data.grid} allocation={data.allocation} readOnly={readOnly} auto={summary.calculation.mode === "AUTO"} onSaved={refresh} />
+      <GridReferencePanel key={`${summary.device_id}:${data.grid.version}`} societyId={societyId} deviceId={summary.device_id} grid={data.grid} allocation={data.allocation} readOnly={readOnly} onSaved={refresh} />
     </section>
     {editor && <BillHistoryDialog societyId={societyId} deviceId={summary.device_id} initialWing={editor} data={data} readOnly={readOnly} onClose={() => setEditor(null)} onSaved={refresh} />}
   </BillHistoryContext.Provider>;

@@ -507,9 +507,8 @@ class EMSController:
             "watchdogEnabled": True,
             "clockSource": "system",
             "slots": slots,
-            # Physical toggle inputs (HIGH = ON). null = GPIO unavailable. Separate from contactor
-            # feedback (slots[*].physical_toggle) and from logical slot enable (cloud config).
-            "toggle_input": self.gpio.toggle_inputs(),
+            # Retain the wire shape for older servers; physical toggles are retired.
+            "toggle_input": {slot: None for slot in SUPPORTED_SLOTS},
             "hardware_fault": self.gpio.hardware_fault,
             "storage_health": self._storage_health_snapshot(),
             "energy": self.energy.snapshot(),
@@ -706,7 +705,7 @@ class EMSController:
         if bool(self.device_config.get("feedback_hardware_installed", False)):
             is_on = self.state.slots[slot].feedback_state.value == "ON"
         else:
-            is_on = self.gpio.toggle_inputs().get(slot) is True
+            is_on = False  # No installed feedback: never infer usage from retired toggles.
 
         return (
             int(cfg.get("target_days", 0)) > 0
@@ -1130,7 +1129,6 @@ class EMSController:
 
     def lcd_view(self):
         """Plain-data view for the LCD. Facts only; the LCD cannot act on anything."""
-        toggles = self.gpio.toggle_inputs()
         slots = {}
         for slot in SUPPORTED_SLOTS:
             cfg = self.device_config.get("slots", {}).get(slot, {})
@@ -1141,7 +1139,6 @@ class EMSController:
                 "used_days": int(st.used_days) if st else None,
                 "target_days": cfg.get("target_days"),
                 "contactor": fb if fb in ("ON", "OFF") else "UNKNOWN",
-                "toggle": toggles.get(slot),
             }
         return {
             "system_state": self.state.system_state.value,
@@ -1210,7 +1207,7 @@ class EMSController:
             logger.warning(message)  # the event carries it to the cloud; WARNING avoids a duplicate ring/log entry
 
     # ============================================================
-    # PHYSICAL TOGGLES (local requests through the same gate as cloud commands)
+    # RETIRED PHYSICAL TOGGLES (discard legacy requests; no hardware actions)
     # ============================================================
 
     def _emit_event(self, event_type, message):
@@ -1226,44 +1223,17 @@ class EMSController:
             self._pending_events = self._pending_events[-self._pending_events_max:]
 
     def process_toggle_events(self):
-        """Drain debounced toggle edges (never levels). ON -> ACTIVATE slot (break-before-make in
-        GPIOManager); OFF -> DEACTIVATE only if that slot is active (otherwise silent no-op).
-        Same gate as cloud commands: FAULT / non-READY / logically disabled slot -> toggle_rejected.
-        Returns number of hardware actions."""
-        actions = 0
-        for ev in self.gpio.pop_toggle_events():
-            slot, on = ev["slot"], bool(ev["on"])
-            if slot not in self.state.slots:
-                continue
-
-            def rejected(reason):
-                logger.warning("Toggle %s GPIO%s %s rejected: %s", slot, ev.get("gpio"), "ON" if on else "OFF", reason)
-                self._emit_event("toggle_rejected", self._toggle_message(ev, "REJECTED", reason=reason))
-
-            if self.state.system_state == SystemState.FAULT:
-                rejected("FAULT")
-                continue
-
-            if bool(self.device_config.get("slots", {}).get(slot, {}).get("disabled", True)):
-                rejected("SLOT_DISABLED")
-                continue
-
-            if not on and self.state.active_slot != slot:
-                continue
-
-            success, reason = self._execute_local_transition(slot, on, "TOGGLE")
-            if reason:
-                rejected(reason)
-                continue
-            self._emit_event("toggle", self._toggle_message(ev, "OK" if success else "FAILED"))
-            actions += 1
-        return actions
+        """Discard any legacy queued edges. Physical switches cannot request actions."""
+        self.gpio.pop_toggle_events()
+        return 0
 
     def _execute_local_transition(self, slot, on, origin):
-        """Shared LOCAL hardware execution for physical toggles and the energy allocator (origin TOGGLE|ENERGY).
+        """LOCAL energy-allocator hardware execution; legacy TOGGLE origin is rejected.
         No OfflineQueue row, no command id, no /api/pi/ack. Same gate as cloud commands (READY/CLOUD_OFFLINE),
         EXECUTING persisted, then GPIOManager break-before-make + positive feedback verification.
         Returns (success, rejection_reason); rejection_reason is None when the hardware path actually ran."""
+        if origin == "TOGGLE":
+            return False, "PHYSICAL_TOGGLES_DISABLED"
         if self.state.system_state not in (SystemState.READY, SystemState.CLOUD_OFFLINE):
             return False, f"SYSTEM_{self.state.system_state.value}"
         prior_state = self.state.system_state

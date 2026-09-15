@@ -139,16 +139,8 @@ class GPIOManager:
                     bounce_time=FEEDBACK_DEBOUNCE_MS / 1000.0,
                 )
 
-                toggle = Button(
-                    ch["toggle_gpio"],
-                    pull_up=self._toggle_active_low,
-                    bounce_time=TOGGLE_DEBOUNCE_S,
-                )
-                # Level present at init is reported, never treated as an edge.
-                self._toggle_last[slot] = bool(toggle.is_pressed)
-                toggle.when_pressed = self._toggle_callback(slot, ch["toggle_gpio"], on=True)
-                toggle.when_released = self._toggle_callback(slot, ch["toggle_gpio"], on=False)
-                self.toggles[slot] = toggle
+                # Physical toggle switches are no longer installed. Do not
+                # claim their pins or register callbacks; feedback remains live.
         except Exception as exc:
             # Fail SAFE, not fast: no relay was ever driven ON (initial_value=False) and the
             # controller stays alive in FAULT to report the fault; systemd must not crash-loop.

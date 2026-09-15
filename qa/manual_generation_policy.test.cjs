@@ -115,6 +115,7 @@ function loadEnergyPanel() {
     if (id === "./AllocationTimeline") return { AllocationTimeline: (p) => ({ type: "AllocationTimeline", props: p }) };
     if (id === "./GenerationCard") return { GenerationCard: (p) => ({ type: "GenerationCard", props: p }) };
     if (id === "./EnergyReferences") return { EnergyReferences: (p) => p.children };
+    if (id === "./SocietyEnergyComparison") return { SocietyEnergyComparison: (p) => ({ type: "SocietyEnergyComparison", props: p }) };
     if (id === "./useEnergy") return { useEnergy: () => ({}) };
     if (id === "./types") return { fmtKwh: (v) => (v == null ? "UNAVAILABLE" : `${Number(v).toFixed(2)} kWh`) };
     throw new Error(`Unexpected import: ${id}`);
@@ -164,7 +165,7 @@ test("ManualGenerationEntry enforces authoritative date field contract and null 
   assert.equal(byTestId(tree, "manual-entry-date-unavailable-A").props.role, "status");
 });
 
-test("EnergyPanel manual activity shows only MANUAL_GENERATION entries and includes clarifier", () => {
+test("EnergyPanel excludes legacy manual generation activity from the new physical-generation view", () => {
   const EnergyPanel = loadEnergyPanel();
   const energy = {
     loading: false,
@@ -184,7 +185,7 @@ test("EnergyPanel manual activity shows only MANUAL_GENERATION entries and inclu
       as_of_operating_date: "2026-09-12",
       calculation: { mode: "MANUAL" },
       generation_meter: { meter_id: "M1" },
-      references: {},
+      references: { grid: { enabled: true } },
       reset_period: "2026-09",
     },
     refresh() {},
@@ -192,14 +193,12 @@ test("EnergyPanel manual activity shows only MANUAL_GENERATION entries and inclu
   };
   const tree = EnergyPanel({ energy, readOnly: false, activeGenerationWing: "A", children: null, societyId: "1" });
   const rows = allByPrefix(tree, "manual-activity-").filter((n) => /^manual-activity-\d+$/.test(n.props["data-testid"]));
-  assert.equal(rows.length, 1);
-  const valueNode = byTestId(tree, "manual-activity-value-1");
-  assert.match(String(valueNode.props.children), /23\.00 kWh/);
-  assert.match(String(byTestId(tree, "manual-activity-provenance").props.children), /not consumption or bills/);
+  assert.equal(rows.length, 0);
+  assert.throws(() => byTestId(tree, "manual-common-provenance"));
 });
 
-test("OperationalDashboard uses manual_generation_operating_date authoritative field", () => {
+test("OperationalDashboard uses mode comparison and no longer mounts manual generation entry", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "frontend", "src", "components", "ops", "OperationalDashboard.tsx"), "utf8");
-  assert.match(src, /manual_generation_operating_date\s*\?\?\s*null/);
-  assert.doesNotMatch(src, /operatingDate=\{energy\.summary\.as_of_operating_date\}/);
+  assert.match(src, /comparison=\{energy\.comparison/);
+  assert.doesNotMatch(src, /ManualGenerationEntry|manualEntry=/);
 });

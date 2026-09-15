@@ -1,23 +1,22 @@
 "use client";
-import { ReactNode, useState } from "react";
+import { useState } from "react";
 import { CommandRow, Device, Slot, LastResponse as Response } from "./types";
 import { QueueFn, SlotConfigFn } from "./useOperations";
 import { btn, input, label, panel, tone } from "./DashboardHeader";
 import { LastResponse } from "./LastResponse";
 import { WingEnergyCard } from "./energy/WingEnergyCard";
-import { AllocationConfig, CalculationMode, CalculationWing, WingCode, WingSummary } from "./energy/types";
+import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary } from "./energy/types";
 
 type Props = { device: Device; code: WingCode; slot?: Slot; queue: QueueFn; setSlotConfig: SlotConfigFn; isPending: (d: string, c: string, s?: string) => boolean; readOnly: boolean;
   lastCmd?: CommandRow; lastResponse?: Response | null; wing?: WingSummary; allocation: AllocationConfig | null; activeGenerationWing?: string; allotmentInput?: ReactNode;
-  mode?: CalculationMode; calculation?: CalculationWing; manualEntry?: ReactNode };
+  mode?: CalculationMode; comparison?: ComparisonSeries; excessEnabled?: boolean };
 const telemetry = (v: string | undefined, offline: boolean) => offline ? "UNKNOWN (offline)" : v === "ON" || v === "OFF" ? v : "UNKNOWN";
 const numberOrNull = (v: number | undefined) => v != null && Number.isFinite(v) ? v : null;
 
-export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, readOnly, wing, allocation, activeGenerationWing, mode, calculation, manualEntry }: Props) {
+export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, readOnly, wing, allocation, activeGenerationWing, mode, comparison, excessEnabled = false }: Props) {
   const active = device.active_slot === code;
   const state = !slot || typeof slot.disabled !== "boolean" ? "UNAVAILABLE" : slot.disabled ? "DISABLED" : active ? "ACTIVE" : "INACTIVE";
   const stateTone = slot?.disabled ? "text-gray-500 border-gray-700" : active ? "text-emerald-300 border-emerald-500/50 bg-emerald-500/10" : "text-gray-300 border-[#2a3646]";
-  const toggleIn = telemetry(slot?.toggle_input, !device.connected);
   // Only the corresponding Pi feedback field; never infer from toggle, command, ACK or active_slot.
   const contactor = device.hardware_fault || device.feedback_hardware_installed !== true || slot?.feedback_enabled === false ? "UNKNOWN" : telemetry(slot?.physical_toggle, !device.connected);
   const busyCfg = isPending(device.id, "slot-config", code);
@@ -32,11 +31,9 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
       </div>
       <dl className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[10px]">
         <dt className="text-gray-500">LOGICAL SLOT</dt><dd data-testid={`slot-enabled-${code}`} className="text-gray-300">{typeof slot?.disabled === "boolean" ? slot.disabled ? "DISABLED" : "ENABLED" : "UNAVAILABLE"}</dd>
-        <dt className="text-gray-500">PHYSICAL TOGGLE</dt><dd data-testid={`slot-toggle-input-${code}`} className={toggleIn === "ON" ? "text-emerald-300" : "text-gray-400"}>{toggleIn}</dd>
         <dt className="text-gray-500">CONTACTOR</dt><dd data-testid={`slot-physical-${code}`} className={contactor === "ON" ? "text-emerald-300" : "text-gray-400"}>{contactor}</dd>
       </dl>
-      <WingEnergyCard code={code} wing={wing} mode={mode} calculation={calculation} allocation={allocation} activeGenerationWing={device.feedback_hardware_installed === true && !device.hardware_fault && slot?.feedback_enabled !== false ? activeGenerationWing : undefined} />
-      {mode === "MANUAL" && <div data-testid={`manual-operation-${code}`} className="text-[10px] text-gray-400">Operating status · Pi contactor: {contactor}</div>}
+      <WingEnergyCard code={code} wing={wing} mode={mode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={device.feedback_hardware_installed === true && !device.hardware_fault && slot?.feedback_enabled !== false ? activeGenerationWing : undefined} />
       {!readOnly && slot && !slot.disabled && (
         <div className="grid grid-cols-2 gap-2">
           <button data-testid={`cmd-set_active_slot-${device.id}-${code}`} disabled={active || busyAct} onClick={() => queue(device.id, "set_active_slot", code)} className={`${btn} ${tone.cyan}`}>{busyAct ? "EXECUTING…" : "ACTIVATE"}</button>
@@ -49,7 +46,6 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
           <button data-testid={`slot-${slot.disabled ? "enable" : "disable"}-${code}`} disabled={busyCfg} onClick={() => setSlotConfig(device.id, code, { disabled: !slot.disabled })} className={`${btn} ${slot.disabled ? tone.cyan : tone.gray}`}>{busyCfg ? "SAVING…" : slot.disabled ? "ENABLE" : "DISABLE"}</button>
         </div>
       )}
-      {!readOnly && mode === "MANUAL" && manualEntry}
     </section>
   );
 }

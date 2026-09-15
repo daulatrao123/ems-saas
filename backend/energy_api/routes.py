@@ -10,6 +10,7 @@ from psycopg.types.json import Json
 
 from . import queries as Q
 from . import references as R
+from . import comparison as C
 from .ingest import DEFAULT_ALLOCATION, METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
 
 VALUE_TYPES = {"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64"}
@@ -324,6 +325,17 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         if to < frm: raise HTTPException(400, "to must be >= from")
         if (to - frm).days + 1 > Q.MAX_DAILY_RANGE_DAYS: raise HTTPException(400, f"range limited to {Q.MAX_DAILY_RANGE_DAYS} days")
         return frm, to, today
+
+    @router.get("/graph/comparison")
+    def graph_comparison(society_id: str, device_id: str, days: int = 30, user: dict = Depends(get_current_user)):
+        sid = access(user, society_id)
+        if days not in (7, 30):
+            raise HTTPException(400, "days must be 7 or 30")
+        def fn(cur):
+            dev = device(cur, sid, device_id); did = str(dev["id"])
+            today = Q.device_today(cur, did, datetime.now(timezone.utc).date())
+            return C.overview(cur, dev, meters_of(cur, did), today, days)
+        return run(fn)
 
     @router.get("/graph/wing")
     def graph_wing(society_id: str, device_id: str, wing: str, range: str = None, frm: str = Query(None, alias="from"), to: str = None,

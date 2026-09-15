@@ -15,7 +15,6 @@ import { Confirm, ConfirmDialog } from "./ConfirmDialog";
 import { EnergyPanel } from "./energy/EnergyPanel";
 import { useEnergy } from "./energy/useEnergy";
 import { WINGS } from "./energy/types";
-import { ManualGenerationEntry } from "./energy/ManualGenerationEntry";
 import { SLOT_CODES } from "./types";
 
 // Society → Status → Slots A–D → Days → Controls → Last Response → LCD → Logs. Frontend only: same APIs,
@@ -42,8 +41,8 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
     <div data-testid="slot-grid" className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
       {WINGS.map((c) => <SlotCard key={`${device.id}:${c}:${mode}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={ops.setSlotConfig} isPending={ops.isPending} readOnly={readOnly}
         lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} wing={energy.summary?.wings?.[c]} allocation={energy.allocation}
-        mode={mode} calculation={energy.summary?.calculation?.wings[c]} activeGenerationWing={activeGenerationWing}
-        manualEntry={mode === "MANUAL" && !readOnly && energy.summary ? <ManualGenerationEntry wing={c} operatingDate={energy.summary.manual_generation_operating_date ?? null} disabled={energy.saving || energy.loading} onAdd={energy.addEntry} /> : null} />)}
+        mode={mode} comparison={energy.comparison?.wings[c]?.wing === c ? energy.comparison.wings[c] : undefined} activeGenerationWing={activeGenerationWing}
+        excessEnabled={energy.summary?.references?.grid.enabled === true} />)}
     </div>
   );
   const renderDayControls = (inputs: Record<string, ReactNode> = {}) => device && (

@@ -16,6 +16,9 @@ export type GenerationMeter = {
   unattributed: Metric | null; active_generation_wing: string; attribution: { wing?: string | null; status?: string } | null; source: string;
 };
 export type CalculationMode = "AUTO" | "MANUAL";
+export type ComparisonPoint = { date: string; generated_kwh: number | null; consumed_kwh: number | null; generation_source: string; consumption_source: string; generation_minus_consumption_kwh: number | null };
+export type ComparisonSeries = { today: ComparisonPoint; rows: ComparisonPoint[] };
+export type EnergyComparison = { device_id: string; mode: CalculationMode; version: number; operating_date: string; consumption_basis: string; wings: Record<WingCode, ComparisonSeries & { wing: WingCode }>; society: ComparisonSeries };
 export type GenerationPoint = { date: string; generated_kwh: number | null; generation_source: string };
 export type CalculationWing = { wing: WingCode; today: GenerationPoint & { required_kwh: number | null; target_achievement_percent: number | null; target_status: string }; generation_trend: GenerationPoint[] };
 export type Calculation = { mode: CalculationMode; version: number; operating_date: string; wings: Record<WingCode, CalculationWing> };
@@ -34,11 +37,11 @@ export const DEFAULT_MONTHS = 6;
 export const ALLOCATION_EVENT_PREFIX = "ENERGY_ALLOCATION_";
 
 // Source labels the operator sees. ADAPTIVE_ESTIMATE is reserved for the E5 estimator; the backend does not emit it yet.
-export const SOURCE_LABEL: Record<string, string> = { PHYSICAL: "Physical", ADAPTIVE_ESTIMATE: "Adaptive Estimate", MANUAL: "Manual", MIXED: "Mixed", UNAVAILABLE: "Unavailable" };
+export const SOURCE_LABEL: Record<string, string> = { PHYSICAL: "Physical", HISTORICAL: "Bill-derived reference", ADAPTIVE_ESTIMATE: "Adaptive Estimate", MANUAL: "Manual", MIXED: "Mixed", UNAVAILABLE: "Unavailable" };
 export const sourceLabel = (s: string | null | undefined) => { const k = (s || "").toUpperCase(); return SOURCE_LABEL[k] ?? (k ? `Unknown (${k})` : "Unavailable"); };
 export const sourceTone = (s: string | null | undefined) => {
   const k = (s || "").toUpperCase();
-  return k === "PHYSICAL" ? "text-emerald-300 border-emerald-500/40" : k === "MANUAL" ? "text-amber-300 border-amber-500/40" : k === "MIXED" || k === "ADAPTIVE_ESTIMATE" ? "text-cyan-300 border-cyan-500/40" : "text-gray-500 border-gray-700";
+  return k === "PHYSICAL" ? "text-emerald-300 border-emerald-500/40" : k === "MANUAL" || k === "HISTORICAL" ? "text-amber-300 border-amber-500/40" : k === "MIXED" || k === "ADAPTIVE_ESTIMATE" ? "text-cyan-300 border-cyan-500/40" : "text-gray-500 border-gray-700";
 };
 export const todayKwh = (m: Metric | null | undefined): number | null => (m && "today" in m && m.today?.status === "PHYSICAL" && Number.isFinite(m.today.kwh) ? m.today.kwh : null);
 export const reasonOf = (m: Metric | null | undefined): string | null => (m && "reason" in m ? m.reason : null);

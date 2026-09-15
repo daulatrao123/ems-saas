@@ -79,12 +79,12 @@ def render_wings(view, pair):
     slots, active = view.get("slots", {}), view.get("active_slot")
     a, b = pair
     sa, sb = slots.get(a, {}), slots.get(b, {})
-    # Three distinct facts per wing: relay/active state + days, contactor feedback, physical toggle.
+    # Relay/active state + days and contactor feedback; physical toggles retired.
     return [
         _fit(_slot_line(a, sa, active)),
         _fit(_slot_line(b, sb, active)),
         _lr(f"CT {a}:{_onoff(sa.get('contactor'))[:7]}", f"{b}:{_onoff(sb.get('contactor'))[:7]}"),
-        _lr(f"TG {a}:{_onoff(sa.get('toggle'))[:7]}", f"{b}:{_onoff(sb.get('toggle'))[:7]}"),
+        _fit(""),
     ]
 
 
