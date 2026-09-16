@@ -37,9 +37,9 @@ export function EnergyComparisonChart({ scope, rows, mode, excessEnabled, compac
           {(rows.length <= 7 || i % 5 === 0 || i === rows.length - 1) && <text x={43 + i * step + bar} y="180" textAnchor="middle" fill="#9ca3af" fontSize="10">{row.date.slice(5)}</text>}
         </g>)}
       </svg>}
-    <details data-testid={`comparison-details-${scope}`} open={compact ? true : undefined} className="text-[10px]">
-      <summary data-testid={`comparison-details-toggle-${scope}`} className="cursor-pointer text-gray-400">Daily values · kWh</summary>
-      <div className={compact ? "max-h-64 overflow-y-auto mt-2" : "mt-2"}>
+    <details data-testid={`comparison-details-${scope}`} className="ops-disclosure text-[11px]">
+      <summary data-testid={`comparison-details-toggle-${scope}`} className="cursor-pointer text-gray-400">Daily values · kWh<span data-testid={`comparison-day-count-${scope}`} className="ml-auto text-gray-500">{rows.length} dates</span></summary>
+      <div className={compact ? "ops-table-scroll max-h-64 overflow-y-auto mt-2" : "ops-table-scroll mt-2"}>
       <div className="grid grid-cols-[minmax(0,1fr)_repeat(3,minmax(0,1fr))] gap-1 text-gray-500 [&>span]:min-w-0 [&>span]:break-words"><span>Date</span><span>{compact ? "Gen." : "Generation"}</span><span>{compact ? "Cons." : "Consumption"}</span><span>Balance</span></div>
       {rows.map((row) => { const delta = difference(row, excessEnabled); return <div key={row.date} data-testid={`comparison-row-${scope}-${row.date}`} className="grid grid-cols-[minmax(0,1fr)_repeat(3,minmax(0,1fr))] gap-1 py-1 border-b border-[#1e2a3a] font-mono [&>span]:min-w-0 [&>span]:break-words">
         <span className="text-gray-500">{row.date.slice(5)}</span>

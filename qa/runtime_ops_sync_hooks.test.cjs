@@ -72,6 +72,47 @@ function eventWindow() {
 }
 const CustomEventMock = class { constructor(type, init) { this.type = type; this.detail = init?.detail; } };
 
+test("configuration gaps use real snapshot values, exclude disabled targets and never claim readiness", () => {
+  const h = hookHarness(), graph = runtime({ get() { throw Error("No API for presentation"); } }, h.React);
+  const Gaps = graph("components/ops/ConfigurationGaps.tsx").ConfigurationGaps;
+  const device = { feedback_hardware_installed: false, slots: Object.fromEntries(["A","B","C","D"].map(w => [w,{disabled:w==="D"}])) };
+  const summary = { generation_meter:{status:"DISABLED"}, wings:{}, target_delivery:{status:"UNKNOWN"} };
+  let tree = Gaps({ device, summary, allocation:{enabled:false} });
+  assert.equal(nodeById(tree,"configuration-gap-targets-value").props.children,"UNAVAILABLE · A, B, C");
+  assert.equal(nodeById(tree,"configuration-gap-feedback-value").props.children,"Not installed");
+  assert.equal(nodeById(tree,"configuration-gap-generation-value").props.children,"Meter disabled");
+  for(const [status, label] of [["PENDING","Pending controller report"],["STALE_REPORT","Stale report"],["UNKNOWN","UNKNOWN"]]){
+    tree=Gaps({device,summary:{...summary,target_delivery:{status}},allocation:null});
+    assert.equal(nodeById(tree,"configuration-gap-energy-version-value").props.children,label);
+    assert.equal(nodeById(tree,"configuration-gap-allocation-value"),undefined,"missing config is not DISABLED");
+  }
+  tree=Gaps({device:{...device,feedback_hardware_installed:undefined},summary:null,allocation:null});
+  assert.equal(nodeById(tree,"configuration-gap-feedback-value").props.children,"UNKNOWN");
+  const configured={...summary,generation_meter:{status:"ONLINE"},target_delivery:{status:"REPORTED_CURRENT"},wings:Object.fromEntries(["A","B","C","D"].map(w=>[w,{required_generation:{target_kwh_per_day:0}}]))};
+  assert.equal(Gaps({device:{...device,feedback_hardware_installed:true},summary:configured,allocation:{enabled:true}}),null,"zero is a configured target, not a missing target; no readiness banner invented");
+});
+
+test("navigation empty-state and full-dated historical commands use actual components", () => {
+  const h=hookHarness(), graph=runtime({ get(){throw Error("No network");} },h.React);
+  const Nav=graph("components/ops/DashboardSections.tsx").DashboardNavigation;
+  const empty=Nav({readOnly:false,hasDevice:false});
+  assert.ok(nodeById(empty,"dashboard-nav-overview"));
+  assert.equal(nodeById(empty,"dashboard-nav-energy"),undefined);
+  const member=Nav({readOnly:true});
+  assert.match(JSON.stringify(nodeById(member,"dashboard-nav-controls")),/Days & evidence/);
+  const Response=graph("components/ops/LastResponse.tsx").LastResponse;
+  const types=graph("components/ops/types.ts");
+  const row={command:"lcd_display",slot:"",status:"failed",result:"NOT_AVAILABLE",error:"DISPLAY_UNAVAILABLE",params:{},sequence_no:40,created_at:"2026-09-14T10:00:00Z",completed_at:"2026-09-14T10:00:02Z"};
+  let tree=Response({last:null,row});
+  assert.match(JSON.stringify(nodeById(tree,"last-response-context")),/Historical command result/);
+  assert.equal(nodeById(tree,"last-response-requested").props.children,types.fmtDateTime(row.created_at));
+  assert.match(nodeById(tree,"last-response-requested").props.children,/2026/);
+  assert.equal(nodeById(tree,"last-response-error").props.children,"DISPLAY_UNAVAILABLE");
+  tree=Response({last:null,row:{...row,status:"queued",result:null,error:null,completed_at:null}});
+  assert.match(JSON.stringify(nodeById(tree,"last-response-context")),/Command awaiting completion/);
+  assert.doesNotMatch(JSON.stringify(nodeById(tree,"last-response-context")),/Historical/);
+});
+
 test("clock and delivery notices render actual data safely without implying hardware verification", () => {
   const h = hookHarness();
   const graph = runtime({ get() { throw Error("No network in notice rendering"); } }, h.React);
@@ -316,7 +357,7 @@ test("LastResponse labels GPIO/contactor states; dashboard keeps single LCD pane
       jsxs: (t, p) => (typeof t === "function" ? t(p || {}) : { type: t, props: p || {} }),
       Fragment: Symbol.for("react.fragment"),
     },
-    "./types": { COMMAND_LABEL: {}, TERMINAL: new Set(["completed", "failed", "acked", "hardware_verified"]), fmtTime: (v) => String(v || "—"), statusTone: () => "tone" },
+    "./types": { COMMAND_LABEL: {}, TERMINAL: new Set(["completed", "failed", "acked", "hardware_verified"]), fmtTime: (v) => String(v || "—"), fmtDateTime: (v) => String(v || "—"), statusTone: () => "tone" },
     "./DashboardHeader": { label: "label", panel: "panel" },
   });
   const text = (node) => {

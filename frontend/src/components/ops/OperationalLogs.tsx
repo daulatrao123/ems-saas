@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import { COMMAND_LABEL, CommandRow, EventRow, fmtDateTime, statusTone } from "./types";
-import { btn, label, panel, tone } from "./DashboardHeader";
+import { btn, input, label, tone } from "./DashboardHeader";
 
 type Line = { ts: string; level: "INFO" | "WARN" | "ERROR"; event: string; details: string; key: string };
 
@@ -24,16 +24,20 @@ function toLines(commands: CommandRow[], events: EventRow[]): Line[] {
 
 export function OperationalLogs({ commands, events }: { commands: CommandRow[]; events: EventRow[] }) {
   const [limit, setLimit] = useState(20);
+  const [level, setLevel] = useState("ALL");
   const lines = toLines(commands, events);
+  const filtered = level === "ALL" ? lines : lines.filter((line) => line.level === level);
   const lvTone = { INFO: "text-emerald-400", WARN: "text-amber-300", ERROR: "text-red-400" };
   return (
-    <section data-testid="operational-logs" className={`${panel} p-4`}>
-      <div className="flex flex-wrap items-center justify-between gap-2"><div data-testid="operational-logs-heading" className={label}>Operational Logs · newest first</div><span data-testid="operational-logs-count" className="font-mono text-[10px] text-gray-500">{Math.min(limit, lines.length)} / {lines.length} loaded (bounded: 25 commands, 50 Pi events)</span></div>
-      {lines.length === 0 ? <div className="mt-3 text-sm text-gray-500">No events recorded for this device.</div> : (
+    <section data-testid="operational-logs" className="border-t border-[#293443] pt-4">
+      <div className="flex flex-wrap items-center justify-between gap-3"><div><div data-testid="operational-logs-heading" className={label}>Recorded history · newest first</div><span data-testid="operational-logs-count" className="block mt-1 font-mono text-[11px] text-gray-500">{Math.min(limit, filtered.length)} / {filtered.length} matching · {lines.length} loaded (bounded: 25 commands, 50 Pi events)</span></div>
+        <label data-testid="logs-level-label" className="flex items-center gap-2 text-xs text-gray-400">Level<select data-testid="logs-level-filter" aria-label="History severity" value={level} onChange={(event) => { setLevel(event.target.value); setLimit(20); }} className={input}><option data-testid="logs-level-option-all" value="ALL">All events</option><option data-testid="logs-level-option-error" value="ERROR">Errors</option><option data-testid="logs-level-option-warn" value="WARN">Warnings</option><option data-testid="logs-level-option-info" value="INFO">Information</option></select></label>
+      </div>
+      {filtered.length === 0 ? <div data-testid="logs-empty" className="mt-4 text-sm text-gray-500">{lines.length === 0 ? "No events recorded for this device." : "No loaded events match this level."}</div> : (
         <div className="mt-3 w-full font-mono text-[11px]">
           <div aria-hidden="true" className="hidden lg:grid lg:grid-cols-[160px_56px_224px_minmax(0,1fr)] gap-3 py-1 text-[10px] uppercase text-gray-500"><span>Time</span><span>Level</span><span>Event</span><span>Details</span></div>
           <ol>
-            {lines.slice(0, limit).map((l) => (
+            {filtered.slice(0, limit).map((l) => (
               <li key={l.key} data-testid={`log-row-${l.key}`} className="grid grid-cols-[auto_minmax(0,1fr)] lg:grid-cols-[160px_56px_224px_minmax(0,1fr)] gap-x-3 gap-y-1 border-t border-[#1e2a3a] py-2 [overflow-wrap:anywhere]">
                 <span data-testid={`log-time-${l.key}`} className="col-span-2 lg:col-span-1 text-gray-400">{fmtDateTime(l.ts)}</span>
                 <span data-testid={`log-level-${l.key}`} className={`font-bold ${lvTone[l.level]}`}>{l.level}</span>
@@ -44,7 +48,7 @@ export function OperationalLogs({ commands, events }: { commands: CommandRow[]; 
           </ol>
         </div>
       )}
-      {lines.length > limit && <button data-testid="logs-more" onClick={() => setLimit(limit + 20)} className={`${btn} ${tone.gray} mt-3`}>SHOW MORE</button>}
+      {filtered.length > limit && <button data-testid="logs-more" onClick={() => setLimit(limit + 20)} className={`${btn} ${tone.gray} mt-3`}>SHOW MORE LOADED HISTORY</button>}
     </section>
   );
 }

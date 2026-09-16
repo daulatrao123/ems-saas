@@ -8,8 +8,8 @@ function Stat({ id, name, value, sub, tone }: { id: string; name: string; value:
   return (
     <div data-testid={`stat-${id}`} className="px-4 py-3 border-r border-[#1e2a3a] last:border-r-0 min-w-0 break-words">
       <div className={label}>{name}</div>
-      <div data-testid={`stat-${id}-value`} className={`mt-1 font-mono text-lg font-bold leading-tight ${tone || "text-white"}`}>{value}</div>
-      {sub && <div data-testid={`stat-${id}-detail`} className="mt-1 text-[10px] text-gray-500">{sub}</div>}
+      <div data-testid={`stat-${id}-value`} className={`mt-2 font-mono ${["UNKNOWN", "STALE", "N/A"].includes(value) ? "text-sm" : "text-lg"} font-semibold leading-tight ${tone || "text-white"}`}>{value}</div>
+      {sub && <div data-testid={`stat-${id}-detail`} className="mt-2 text-[11px] leading-relaxed text-gray-500">{sub}</div>}
     </div>
   );
 }
@@ -26,7 +26,7 @@ export function StatusStrip({ device, resetDay }: { device: Device | null; reset
   const boots = count == null ? "UNKNOWN" : freshness !== "CURRENT" ? freshness : String(count);
   return (
     <div data-testid="status-strip" className={panel}>
-    <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 divide-y sm:divide-y-0 divide-[#1e2a3a]">
+    <div className="ops-metric-grid grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 divide-y xl:divide-y-0 divide-[#1e2a3a]">
       <Stat id="active-slot" name="Active Slot" value={device?.active_slot || "—"} sub={device?.active_slot ? device.slots[device.active_slot]?.display_name : "none active"} tone="text-cyan-300" />
       <Stat id="slots" name="Slots" value={slots.length ? `${enabled} / ${slots.length}` : "—"} sub="enabled / configured" />
       <Stat id="reset-day" name="Reset Day" value={String(resetDay)} sub="day of month" />

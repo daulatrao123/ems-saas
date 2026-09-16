@@ -124,6 +124,7 @@ function loadEnergyPanel() {
     if (id === "./types") return { fmtKwh: (v) => (v == null ? "UNAVAILABLE" : `${Number(v).toFixed(2)} kWh`) };
     if (id === "./ClockQualificationNotice") return { ClockQualificationNotice: () => null };
     if (id === "./TargetDeliveryStatus") return { TargetDeliveryStatus: () => null };
+    if (id === "../DashboardSections") return { SectionHeading: () => null };
     throw new Error(`Unexpected import: ${id}`);
   };
   vm.runInNewContext(out, { module, exports: module.exports, require: req, console }, { filename: "EnergyPanel.compiled.cjs" });

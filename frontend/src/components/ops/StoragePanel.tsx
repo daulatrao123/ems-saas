@@ -25,14 +25,14 @@ export function StoragePanel({ device }: { device: Device }) {
     : [];
   return (
     <section data-testid="storage-panel" className={`${panel} p-4`}>
-      <div className="flex items-center justify-between">
-        <span className={label}>Storage / data volume</span>
+      <div className="flex flex-wrap gap-3 items-center justify-between">
+        <span data-testid="storage-panel-heading" className={label}>Storage / data volume · Pi-reported</span>
         <span data-testid="storage-health" className={`font-mono text-xs font-bold ${toneFor(health)}`}>STATUS: {health}</span>
       </div>
       {!s ? (
-        <p className="mt-3 font-mono text-xs text-gray-500">No storage telemetry reported yet.</p>
+        <p data-testid="storage-no-telemetry" className="mt-3 font-mono text-xs text-gray-500">No storage telemetry reported yet.</p>
       ) : (
-        <dl className="mt-3 grid grid-cols-[110px_1fr] gap-y-1 font-mono text-xs">
+        <dl className="mt-4 grid grid-cols-[minmax(0,100px)_minmax(0,1fr)] gap-x-3 gap-y-2 font-mono text-xs [&_dd]:break-words [&_dd]:min-w-0">
           {rows.map(([k, v, t]) => (
             <Fragment key={k}>
               <dt className="text-gray-500">{k}</dt>
@@ -42,7 +42,7 @@ export function StoragePanel({ device }: { device: Device }) {
           {s.error && (<><dt className="text-gray-500">Error</dt><dd data-testid="storage-error" className="text-red-300">{s.error}</dd></>)}
         </dl>
       )}
-      {s && !s.smart_available && <p className="mt-2 text-[10px] text-gray-500">SMART unavailable on this device/controller — health cannot be GOOD without it.</p>}
+      {s && !s.smart_available && <p data-testid="storage-smart-caveat" className="mt-4 border-l-2 border-amber-500/50 pl-3 text-xs text-amber-200">SMART unavailable on this device/controller — health cannot be GOOD without it.</p>}
     </section>
   );
 }

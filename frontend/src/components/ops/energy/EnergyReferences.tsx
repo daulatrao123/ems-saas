@@ -6,6 +6,7 @@ import { GridReferencePanel } from "./GridReferencePanel";
 import { EnergySummary, WingCode, WINGS } from "./types";
 import { dailyRate, referenceSource } from "./referenceTypes";
 import { ConsumptionScopeLabel } from "./ConsumptionScopeLabel";
+import { SectionHeading } from "../DashboardSections";
 
 export function EnergyReferences({ societyId, societyName, controllerName, summary, readOnly, refresh, onSavedMonth, children }: {
   societyId: string; societyName: string; controllerName: string; summary: EnergySummary; readOnly: boolean; refresh: () => void; onSavedMonth: (month: string) => void; children: ReactNode;
@@ -14,8 +15,10 @@ export function EnergyReferences({ societyId, societyName, controllerName, summa
   const data = summary.references;
   return <BillHistoryContext.Provider value={{ open: setEditor, readOnly }}>
     {children}
-    <details data-testid="historical-consumption-section" className="border-t border-[#1e2a3a] pt-4 space-y-4">
-      <summary data-testid="historical-consumption-title" className="text-base font-bold text-white cursor-pointer">Historical averages · separate from selected-month values</summary>
+    <section id="ops-references" data-testid="dashboard-references" className="ops-section space-y-5">
+    <SectionHeading id="references" number="03" title="Baselines & calculation references" context="Not live dispatch" />
+    <details data-testid="historical-consumption-section" className="ops-disclosure space-y-4">
+      <summary data-testid="historical-consumption-title" className="text-sm font-semibold cursor-pointer"><span>Historical consumption averages</span><span data-testid="historical-baseline-preview" className="ml-auto text-sm text-sky-200 font-mono">{dailyRate(data.society_historical_daily_kwh)}</span></summary>
       <ConsumptionScopeLabel data={data} scope="society-reference" />
       <dl className="flex flex-wrap gap-x-10 gap-y-3 text-xs">
         <div><dt className="text-gray-400">Society historical baseline</dt><dd data-testid="society-historical-baseline" className="text-lg text-cyan-200 mt-1">{dailyRate(data.society_historical_daily_kwh)}</dd></div>
@@ -34,6 +37,7 @@ export function EnergyReferences({ societyId, societyName, controllerName, summa
     </details>
     <div data-testid="allocation-reference-operating-date" className="text-xs text-gray-400">Allocation / Grid reference date: {summary.as_of_operating_date} · Pi operating day</div>
     <GridReferencePanel key={`${summary.device_id}:${data.grid.version}`} societyId={societyId} deviceId={summary.device_id} grid={data.grid} allocation={data.allocation} readOnly={readOnly} onSaved={refresh} />
+    </section>
     {editor && <BillHistoryDialog societyId={societyId} societyName={societyName} controllerName={controllerName} operatingDate={summary.as_of_operating_date} deviceId={summary.device_id} initialWing={editor} data={data} readOnly={readOnly} onClose={() => setEditor(null)} onSavedMonth={onSavedMonth} />}
   </BillHistoryContext.Provider>;
 }

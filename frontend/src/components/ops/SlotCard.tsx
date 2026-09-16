@@ -24,7 +24,7 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
   const displayName = slot?.display_name?.trim();
   const customName = displayName && ![code, `slot ${code}`, `wing ${code}`].some((v) => v.toLowerCase() === displayName.toLowerCase()) ? displayName : null;
   return (
-    <section data-testid={`slot-card-${code}`} className={`${panel} ${active ? "border-emerald-500/40" : ""} p-4 flex flex-col gap-3 min-w-0`}>
+    <section data-testid={`slot-card-${code}`} data-state={state} className={`ops-wing ${panel} ${active ? "border-emerald-500/40" : ""} p-4 flex flex-col gap-4 min-w-0`}>
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0"><h2 data-testid={`slot-heading-${code}`} className="text-base font-bold text-white">Wing {code}</h2><div data-testid={`slot-name-${code}`} className={`${label} break-words`}>Slot {code}{customName ? ` · ${customName}` : ""}</div></div>
         <span data-testid={`slot-state-${code}`} className={`px-2 py-0.5 text-[10px] font-bold border ${stateTone}`}>{state}</span>
@@ -33,7 +33,9 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
         <dt className="text-gray-500">LOGICAL SLOT</dt><dd data-testid={`slot-enabled-${code}`} className="text-gray-300">{typeof slot?.disabled === "boolean" ? slot.disabled ? "DISABLED" : "ENABLED" : "UNAVAILABLE"}</dd>
         <dt className="text-gray-500">CONTACTOR</dt><dd data-testid={`slot-physical-${code}`} className={contactor === "ON" ? "text-emerald-300" : "text-gray-400"}>{contactor}</dd>
       </dl>
-      <WingEnergyCard code={code} wing={wing} mode={mode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={device.feedback_hardware_installed === true && !device.hardware_fault && slot?.feedback_enabled !== false ? activeGenerationWing : undefined} />
+      {slot?.disabled && <div data-testid={`slot-exclusion-${code}`} className="text-xs leading-relaxed text-gray-400 border-t border-dashed border-gray-700 pt-3">Disabled logical wing · excluded from society consumption</div>}
+      {slot?.disabled ? <details data-testid={`slot-disabled-data-${code}`} className="ops-disclosure"><summary data-testid={`slot-disabled-data-toggle-${code}`} className="text-xs">Energy data & bill history</summary><WingEnergyCard code={code} wing={wing} mode={mode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={undefined} /></details>
+        : <WingEnergyCard code={code} wing={wing} mode={mode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={device.feedback_hardware_installed === true && !device.hardware_fault && slot?.feedback_enabled !== false ? activeGenerationWing : undefined} />}
       {!readOnly && slot && !slot.disabled && (
         <div className="grid grid-cols-2 gap-2">
           <button data-testid={`cmd-set_active_slot-${device.id}-${code}`} disabled={active || busyAct} onClick={() => queue(device.id, "set_active_slot", code)} className={`${btn} ${tone.cyan}`}>{busyAct ? "EXECUTING…" : "ACTIVATE"}</button>

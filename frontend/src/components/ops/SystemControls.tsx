@@ -15,7 +15,7 @@ export function SystemControls({ deviceId, queue, isPending, ask }: Ctl) {
   ];
   return (
     <section data-testid={`system-controls-${deviceId}`} className={`${panel} p-4`}>
-      <div className={label}>System Controls</div>
+      <div data-testid={`system-controls-heading-${deviceId}`} className={label}>System Controls</div>
       <div className="mt-3 grid grid-cols-2 gap-2">
         {items.map((i) => {
           const busy = isPending(deviceId, i.cmd);
@@ -37,7 +37,7 @@ export function ResetDayControl({ deviceId, current, queue, isPending, ask }: Ct
   const n = Number(day); const valid = Number.isInteger(n) && n >= 1 && n <= 28; const busy = isPending(deviceId, "set_reset_day");
   return (
     <section data-testid={`reset-day-control-${deviceId}`} className={`${panel} p-4`}>
-      <div className="flex items-center justify-between"><div className={label}>Monthly Reset Day</div><div className="font-mono text-[11px] text-gray-400">current <b data-testid={`reset-day-current-${deviceId}`} className="text-white">{current}</b></div></div>
+      <div className="flex flex-wrap items-center justify-between gap-2"><div data-testid={`reset-day-heading-${deviceId}`} className={label}>Monthly Reset Day</div><div className="font-mono text-[11px] text-gray-400">current <b data-testid={`reset-day-current-${deviceId}`} className="text-white">{current}</b></div></div>
       <div className="mt-3 flex items-center gap-2">
         <span className="text-[11px] text-gray-400">Day</span>
         <input data-testid={`reset-day-input-${deviceId}`} type="number" min={1} max={28} value={day} onChange={(e) => setDay(e.target.value)} className={`${input} w-20 text-center`} />
@@ -46,7 +46,7 @@ export function ResetDayControl({ deviceId, current, queue, isPending, ask }: Ct
           {busy ? "SENDING…" : "SET"}
         </button>
       </div>
-      {!valid && <div className="mt-1 text-[10px] text-red-400">Allowed range 1–28</div>}
+      {!valid && <div data-testid={`reset-day-range-error-${deviceId}`} role="alert" className="mt-1 text-xs text-red-400">Allowed range 1–28</div>}
     </section>
   );
 }
