@@ -33,6 +33,7 @@ export function DashboardHeader({ dash, device, backHref, onRefresh, readOnly }:
         </div>
       </div>
       <div className="flex flex-wrap items-center gap-3 font-mono text-xs">
+        {device && !readOnly && <Link data-testid="ops-energy-setup" href={`/society/${dash.society_id}/energy-setup/${device.id}`} className={`${btn} ${tone.cyan}`}>⚙ Energy setup</Link>}
         {device ? (
           <>
             <span data-testid="ops-online" className={`flex items-center gap-2 font-bold ${device.connected ? "text-emerald-400" : "text-red-400"}`}><Dot on={device.connected} />LINK {device.connected ? "ONLINE" : "OFFLINE"}</span>

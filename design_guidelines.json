@@ -1,48 +1,49 @@
 {
-  "project_title": "Prestine Pacific EMS - Operational Web Dashboard Strategy & Design System",
+  "project_title": "Prestine Pacific EMS - Operational Web Dashboard & Admin Energy Commissioning System",
   "theme": "Dark Tactical Industrial Slate",
   "context_type": "DASHBOARD_AND_ADMIN",
   "archetype": "THE PERFORMANCE PRO / TACTICAL MINIMALISM",
-  "core_design_objective": "Eliminate operator ambiguity by strictly categorizing UI states into four distinct visual buckets: Live Active Telemetry, Configuration Discrepancies, Historical References, and Legacy Logs. Preserve truthful UNKNOWN, NOT VERIFIED, and UNAVAILABLE states without visual clutter.",
+  "core_design_objective": "Provide an Admin-only Energy Setup & Commissioning interface linked from society dashboard. Enable RS485 bus editing, physical M1 identity/address/phases/CT/maxkW and register map configuration, AUTO/MANUAL calculation mode selection (M1-only defaults MANUAL), and per-wing targets with up-to-6-bill weighted daily formula saving. Explicitly present Desired vs Pi-Reported config status without inventing fake hardware model presets or deleting data.",
   "state_separation_quadrant": {
     "category_1_live_active": {
-      "name": "Live Active Telemetry",
+      "name": "Live Active Telemetry & Confirmed Config",
       "visual_language": "Glowing Emerald pulse indicators, solid 1px emerald borders (#10B981), high-contrast primary typography.",
       "applied_to": [
         "Society Identity (Prestine Pacific, Mumbai)",
-        "Live Sync Status (ONLINE • 22s ago)",
-        "Active Wing States (Wing A, B, C Active/Enabled)",
-        "Live Aggregate Consumption (426.10 kWh)"
+        "Live Sync Status (ONLINE)",
+        "Verified M1 Meter Connection",
+        "Converged Config State (Desired matches Pi-reported)"
       ],
       "bg_style": "bg-emerald-950/30 border-emerald-500/40 text-emerald-300"
     },
     "category_2_config_gaps": {
-      "name": "Configuration Discrepancies & Unverified States",
-      "visual_language": "Amber/Orange warning banners (#F59E0B), diagonal stripe borders, pill labels 'CONFIG GAP', truthful UNKNOWN displays.",
+      "name": "Configuration Discrepancies & Unverified Hardware",
+      "visual_language": "Amber/Orange warning banners (#F59E0B), diagonal stripe borders, pill labels 'CONFIG GAP', truthful UNKNOWN displays for unconfirmed fields.",
       "applied_to": [
-        "Energy Config Version (Desired v2.1 vs Reported UNKNOWN)",
-        "Clock Qualification Warning (Unsynchronized Pi Clock)",
-        "Boot Recovery Status (NOT VERIFIED)"
+        "Desired vs Pi-Reported Config Discrepancies",
+        "Unverified Datasheet Register Map",
+        "Unconfirmed M1 Hardware Address or Blank Parameters",
+        "Disabled Meter Status until Explicit Confirmation"
       ],
       "bg_style": "bg-amber-950/40 border-amber-500/50 text-amber-200 shadow-inner"
     },
     "category_3_historical_references": {
-      "name": "Historical References & Baselines",
-      "visual_language": "Steel Indigo/Slate card containers (#6366F1), dashed or subtle borders, mandatory badge 'HISTORICAL REFERENCE • NO DIRECT EXPORT CLAIM'.",
+      "name": "Historical References & Weighted Target Baselines",
+      "visual_language": "Steel Indigo/Slate card containers (#6366F1), dashed or subtle borders, mandatory badge 'HISTORICAL REFERENCE / WEIGHTED DAILY TARGET'.",
       "applied_to": [
-        "Historical Baseline Comparison (402.32 kWh)",
-        "Selected Calendar / Pi-day Comparison",
-        "Monthly Generation Bar Charts & M1 Generation"
+        "Latest Up-To-6-Bill Weighted Daily Formula Calculations",
+        "Historical Wing Energy Allocation Baseline",
+        "Previous Energy Config Snapshot History"
       ],
       "bg_style": "bg-indigo-950/20 border-indigo-500/30 text-indigo-200"
     },
     "category_4_legacy_past_failures": {
       "name": "Historical Past Event / Legacy Log",
-      "visual_language": "De-emphasized Muted Dark Gray (#64748B), outline-only style, distinct dated badge 'HISTORICAL EVENT (Sep 14)' to prevent misinterpreting as a current active fault.",
+      "visual_language": "De-emphasized Muted Dark Gray (#64748B), outline-only style, distinct dated badge.",
       "applied_to": [
-        "Old LCD#40 failed DISPLAY_UNAVAILABLE dated Sep 14",
         "Acknowledged Historical System Logs",
-        "Past Hardware Diagnostics"
+        "Past Bus Communication Failures",
+        "Historical Controller Hardware Reconnections"
       ],
       "bg_style": "bg-slate-900/50 border-slate-700/60 text-slate-400 opacity-80 hover:opacity-100"
     }
@@ -76,13 +77,13 @@
   },
   "grids_and_layouts": {
     "layout_mode": "MODE B: High Density Bento Grid (Analytics & Control Command Center)",
-    "container_structure": "grid grid-cols-1 md:grid-cols-3 lg:grid-cols-12 gap-5 p-4 md:p-6 max-w-[1600px] mx-auto",
-    "spans": {
-      "header_strip": "col-span-full mb-2",
-      "top_metrics_row": "col-span-full grid grid-cols-1 md:grid-cols-3 gap-4",
-      "main_left_column": "col-span-full lg:col-span-8 space-y-5",
-      "main_right_column": "col-span-full lg:col-span-4 space-y-5",
-      "logs_full_width": "col-span-full mt-2"
+    "commissioning_page_layout": "grid grid-cols-1 lg:grid-cols-12 gap-6 p-4 md:p-8 max-w-[1600px] mx-auto",
+    "commissioning_spans": {
+      "header_nav": "col-span-full flex flex-wrap items-center justify-between gap-4 bg-slate-900/80 p-4 rounded-xl border border-slate-800",
+      "controller_selector_bar": "col-span-full bg-slate-900/60 p-4 rounded-lg border border-slate-800/80 flex flex-wrap items-center justify-between gap-4",
+      "config_status_summary": "col-span-full lg:col-span-12 grid grid-cols-1 md:grid-cols-3 gap-4",
+      "left_col_hardware_bus": "col-span-full lg:col-span-7 space-y-6",
+      "right_col_mode_targets": "col-span-full lg:col-span-5 space-y-6"
     }
   },
   "visual_enhancers": {
@@ -92,15 +93,42 @@
     "unknown_badge": "inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-xs font-mono font-medium border border-dashed border-sky-500/40 bg-sky-950/30 text-sky-300"
   },
   "component_map": {
-    "DashboardHeader.tsx": "Header displaying Prestine Pacific, Mumbai controller identity, live connection badge (ONLINE • 22s ago), and controller device selector dropdown.",
-    "StatusStrip.tsx": "Top-level health summary: CPU/Uptime/Boot watchdog state (truthful UNKNOWN), Storage health (active SMART UNAVAILABLE warning), and Config Version Convergence (Desired v2.1 vs Reported UNKNOWN).",
-    "WingEnergyCard.tsx": "Per-Wing billing & status card. Wings A, B, C enabled with bill refs (A: 312.73, B: 36.33, C: 77.03). Wing D disabled with explicit 'EXCLUDED FROM AGGREGATE' visual shield.",
-    "EnergyPanel.tsx": "Aggregate consumption display (426.10 kWh) with strict exclusion of disabled Wing D, accompanied by Historical Baseline Comparison (402.32 kWh) and Pi-day comparison controls.",
-    "GenerationCard.tsx": "Manual vs AUTO calculation selector, M1 physical generation inputs, monthly generation plot, and selected calendar context.",
-    "LcdMessagePanel.tsx": "Retained 20x4 LCD web message preview screen with live physical character grid simulation and payload update controls.",
-    "SystemControls.tsx": "System action triggers (Reboot, OTA, Config Sync) with modal confirmations and strict read-only member protection disabling writes.",
-    "OperationalLogs.tsx": "Bounded operational log with state filters (All, Active Faults, Config Discrepancies, Historical Legacy) and 'Show More' history expansion."
+    "AdminEnergySetupPage": "Admin-only setup root container at /admin/energy-setup or /society/[id]/setup with Return to Operations button.",
+    "ControllerSelectorBar": "Dropdown to select existing target controller with current online/sync state display.",
+    "ConfigConvergenceBanner": "Side-by-side comparison of Desired Energy Config vs Pi-Reported Config Status with convergence state pill (CONVERGED / PENDING_SYNC / MISMATCH).",
+    "BusConfigCard": "RS485 Bus configuration panel (Port, Baud Rate, Parity, Stop Bits, Timeout ms) with data-testid attributes.",
+    "M1MeterCommissioningCard": "Physical M1 identity, Modbus Slave Address, Phase count (1P/3P), CT Ratio (Primary/Secondary), Max kW rating, Enabled state toggle, and generic register map form (Voltage, Current, Active Power, Import kWh registers). Blank fields kept blank when unconfirmed.",
+    "CalculationModeCard": "Calculation Mode selector (AUTO vs MANUAL). Shows forced MANUAL constraint warning when M1-only topology is active.",
+    "PerWingTargetCard": "Per-Wing daily energy target editor using latest up-to-6 bill weighted daily formula (Weight W_i = Bill_Days_i / Total_Days). Explicit Save Target action button."
   },
+  "required_data_testids": [
+    "data-testid=\"admin-setup-return-to-ops-btn\"",
+    "data-testid=\"select-controller-dropdown\"",
+    "data-testid=\"config-convergence-badge\"",
+    "data-testid=\"desired-vs-reported-card\"",
+    "data-testid=\"rs485-port-input\"",
+    "data-testid=\"rs485-baud-select\"",
+    "data-testid=\"rs485-parity-select\"",
+    "data-testid=\"m1-address-input\"",
+    "data-testid=\"m1-phases-select\"",
+    "data-testid=\"m1-ct-primary-input\"",
+    "data-testid=\"m1-ct-secondary-input\"",
+    "data-testid=\"m1-max-kw-input\"",
+    "data-testid=\"m1-enabled-toggle\"",
+    "data-testid=\"m1-register-voltage-input\"",
+    "data-testid=\"m1-register-current-input\"",
+    "data-testid=\"m1-register-power-input\"",
+    "data-testid=\"m1-register-kwh-input\"",
+    "data-testid=\"m1-save-config-btn\"",
+    "data-testid=\"calc-mode-auto-radio\"",
+    "data-testid=\"calc-mode-manual-radio\"",
+    "data-testid=\"calc-mode-save-btn\"",
+    "data-testid=\"wing-target-input-a\"",
+    "data-testid=\"wing-target-input-b\"",
+    "data-testid=\"wing-target-input-c\"",
+    "data-testid=\"wing-target-save-btn\"",
+    "data-testid=\"weighted-formula-preview\""
+  ],
   "image_urls": [
     {
       "url": "https://images.unsplash.com/photo-1563456019560-2b37aa7ad890?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MTN8MHwxfHNlYXJjaHwyfHxpbmR1c3RyaWFsJTIwZW5lcmd5JTIwY29udHJvbCUyMHBhbmVsJTIwZGFzaGJvYXJkfGVufDB8fHx8MTc4OTUzMzAyMXww&ixlib=rb-4.1.0&q=85",
@@ -116,16 +144,18 @@
   "accessibility": {
     "contrast_ratio": "APCA & WCAG AA minimum 4.5:1 for standard text, 3:1 for large metrics",
     "focus_states": "ring-2 ring-emerald-400 ring-offset-2 ring-offset-slate-900 focus:outline-none",
-    "data_testid_rule": "MUST add data-testid on every interactive button, input, toggle, tab, metric card, and badge (e.g., data-testid='society-sync-status-badge', data-testid='wing-a-bill-input').",
+    "data_testid_rule": "MUST add data-testid on every interactive button, input, toggle, tab, metric card, and badge.",
     "reduced_motion": "Wrap non-essential transitions in motion-safe: classes."
   },
   "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
     "Do not use generic centered layouts or unstyled default cards.",
     "Maintain strict data integrity: UNKNOWN and NOT VERIFIED states must be visually distinct and truthful, not converted to 0 or hidden.",
-    "Ensure Wing D (disabled) is clearly labeled as logically excluded from the society aggregate calculation (426.10 kWh).",
-    "Separate current active storage warnings (SMART UNAVAILABLE) from historical old fault logs (Sep 14 LCD failure) using clear category tags.",
-    "All interactive and key informational components must include explicit kebab-case data-testid attributes.",
+    "Do NOT invent hardware model presets (e.g., Schneider IEM3155, Eastron SDM120) because current backend only has generic register maps. Keep unknown fields blank and meter disabled until confirmed.",
+    "In calculation mode selection, when topology is M1-only, auto mode is disabled and forced to MANUAL with clear explanatory callout.",
+    "For per-wing daily target calculation, implement the weighted daily formula based on up-to-6 historical bills: Weighted_Daily_Target = sum(Bill_kWh_i) / sum(Bill_Days_i).",
+    "Ensure explicit save actions with confirmation/status feedback for Bus config, M1 config, Mode choice, and Wing targets.",
+    "All user-visible controls, input fields, select boxes, radios, status badges, and action buttons MUST have unique kebab-case data-testid attributes.",
     "Never use Space Grotesk font for this dashboard. Use Cabinet Grotesk or Barlow Condensed for headings and JetBrains Mono for metrics."
   ],
-  "instructions_to_main_agent": "Implement the UI enhancements across existing files (/app/frontend/src/components/ops/*.tsx) according to these specifications. Maintain existing backend API hooks and identity/permission rules while upgrading layout structure, color cues, spacing, and data hierarchy."
+  "instructions_to_main_agent": "Implement the Admin Energy Setup & Commissioning screen conforming to these specifications. Connect with existing society dashboard navigation and maintain full state consistency."
 }

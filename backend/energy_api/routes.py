@@ -13,6 +13,7 @@ from . import references as R
 from . import comparison as C
 from .operating_dates import date_problem, require_qualified_open
 from .target_delivery import reconcile_targets, delivery_view
+from .commissioning import check_expected, basis_hash, register_problems
 from .ingest import DEFAULT_ALLOCATION, METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
 
 VALUE_TYPES = {"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64"}
@@ -21,24 +22,7 @@ WRITE_ROLES = {"super_admin", "society_admin"}
 
 
 def validate_register_map(rmap):
-    if not isinstance(rmap, dict):
-        return ["register_map must be an object"]
-    p = []
-    if rmap.get("verified") is not True:
-        p.append("register_map must be marked verified (from the meter datasheet)")
-    regs = rmap.get("registers") if isinstance(rmap.get("registers"), dict) else {}
-    e = regs.get("energy_total_kwh")
-    if not isinstance(e, dict):
-        return p + ["registers.energy_total_kwh is required"]
-    if not isinstance(e.get("address"), int) or isinstance(e.get("address"), bool) or not 0 <= e["address"] <= 65535:
-        p.append("energy_total_kwh.address must be an integer 0..65535")
-    if e.get("type") not in VALUE_TYPES:
-        p.append("energy_total_kwh.type invalid")
-    if e.get("unit") not in ("kWh", "Wh", "MWh"):
-        p.append("energy_total_kwh.unit must be kWh/Wh/MWh")
-    if e.get("function", 3) not in (3, 4):
-        p.append("energy_total_kwh.function must be 3 or 4")
-    return p
+    return register_problems(rmap)
 
 
 def _date(v, what):
@@ -120,6 +104,23 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         return out
 
     # ---------------------------------------------------------------- meters / bus
+    @router.get("/commissioning")
+    def get_commissioning(society_id: str, device_id: str, user: dict = Depends(get_current_user)):
+        sid = access(user, society_id, write=True)
+        def fn(cur):
+            dev = device(cur, sid, device_id, ensure_meters=False); did = str(dev["id"])
+            stored = meters_of(cur, did)
+            meters = {mid: stored.get(mid, {"meter_id": mid, "enabled": False, "comm_status": "DISABLED",
+                "serial": None, "model": None, "modbus_address": None, "register_map": None,
+                "phases": 1, "ct_ratio": 1, "max_kw": None, "last_seen": None}) for mid in METER_IDS}
+            cur.execute("SELECT energy_allocation FROM pi_devices WHERE id=%s", (did,))
+            allocation = cur.fetchone()["energy_allocation"] or DEFAULT_ALLOCATION
+            return {"device_id": did, "config_version": dev["energy_config_version"], "bus": dev["energy_bus"] or {},
+                    "meters": meters, "mode": {"mode": dev["energy_calculation_mode"], "version": dev["energy_calculation_version"]},
+                    "delivery": delivery_view(cur, did, dev["energy_config_version"], datetime.now(timezone.utc)),
+                    "allocation_enabled": allocation.get("enabled", False) is True}
+        return run(fn)
+
     @router.get("/meters")
     def get_meters(society_id: str, device_id: str, user: dict = Depends(get_current_user)):
         sid = access(user, society_id)
@@ -136,6 +137,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         sid = access(user, data.get("society_id"), write=True)
         def fn(cur):
             dev = device(cur, sid, data.get("device_id"), lock=True); did = str(dev["id"])
+            check_expected(data, dev["energy_config_version"])
             cur.execute("SELECT * FROM energy_meters WHERE device_id=%s AND meter_id=%s", (did, meter_id))
             cur_row = dict(cur.fetchone())
             fields = {}
@@ -151,8 +153,11 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                 fields["register_map"] = Json(rm) if rm is not None else None
             for k, lo, hi in (("phases", 1, 3), ("ct_ratio", 0.001, 100000), ("max_kw", 0.001, 100000)):
                 if k in data:
+                    if k == "phases" and (type(data[k]) is not int or data[k] not in (1, 3)): raise HTTPException(400, "phases must be 1 or 3")
                     fields[k] = None if data[k] is None else (int(_num(data[k], k, lo, hi)) if k == "phases" else _num(data[k], k, lo, hi))
-            if "enabled" in data: fields["enabled"] = bool(data["enabled"])
+            if "enabled" in data:
+                if type(data["enabled"]) is not bool: raise HTTPException(400, "enabled must be true or false")
+                fields["enabled"] = data["enabled"]
             if not fields: raise HTTPException(400, "No fields to update")
             merged = {**cur_row, **{k: (v.obj if isinstance(v, Json) else v) for k, v in fields.items()}}
             if merged["enabled"]:
@@ -181,19 +186,22 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
     def put_bus(data: dict, user: dict = Depends(get_current_user)):
         sid = access(user, data.get("society_id"), write=True)
         port = str(data.get("port") or "").strip()
-        if port and not port.startswith("/dev/"):
+        if port and (not port.startswith("/dev/") or not port.removeprefix("/dev/") or ".." in port.split("/")):
             raise HTTPException(400, "port must be a /dev/... path (prefer /dev/serial/by-id/...)")
         serial = data.get("serial") if isinstance(data.get("serial"), dict) else {}
         allowed = {"baudrate": (300, 115200), "bytesize": (7, 8), "stopbits": (1, 2), "timeout_s": (0.05, 5)}
         clean = {}
         for k, (lo, hi) in allowed.items():
             if k in serial:
-                clean[k] = _num(serial[k], k, lo, hi) if k == "timeout_s" else int(_num(serial[k], k, lo, hi))
+                number = _num(serial[k], k, lo, hi)
+                if k != "timeout_s" and not number.is_integer(): raise HTTPException(400, f"{k} must be an integer")
+                clean[k] = number if k == "timeout_s" else int(number)
         if "parity" in serial:
             if str(serial["parity"]).upper() not in ("N", "E", "O"): raise HTTPException(400, "parity must be N, E or O")
             clean["parity"] = str(serial["parity"]).upper()
         def fn(cur):
             dev = device(cur, sid, data.get("device_id"), lock=True); did = str(dev["id"])
+            check_expected(data, dev["energy_config_version"])
             bus = {"port": port or None, "serial": clean}
             if not port:
                 cur.execute("SELECT COUNT(*) AS n FROM energy_meters WHERE device_id=%s AND enabled", (did,))
@@ -500,7 +508,8 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             cur.execute("SELECT * FROM energy_generation_targets WHERE device_id=%s AND wing=%s ORDER BY effective_from DESC, id DESC LIMIT 20", (did, w))
             rows = [_target_row(r) for r in cur.fetchall()]
             current = Q.latest_target(cur, did, w, as_of)
-            return {"wing": w, "current": _target_row(current) if current else None, "history": rows, "bills": _bills(cur, did, w),
+            bills = _bills(cur, did, w)
+            return {"wing": w, "current": _target_row(current) if current else None, "history": rows, "bills": bills, "basis_hash": basis_hash(bills),
                     "as_of_operating_date": as_of.isoformat(), "delivery": delivery_view(cur, did, dev["energy_config_version"], now)}
         return run(fn)
 
@@ -511,9 +520,12 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         eff = _date(data["effective_from"], "effective_from") if data.get("effective_from") else datetime.now(timezone.utc).date()
         def fn(cur):
             dev = device(cur, sid, data.get("device_id"), ensure_meters=False, lock=True); did = str(dev["id"])
+            check_expected(data, dev["energy_config_version"])
             now = datetime.now(timezone.utc)
             as_of = Q.device_today(cur, did, now.date(), now=now)
             bills = _bills(cur, did, w)
+            if "expected_basis_hash" in data and data["expected_basis_hash"] != basis_hash(bills):
+                raise HTTPException(409, "Bill history changed; refresh the target preview before saving")
             if not bills["months"] or bills["daily_average_kwh"] is None: raise HTTPException(409, f"No bill history for wing {w}: enter the six-month bills first")
             target = _num(Q.compute_target(bills["daily_average_kwh"], pct), "target_kwh_per_day", 0)
             basis = {"months": [m["month"] for m in bills["months"]], "total_kwh": bills["total_kwh"], "days": bills["days"], "formula": "daily_average x (1 + adjustment_percent/100)"}
