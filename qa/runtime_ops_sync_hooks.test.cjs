@@ -71,6 +71,28 @@ function eventWindow() {
     dispatchEvent(e) { sent.push(e); listeners.get(e.type)?.forEach((fn) => fn(e)); return true; } };
 }
 const CustomEventMock = class { constructor(type, init) { this.type = type; this.detail = init?.detail; } };
+
+test("clock and delivery notices render actual data safely without implying hardware verification", () => {
+  const h = hookHarness();
+  const graph = runtime({ get() { throw Error("No network in notice rendering"); } }, h.React);
+  const Clock = graph("components/ops/energy/ClockQualificationNotice.tsx").ClockQualificationNotice;
+  const Delivery = graph("components/ops/energy/TargetDeliveryStatus.tsx").TargetDeliveryStatus;
+  for (const value of [null, undefined, [], "bad", 7, { status: {} }]) {
+    assert.doesNotThrow(() => Clock({ report: value }));
+    assert.doesNotThrow(() => Delivery({ delivery: value }));
+  }
+  const clock = Clock({ report: { status: "WARNING", sampled_at: "2026-09-16T01:00:00Z", open_days: 2,
+    rejected_rows: [null, { operating_date: "2099-01-01", reason: "FUTURE_OPERATING_DATE" }, { reason: {}, operating_date: [] }] } });
+  assert.ok(nodeById(clock, "energy-clock-warning"));
+  assert.ok(nodeById(clock, "energy-clock-open-backlog"));
+  assert.ok(nodeById(clock, "energy-clock-rejected-0"));
+  const delivery = Delivery({ delivery: { desired_version: 5, reported_version: 4, status: "PENDING", reported_at: null } });
+  assert.equal(nodeById(delivery, "energy-target-delivery-status").props.children, "Pending controller version");
+  assert.equal(nodeById(delivery, "energy-target-delivery-time"), undefined);
+  const reported = Delivery({ delivery: { desired_version: 5, reported_version: 5, status: "REPORTED_CURRENT" } });
+  assert.equal(nodeById(reported, "energy-target-delivery-status").props.children, "Controller reports current version");
+  assert.doesNotMatch(JSON.stringify(reported), /hardware.verified|HW VERIFIED/i);
+});
 function nodeById(tree, id) {
   if (Array.isArray(tree)) { for (const child of tree) { const found = nodeById(child,id); if(found) return found; } }
   if (!tree || typeof tree !== "object") return undefined;

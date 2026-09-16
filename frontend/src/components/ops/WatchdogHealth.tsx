@@ -1,15 +1,18 @@
 "use client";
 import { ControllerHealth, fmtDateTime } from "./types";
 import { label } from "./DashboardHeader";
+import { normalizeControllerHealth } from "./healthValidation";
 
-export function healthFreshness(health: ControllerHealth | undefined, connected: boolean) {
+export function healthFreshness(value: unknown, connected: boolean) {
+  const health = normalizeControllerHealth(value);
   if (!health?.sampled_at || health.status === "UNKNOWN") return "UNKNOWN";
   const age = (Date.now() - Date.parse(health.sampled_at)) / 1000;
   if (!Number.isFinite(age) || age < -30) return "UNKNOWN";
   return !connected || health.status === "STALE" || age > health.max_age_seconds ? "STALE" : "CURRENT";
 }
 
-export function WatchdogHealth({ health, connected }: { health?: ControllerHealth; connected: boolean }) {
+export function WatchdogHealth({ health: value, connected }: { health?: ControllerHealth; connected: boolean }) {
+  const health = normalizeControllerHealth(value);
   const freshness = healthFreshness(health, connected), wd = health?.watchdog;
   const timeout = wd?.service_timeout_us;
   const configured = freshness !== "CURRENT" ? freshness : timeout == null ? "UNKNOWN" : timeout > 0 ? "CONFIGURED" : "NOT CONFIGURED";

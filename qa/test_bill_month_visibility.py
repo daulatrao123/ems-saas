@@ -67,10 +67,18 @@ class BillMonthCursor:
             self._rows = [deepcopy(r) for r in self.state.get("slot_configs", {}).get(did, [])]
             return
 
-        if q.startswith("select max(operating_date) as d from energy_daily where device_id=%s and status='open'"):
+        if q.startswith("select clock_report from energy_sync_state"):
+            self._one = None
+            return
+
+        if q.startswith("select reported_config_version,reported_at from energy_sync_state"):
+            self._one = None
+            return
+
+        if q.startswith("select max(operating_date) as d, min(operating_date) as earliest, count(*) as open_count from energy_daily where device_id=%s and status='open'"):
             did = str(params[0])
             days = [r["operating_date"] for r in self.state["daily"].get(did, []) if r["status"] == "OPEN"]
-            self._one = {"d": max(days)} if days else {"d": None}
+            self._one = {"d": max(days) if days else None, "earliest": min(days) if days else None, "open_count": len(days)}
             return
 
         if q.startswith("select operating_date, status, (wing_generation->>"):

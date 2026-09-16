@@ -1777,7 +1777,7 @@ def pi_sync(
                 "reconciled_commands": reconciled,
                 "lcd_message": active_lcd_message(cur, device_id, now),
             }
-            energy_cfg = energy_ingest.config_reply(cur, device_id, payload.get("energy"))
+            energy_cfg = energy_ingest.config_reply(cur, device_id, payload.get("energy"), now)
             if energy_cfg is not None:
                 reply["energy_config"] = energy_cfg
             if cmd:

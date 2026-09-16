@@ -62,6 +62,7 @@ function loadTsx(relPath, exportName, mocks = {}) {
   const module = { exports: {} };
   const req = (id) => {
     if (id in mocks) return mocks[id];
+    if (id === "./healthValidation") return { normalizeControllerHealth: loadTsx("frontend/src/components/ops/healthValidation.ts", "normalizeControllerHealth") };
     throw new Error(`Unexpected import: ${id}`);
   };
   vm.runInNewContext(out, { module, exports: module.exports, require: req, console, Date }, { filename: `${exportName}.compiled.cjs` });
@@ -132,16 +133,16 @@ function mkDevice(health) {
 
 test("health freshness handles current, stale, unknown, and future timestamps", () => {
   withFixedNow(() => {
-    const current = healthFreshness({ sampled_at: "2026-01-31T23:59:50Z", status: "CURRENT", max_age_seconds: 120 }, true);
+    const current = healthFreshness({ version: 1, sampled_at: "2026-01-31T23:59:50Z", status: "CURRENT", max_age_seconds: 120 }, true);
     assert.equal(current, "CURRENT");
 
-    const stale = healthFreshness({ sampled_at: "2026-01-31T23:57:00Z", status: "STALE", max_age_seconds: 120 }, true);
+    const stale = healthFreshness({ version: 1, sampled_at: "2026-01-31T23:57:00Z", status: "STALE", max_age_seconds: 120 }, true);
     assert.equal(stale, "STALE");
 
-    const unknown = healthFreshness({ sampled_at: null, status: "UNKNOWN", max_age_seconds: 120 }, true);
+    const unknown = healthFreshness({ version: 1, sampled_at: null, status: "UNKNOWN", max_age_seconds: 120 }, true);
     assert.equal(unknown, "UNKNOWN");
 
-    const future = healthFreshness({ sampled_at: "2026-02-01T00:10:00Z", status: "CURRENT", max_age_seconds: 120 }, true);
+    const future = healthFreshness({ version: 1, sampled_at: "2026-02-01T00:10:00Z", status: "CURRENT", max_age_seconds: 120 }, true);
     assert.equal(future, "UNKNOWN");
   });
 });
@@ -149,6 +150,7 @@ test("health freshness handles current, stale, unknown, and future timestamps", 
 test("WatchdogHealth shows configured/service evidence and keeps recovery NOT VERIFIED", () => {
   withFixedNow(() => {
     const health = {
+      version: 1,
       sampled_at: "2026-01-31T23:59:50Z",
       status: "CURRENT",
       max_age_seconds: 120,
@@ -171,6 +173,7 @@ test("WatchdogHealth shows configured/service evidence and keeps recovery NOT VE
 test("StatusStrip uses measured health values, including valid zero, not legacy numbers", () => {
   withFixedNow(() => {
     const health = {
+      version: 1,
       sampled_at: "2026-01-31T23:59:50Z",
       status: "CURRENT",
       max_age_seconds: 120,
@@ -195,6 +198,7 @@ test("StatusStrip uses measured health values, including valid zero, not legacy 
 test("StatusStrip shows stale/disconnected semantics and does not leak prior device data", () => {
   withFixedNow(() => {
     const stale = {
+      version: 1,
       sampled_at: "2026-01-31T23:55:00Z",
       status: "STALE",
       max_age_seconds: 120,
@@ -221,6 +225,7 @@ test("StatusStrip shows stale/disconnected semantics and does not leak prior dev
 
 test("StatusStrip and WatchdogHealth testids stay unique and expose no health-control buttons", () => {
   const health = {
+    version: 1,
     sampled_at: "2026-01-31T23:59:50Z",
     status: "CURRENT",
     max_age_seconds: 120,
@@ -238,4 +243,23 @@ test("StatusStrip and WatchdogHealth testids stay unique and expose no health-co
     if (n?.type === "button") buttons += 1;
   });
   assert.equal(buttons, 0, "health UI must remain read-only");
+});
+
+test("malformed optional health never crashes or manufactures measured/verified values", () => {
+  withFixedNow(() => {
+    const known = { version: 1, sampled_at: "2026-01-31T23:59:50Z", status: "CURRENT", max_age_seconds: 120 };
+    for (const value of [undefined, null, {}, [], 1, "bad", { ...known }, { ...known, cpu: null, boot: null },
+      { ...known, cpu: { celsius: "42", source: "LINUX_THERMAL" }, boot: { count: {} }, watchdog: { hardware_state: {} } },
+      ...[NaN, Infinity, -Infinity, true, {}, [], -41, 151].map(celsius => ({ ...known, cpu: { celsius, source: "LINUX_THERMAL" } })),
+      ...["bad", null, {}, 1, "2026-02-01T00:10:00Z", "2026-02-01T00:00:00"].map(sampled_at => ({ ...known, sampled_at, cpu: { celsius: 42, source: "LINUX_THERMAL" } }))]) {
+      const tree = StatusStrip({ device: mkDevice(value), resetDay: 15 });
+      assert.equal(byTestId(tree, "stat-cpu-value").props.children, "UNKNOWN");
+      assert.equal(byTestId(tree, "stat-boots-value").props.children, "UNKNOWN");
+      assert.equal(byTestId(tree, "watchdog-recovery-status").props.children, "NOT VERIFIED");
+    }
+    const tree = StatusStrip({ device: mkDevice({ ...known, cpu: { celsius: 0, source: "LINUX_THERMAL" }, boot: null, watchdog: [] }), resetDay: 15 });
+    assert.equal(byTestId(tree, "stat-cpu-value").props.children, "0.0°C");
+    assert.equal(byTestId(tree, "stat-boots-value").props.children, "UNKNOWN");
+    assert.equal(byTestId(tree, "watchdog-hardware-status").props.children, "UNKNOWN");
+  });
 });

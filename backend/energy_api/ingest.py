@@ -5,6 +5,10 @@ import math
 from datetime import date, datetime, timezone
 
 from psycopg.types.json import Json
+from .operating_dates import day_problem, quarantine, record_clock_report, utc_now
+from .target_delivery import reconcile_targets, record_report
+from . import queries as Q
+from fastapi import HTTPException
 
 METER_IDS = ("M1", "M2", "M3", "M4", "M5")
 METER_ROLE = {"M1": "GENERATION", "M2": "CONSUMPTION", "M3": "CONSUMPTION", "M4": "CONSUMPTION", "M5": "CONSUMPTION"}
@@ -40,9 +44,9 @@ def ensure_meter_rows(cur, device_id):
                        ON CONFLICT (device_id, meter_id) DO NOTHING""", (device_id, mid, METER_ROLE[mid], METER_WING[mid]))
 
 
-def normalize_day(raw):
+def normalize_day(raw, now=None):
     """Pi ledger row -> typed row. Missing/None stays None (UNAVAILABLE). Returns None if unusable."""
-    if not isinstance(raw, dict):
+    if day_problem(raw, utc_now(now)):
         return None
     try:
         od = date.fromisoformat(str(raw.get("operating_date")))
@@ -107,6 +111,7 @@ def ingest(cur, device_id, energy, now):
 
 
 def _ingest(cur, device_id, energy, now):
+    cur.execute("SELECT id FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
     ensure_meter_rows(cur, device_id)
     meters = energy.get("meters") if isinstance(energy.get("meters"), dict) else {}
     for mid in METER_IDS:
@@ -122,21 +127,37 @@ def _ingest(cur, device_id, energy, now):
         if _ts(h.get("last_seen")) and _num(h.get("last_kwh")) is not None:
             cur.execute("""INSERT INTO energy_meter_readings (device_id, meter_id, ts, cumulative_kwh, power_kw) VALUES (%s,%s,%s,%s,%s)
                            ON CONFLICT DO NOTHING""", (device_id, mid, _ts(h["last_seen"]), _num(h["last_kwh"]), _num(h.get("power_kw"))))
-    days = 0
-    for raw in list(energy.get("closed_days") or [])[:31] + [energy.get("today")]:
-        day = normalize_day(raw)
+    days, rejected = 0, []
+    closed = energy.get("closed_days")
+    closed = closed[:31] if isinstance(closed, list) else []
+    for raw in closed + [energy.get("today")]:
+        if raw is None:
+            continue
+        problem = day_problem(raw, now)
+        if problem:
+            rejected.append(quarantine(cur, device_id, raw, problem, now))
+            continue
+        day = normalize_day(raw, now)
         if day:
             upsert_day(cur, device_id, day)
             days += 1
     cur.execute("DELETE FROM energy_meter_readings WHERE device_id=%s AND ts < NOW() - make_interval(days => %s)", (device_id, READINGS_RETENTION_DAYS))
-    return {"days": days}
+    report = record_clock_report(cur, device_id, energy.get("today"), rejected, now)
+    return {"days": days, "clock_report": report}
 
 
-def build_energy_config(cur, device_id):
+def build_energy_config(cur, device_id, now=None):
     """Backend-authoritative config for the Pi: {"version", "bus", "meters": {Mx: {...}}}."""
-    cur.execute("SELECT energy_bus, energy_config_version, energy_allocation FROM pi_devices WHERE id=%s", (device_id,))
+    now = utc_now(now)
+    cur.execute("SELECT energy_bus, energy_config_version, energy_allocation FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
     dev = cur.fetchone()
     if not dev:
+        return None
+    # Invalid OPEN data must not select future targets, nor abort the rest of Pi sync.
+    try:
+        as_of = Q.device_today(cur, device_id, now.date(), now=now)
+    except HTTPException as exc:
+        logging.getLogger("ems.energy").warning("Energy config withheld device=%s: %s", device_id, exc.detail)
         return None
     ensure_meter_rows(cur, device_id)
     cur.execute("""SELECT meter_id, serial, modbus_address, model, register_map, phases, ct_ratio, max_kw, enabled
@@ -146,18 +167,21 @@ def build_energy_config(cur, device_id):
         meters[r["meter_id"]] = {"enabled": bool(r["enabled"]), "serial": r["serial"], "modbus_address": r["modbus_address"], "model": r["model"],
                                  "register_map": r["register_map"], "phases": r["phases"],
                                  "ct_ratio": _num(r["ct_ratio"]), "max_kw": _num(r["max_kw"])}
-    cur.execute("""SELECT DISTINCT ON (wing) wing, target_kwh_per_day, effective_from FROM energy_generation_targets
-                   WHERE device_id=%s AND effective_from <= CURRENT_DATE ORDER BY wing, effective_from DESC, id DESC""", (device_id,))
-    targets = {r["wing"]: {"target_kwh_per_day": _num(r["target_kwh_per_day"]), "effective_from": r["effective_from"].isoformat()} for r in cur.fetchall()}
+    try:
+        targets, version = reconcile_targets(cur, device_id, as_of, dev["energy_config_version"])
+    except HTTPException as exc:
+        logging.getLogger("ems.energy").warning("Energy config withheld device=%s: %s", device_id, exc.detail)
+        return None
     allocation = dev["energy_allocation"] or DEFAULT_ALLOCATION
-    return {"version": int(dev["energy_config_version"] or 0), "bus": dev["energy_bus"] or {}, "meters": meters,
+    return {"version": version, "bus": dev["energy_bus"] or {}, "meters": meters,
             "allocation": allocation, "targets": targets}
 
 
-def config_reply(cur, device_id, energy):
+def config_reply(cur, device_id, energy, now=None):
     """Include energy_config in the sync reply only when the Pi runs a different version (or none)."""
-    reported = (energy or {}).get("config_version") if isinstance(energy, dict) else None
-    cfg = build_energy_config(cur, device_id)
+    now = utc_now(now)
+    cfg = build_energy_config(cur, device_id, now)
+    reported = record_report(cur, device_id, energy, now)
     if cfg is None:
         return None
     return cfg if reported != cfg["version"] else None

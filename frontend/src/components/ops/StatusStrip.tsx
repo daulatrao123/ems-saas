@@ -2,6 +2,7 @@
 import { Device, SLOT_CODES, ago, fmtDateTime, fmtUptime, nextResetDate } from "./types";
 import { label, panel } from "./DashboardHeader";
 import { healthFreshness, WatchdogHealth } from "./WatchdogHealth";
+import { normalizeControllerHealth } from "./healthValidation";
 
 function Stat({ id, name, value, sub, tone }: { id: string; name: string; value: string; sub?: string; tone?: string }) {
   return (
@@ -18,7 +19,7 @@ export function StatusStrip({ device, resetDay }: { device: Device | null; reset
   const slots = device ? SLOT_CODES.filter((c) => device.slots[c]) : [];
   const enabled = slots.filter((c) => !device!.slots[c].disabled).length;
   const t = device?.telemetry;
-  const health = t?.health, freshness = healthFreshness(health, device?.connected === true);
+  const health = normalizeControllerHealth(t?.health), freshness = healthFreshness(health, device?.connected === true);
   const measured = health?.cpu.celsius, count = health?.boot.count;
   const cpu = measured == null ? "UNKNOWN" : freshness !== "CURRENT" ? freshness : `${measured.toFixed(1)}°C`;
   const up = fmtUptime(t?.uptime_seconds) || "N/A";

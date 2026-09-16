@@ -11,6 +11,8 @@ from psycopg.types.json import Json
 from . import queries as Q
 from . import references as R
 from . import comparison as C
+from .operating_dates import date_problem, require_qualified_open
+from .target_delivery import reconcile_targets, delivery_view
 from .ingest import DEFAULT_ALLOCATION, METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
 
 VALUE_TYPES = {"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64"}
@@ -58,7 +60,7 @@ def _num(v, what, lo=None, hi=None):
         f = float(v)
     except (TypeError, ValueError):
         raise HTTPException(400, f"{what} must be numeric")
-    if math.isnan(f) or (lo is not None and f < lo) or (hi is not None and f > hi):
+    if isinstance(v, bool) or not math.isfinite(f) or (lo is not None and f < lo) or (hi is not None and f > hi):
         raise HTTPException(400, f"{what} out of range")
     return f
 
@@ -77,13 +79,13 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             raise HTTPException(403, "Cannot access other society data")
         return sid
 
-    def device(cur, sid, device_id, ensure_meters=True):
+    def device(cur, sid, device_id, ensure_meters=True, *, lock=False):
         did = require_uuid(device_id, "device_id")
         cur.execute("""SELECT d.id, d.energy_bus, d.energy_config_version,
                               d.energy_calculation_mode, d.energy_calculation_version,
                               d.grid_export_enabled, d.grid_export_limit_kwh, d.grid_reference_version,
                               COALESCE(s.reset_day, 15) AS reset_day
-                       FROM pi_devices d JOIN societies s ON s.id=d.society_id WHERE d.id=%s AND d.society_id=%s""", (did, sid))
+                       FROM pi_devices d JOIN societies s ON s.id=d.society_id WHERE d.id=%s AND d.society_id=%s""" + (" FOR UPDATE OF d" if lock else ""), (did, sid))
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "Device not found in this society")
@@ -133,7 +135,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             raise HTTPException(400, f"meter_id must be one of {list(METER_IDS)} (exactly 1 generation + 4 consumption meters)")
         sid = access(user, data.get("society_id"), write=True)
         def fn(cur):
-            dev = device(cur, sid, data.get("device_id")); did = str(dev["id"])
+            dev = device(cur, sid, data.get("device_id"), lock=True); did = str(dev["id"])
             cur.execute("SELECT * FROM energy_meters WHERE device_id=%s AND meter_id=%s", (did, meter_id))
             cur_row = dict(cur.fetchone())
             fields = {}
@@ -191,7 +193,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             if str(serial["parity"]).upper() not in ("N", "E", "O"): raise HTTPException(400, "parity must be N, E or O")
             clean["parity"] = str(serial["parity"]).upper()
         def fn(cur):
-            dev = device(cur, sid, data.get("device_id")); did = str(dev["id"])
+            dev = device(cur, sid, data.get("device_id"), lock=True); did = str(dev["id"])
             bus = {"port": port or None, "serial": clean}
             if not port:
                 cur.execute("SELECT COUNT(*) AS n FROM energy_meters WHERE device_id=%s AND enabled", (did,))
@@ -227,7 +229,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             cfg["wings"][w] = {"generation_attribution_enabled": bool(wc.get("generation_attribution_enabled", True)),
                                "manual_target_kwh": None if mt is None else _num(mt, f"wings.{w}.manual_target_kwh", 0.001, 1_000_000)}
         def fn(cur):
-            dev = device(cur, sid, data.get("device_id")); did = str(dev["id"])
+            dev = device(cur, sid, data.get("device_id"), lock=True); did = str(dev["id"])
             if cfg["enabled"]:
                 cur.execute("SELECT enabled FROM energy_meters WHERE device_id=%s AND meter_id='M1'", (did,))
                 if not cur.fetchone()["enabled"]: raise HTTPException(409, "Cannot enable allocation: generation meter M1 is disabled")
@@ -269,8 +271,9 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         sid = access(user, society_id)
         def fn(cur):
             dev = device(cur, sid, device_id); did = str(dev["id"]); meters = meters_of(cur, did)
-            calendar_today = datetime.now(timezone.utc).date()
-            pi_today = Q.device_today(cur, did, None)
+            now = datetime.now(timezone.utc)
+            calendar_today = now.date()
+            pi_today = Q.device_today(cur, did, None, now=now)
             today = pi_today or calendar_today  # preserve existing read-model fallback, never use it to authorize an entry
             gen_on = bool(meters["M1"]["enabled"])
             wings = {}
@@ -301,7 +304,11 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                                 "generation": gen_total or {"status": "UNAVAILABLE", "reason": "generation meter disabled"},
                                 "unattributed": unattr, "active_generation_wing": active, "attribution": attr if gen_on else None,
                                 "source": "PHYSICAL" if gen_total and gen_total["today"]["kwh"] is not None else "UNAVAILABLE"}
+            cur.execute("SELECT clock_report FROM energy_sync_state WHERE device_id=%s", (did,))
+            sync_state = cur.fetchone()
             return {"device_id": did, "as_of_operating_date": today.isoformat(), "reset_day": dev["reset_day"], "reset_period": Q.reset_period_for(today, dev["reset_day"]),
+                    "clock_report": sync_state["clock_report"] if sync_state else None,
+                    "target_delivery": delivery_view(cur, did, dev["energy_config_version"], now),
                     "manual_generation_operating_date": pi_today.isoformat() if pi_today is not None else None,
                     "generation_meter": generation_meter, "wings": wings,
                     "calculation": Q.calculation_view(cur, did, dev["energy_calculation_mode"], dev["energy_calculation_version"], meters, today),
@@ -310,7 +317,8 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
 
     # ---------------------------------------------------------------- history / graph / monthly
     def _range(cur, did, dev, frm, to, rng):
-        today = Q.device_today(cur, did, datetime.now(timezone.utc).date())
+        now = datetime.now(timezone.utc)
+        today = Q.device_today(cur, did, now.date(), now=now)
         if rng:
             if rng == "7d": frm, to = today - timedelta(days=6), today
             elif rng == "30d": frm, to = today - timedelta(days=29), today
@@ -322,6 +330,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         else:
             if not frm or not to: raise HTTPException(400, "from/to (YYYY-MM-DD) or range is required")
             frm, to = _date(frm, "from"), _date(to, "to")
+        if date_problem(frm, now) or date_problem(to, now): raise HTTPException(400, "Requested energy dates are outside the qualified operating-date range")
         if to < frm: raise HTTPException(400, "to must be >= from")
         if (to - frm).days + 1 > Q.MAX_DAILY_RANGE_DAYS: raise HTTPException(400, f"range limited to {Q.MAX_DAILY_RANGE_DAYS} days")
         return frm, to, today
@@ -334,8 +343,9 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         selected_month = _bill_month(month) if month is not None else None
         def fn(cur):
             dev = device(cur, sid, device_id, ensure_meters=selected_month is None); did = str(dev["id"])
-            calendar_today = datetime.now(timezone.utc).date()
-            today = Q.device_today(cur, did, calendar_today)
+            now = datetime.now(timezone.utc)
+            calendar_today = now.date()
+            today = Q.device_today(cur, did, calendar_today, now=now)
             if selected_month is not None:
                 return C.month_overview(cur, dev, meters_of(cur, did), today, selected_month, calendar_today)
             return C.overview(cur, dev, meters_of(cur, did), today, days)
@@ -394,7 +404,8 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         if not 1 <= months <= Q.MAX_MONTHS: raise HTTPException(400, f"months must be 1..{Q.MAX_MONTHS}")
         def fn(cur):
             dev = device(cur, sid, device_id); did = str(dev["id"]); meters = meters_of(cur, did)
-            today = Q.device_today(cur, did, datetime.now(timezone.utc).date())
+            now = datetime.now(timezone.utc)
+            today = Q.device_today(cur, did, now.date(), now=now)
             y, m = today.year, today.month
             for _ in range(months - 1):
                 y, m = (y - 1, 12) if m == 1 else (y, m - 1)
@@ -482,10 +493,14 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
     def get_targets(society_id: str, device_id: str, wing: str, user: dict = Depends(get_current_user)):
         sid = access(user, society_id); w = _wing(wing)
         def fn(cur):
-            did = str(device(cur, sid, device_id)["id"])
+            dev = device(cur, sid, device_id, ensure_meters=False); did = str(dev["id"])
+            now = datetime.now(timezone.utc)
+            as_of = Q.device_today(cur, did, now.date(), now=now)
             cur.execute("SELECT * FROM energy_generation_targets WHERE device_id=%s AND wing=%s ORDER BY effective_from DESC, id DESC LIMIT 20", (did, w))
             rows = [_target_row(r) for r in cur.fetchall()]
-            return {"wing": w, "current": rows[0] if rows else None, "history": rows, "bills": _bills(cur, did, w)}
+            current = Q.latest_target(cur, did, w, as_of)
+            return {"wing": w, "current": _target_row(current) if current else None, "history": rows, "bills": _bills(cur, did, w),
+                    "as_of_operating_date": as_of.isoformat(), "delivery": delivery_view(cur, did, dev["energy_config_version"], now)}
         return run(fn)
 
     @router.post("/targets")
@@ -494,16 +509,20 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         pct = _num(data.get("adjustment_percent"), "adjustment_percent", -100, 500)
         eff = _date(data["effective_from"], "effective_from") if data.get("effective_from") else datetime.now(timezone.utc).date()
         def fn(cur):
-            did = str(device(cur, sid, data.get("device_id"))["id"])
+            dev = device(cur, sid, data.get("device_id"), ensure_meters=False, lock=True); did = str(dev["id"])
+            now = datetime.now(timezone.utc)
+            as_of = Q.device_today(cur, did, now.date(), now=now)
             bills = _bills(cur, did, w)
             if not bills["months"] or bills["daily_average_kwh"] is None: raise HTTPException(409, f"No bill history for wing {w}: enter the six-month bills first")
-            target = Q.compute_target(bills["daily_average_kwh"], pct)
+            target = _num(Q.compute_target(bills["daily_average_kwh"], pct), "target_kwh_per_day", 0)
             basis = {"months": [m["month"] for m in bills["months"]], "total_kwh": bills["total_kwh"], "days": bills["days"], "formula": "daily_average x (1 + adjustment_percent/100)"}
             cur.execute("""INSERT INTO energy_generation_targets (device_id, wing, base_daily_average_kwh, adjustment_percent, target_kwh_per_day, basis, effective_from, reason, created_by)
                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""", (did, w, bills["daily_average_kwh"], pct, target, Json(basis), eff, (str(data.get("reason"))[:300] if data.get("reason") else None), user.get("id")))
             row = _target_row(cur.fetchone())
-            log_audit(cur, user, sid, "ENERGY_TARGET", {"device_id": did, "wing": w, "adjustment_percent": pct, "target_kwh_per_day": target, "effective_from": eff.isoformat()})
-            return {"success": True, "target": row}
+            _, version = reconcile_targets(cur, did, as_of, dev["energy_config_version"], force=True)
+            log_audit(cur, user, sid, "ENERGY_TARGET", {"device_id": did, "wing": w, "adjustment_percent": pct, "target_kwh_per_day": target, "effective_from": eff.isoformat(), "energy_config_version": version})
+            return {"success": True, "target": row, "config_version": version, "delivery_status": "PENDING_CONTROLLER_REPORT",
+                    "as_of_operating_date": as_of.isoformat()}
         return run(fn, write=True)
 
     @router.post("/adjustments")
@@ -519,6 +538,8 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         def fn(cur):
             did = str(device(cur, sid, data.get("device_id"), ensure_meters=(kind != "MANUAL_GENERATION"))["id"])
             if kind == "MANUAL_GENERATION":
+                now = datetime.now(timezone.utc)
+                qualified_day = Q.device_today(cur, did, None, now=now)
                 # Same latest-OPEN ordering as device_today, with no date fallback.
                 # Hold a read lock on this record until insert/audit commit so its
                 # OPEN state cannot be closed concurrently during acceptance.
@@ -527,6 +548,9 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                 opened = cur.fetchone()
                 if not opened or opened["operating_date"] is None:
                     raise HTTPException(409, "Authoritative OPEN Pi operating day is unavailable; manual generation cannot be recorded")
+                require_qualified_open(opened["operating_date"], now)
+                if opened["operating_date"] != qualified_day:
+                    raise HTTPException(409, "Pi operating day changed; refresh before entering generation")
                 if od != opened["operating_date"]:
                     raise HTTPException(409, f"Manual generation is allowed only for current Pi operating day {opened['operating_date'].isoformat()}; refresh before entering generation")
             cur.execute("""INSERT INTO energy_adjustments (device_id, wing, operating_date, kind, value_kwh, reason, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id, created_at""",

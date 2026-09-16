@@ -45,6 +45,14 @@ class FakeCursor:
         self.state["queries"].append((q, params))
         self._rows, self._one = [], None
 
+        if q.startswith("select clock_report from energy_sync_state"):
+            self._one = None
+            return
+
+        if q.startswith("select reported_config_version,reported_at from energy_sync_state"):
+            self._one = None
+            return
+
         if "from pi_devices d join societies s" in q:
             self._one = deepcopy(self.state["device"])
             return
@@ -333,7 +341,7 @@ class HistoricalCalendarRegression(unittest.TestCase):
         with patch.object(routes, "datetime", FrozenDateTime), patch.object(routes, "ensure_meter_rows", lambda _cur, _did: None), patch.object(
             routes.Q,
             "device_today",
-            side_effect=lambda _cur, _did, fallback: self.stale_today if fallback in (None, self.calendar_today) else None,
+            side_effect=lambda _cur, _did, fallback, **_kwargs: self.stale_today if fallback in (None, self.calendar_today) else None,
         ), patch.object(routes.Q, "metric_periods", side_effect=self._metric_periods), patch.object(
             routes.Q, "latest_target", side_effect=self._latest_target
         ), patch.object(routes.Q, "calculation_view", return_value={"mode": "AUTO", "version": 8, "operating_date": self.stale_today.isoformat(), "wings": {}}) as calculation_view:

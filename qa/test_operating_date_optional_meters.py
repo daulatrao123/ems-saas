@@ -178,10 +178,22 @@ class FakeCursor:
             self._one = rows[0] if rows else None
             return
 
-        if q.startswith("select max(operating_date) as d from energy_daily where device_id=%s and status='open'"):
+        if q.startswith("select clock_report from energy_sync_state"):
+            self._one = None
+            return
+
+        if q.startswith("select reported_config_version,reported_at from energy_sync_state"):
+            self._one = None
+            return
+
+        if q.startswith("insert into energy_sync_state"):
+            self.state["clock_report"] = params[1].obj
+            return
+
+        if q.startswith("select max(operating_date) as d, min(operating_date) as earliest, count(*) as open_count from energy_daily where device_id=%s and status='open'"):
             did = params[0]
             days = [r["operating_date"] for r in self.state["daily"] if r["device_id"] == did and r["status"] == "OPEN"]
-            self._one = {"d": max(days)} if days else {"d": None}
+            self._one = {"d": max(days) if days else None, "earliest": min(days) if days else None, "open_count": len(days)}
             return
 
         if q.startswith("select operating_date from energy_daily where device_id=%s and status='open' order by operating_date desc limit 1 for share"):
@@ -197,6 +209,8 @@ class FakeCursor:
             did = params[0]
             rows = [r for r in self.state["daily"] if r["device_id"] == did]
             rows = [r for r in rows if r["reset_period"] == params[1]] if "reset_period=%s" in q else [r for r in rows if params[1] <= r["operating_date"] <= params[2]]
+            if "reset_period=%s" in q and "operating_date<=%s" in q:
+                rows = [r for r in rows if r["operating_date"] <= params[2]]
             values = [self._qualified_value(r, q) for r in rows]
             values = [v for v in values if v is not None]
             self._one = {"total": sum(values) if values else None, "days": len(values)}
@@ -783,6 +797,8 @@ class OperatingDateAndOptionalMetersRegression(unittest.TestCase):
                     rows = [r for r in self.st["targets"] if r["device_id"] == did and r["wing"] == wing and r["effective_from"] <= as_of]
                     rows.sort(key=lambda r: (r["effective_from"], r["id"]), reverse=True)
                     self._one = rows[0] if rows else None
+                elif q.startswith("select slot, disabled from slot_configs where device_id=%s"):
+                    self._rows = []
                 else:
                     raise AssertionError(f"Unexpected SQL for references test: {sql}")
 

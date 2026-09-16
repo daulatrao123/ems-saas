@@ -3,6 +3,7 @@ NULL means UNAVAILABLE and is never coerced to 0; a period without any measured 
 import calendar
 import math
 from datetime import date, timedelta
+from .operating_dates import require_qualified_open, utc_now
 
 WINGS = ("A", "B", "C", "D")
 MAX_DAILY_RANGE_DAYS = 400
@@ -26,10 +27,12 @@ def month_bounds(y, m):
     return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
 
 
-def device_today(cur, device_id, fallback):
+def device_today(cur, device_id, fallback, *, now=None):
     """Operating 'today' = the Pi's latest OPEN ledger day (Pi-local date), else the fallback date."""
-    cur.execute("SELECT MAX(operating_date) AS d FROM energy_daily WHERE device_id=%s AND status='OPEN'", (device_id,))
+    cur.execute("SELECT MAX(operating_date) AS d, MIN(operating_date) AS earliest, COUNT(*) AS open_count FROM energy_daily WHERE device_id=%s AND status='OPEN'", (device_id,))
     row = cur.fetchone()
+    if row and row["d"]:
+        require_qualified_open(row["d"], utc_now(now), row["open_count"], row["earliest"])
     return row["d"] if row and row["d"] else fallback
 
 
@@ -62,8 +65,8 @@ NaN, infinities, negatives and NULL while retaining genuine physical zero.
 
 
 def _agg(cur, device_id, expr, frm, to, reset_period=None):
-    where = "device_id=%s AND operating_date BETWEEN %s AND %s" if reset_period is None else "device_id=%s AND reset_period=%s"
-    params = (device_id, frm, to) if reset_period is None else (device_id, reset_period)
+    where = "device_id=%s AND operating_date BETWEEN %s AND %s" if reset_period is None else "device_id=%s AND reset_period=%s AND operating_date<=%s"
+    params = (device_id, frm, to) if reset_period is None else (device_id, reset_period, to)
     value = qualified_physical_expr(expr)
     cur.execute(f"SELECT SUM({value}) AS total, COUNT({value}) AS days FROM energy_daily WHERE {where}", params)
     r = cur.fetchone()
@@ -76,7 +79,7 @@ def metric_periods(cur, device_id, expr, today, reset_day):
     for name, (frm, to) in period_ranges(today, reset_day).items():
         total, days = _agg(cur, device_id, expr, frm, to)
         out[name] = {"kwh": round(total, 3) if total is not None else None, "days": days, "status": "PHYSICAL" if total is not None else "UNAVAILABLE"}
-    total, days = _agg(cur, device_id, expr, None, None, reset_period=reset_period_for(today, reset_day))
+    total, days = _agg(cur, device_id, expr, None, today, reset_period=reset_period_for(today, reset_day))
     out["reset_period"] = {"kwh": round(total, 3) if total is not None else None, "days": days, "status": "PHYSICAL" if total is not None else "UNAVAILABLE",
                            "period": reset_period_for(today, reset_day)}
     return out

@@ -11,6 +11,8 @@ import { CalendarComparisonContext } from "./CalendarComparisonContext";
 import { useCalendarComparison } from "./useCalendarComparison";
 import { ComparisonPeriod } from "./ComparisonPeriod";
 import { CalendarSocietyComparison } from "./CalendarSocietyComparison";
+import { ClockQualificationNotice } from "./ClockQualificationNotice";
+import { TargetDeliveryStatus } from "./TargetDeliveryStatus";
 
 export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, children, societyId, societyName, controllerName }: {
   energy: ReturnType<typeof useEnergy>; readOnly: boolean; activeGenerationWing?: string; children: ReactNode; societyId: string; societyName?: string; controllerName?: string;
@@ -40,6 +42,8 @@ export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, childr
       {(en.error || en.saveError) && <div data-testid="energy-error" role="alert" className="border border-red-500/40 bg-red-500/10 px-4 py-2 font-mono text-xs text-red-300">{en.saveError || en.error}</div>}
       {en.panelErrors?.length > 0 && <div data-testid="energy-history-errors" role="alert" className="text-xs text-amber-300">{en.panelErrors.join(" · ")}</div>}
       {en.notice && !en.saveError && <div data-testid="energy-save-confirmation" role="status" className="text-xs text-emerald-300">{en.notice}</div>}
+      <ClockQualificationNotice report={en.summary?.clock_report} />
+      <TargetDeliveryStatus delivery={en.summary?.target_delivery} />
       {!en.summary ? <div data-testid="energy-unavailable" className={`${panel} p-6 text-center font-mono text-sm text-gray-500`}>{en.loading ? "LOADING ENERGY…" : "ENERGY DATA UNAVAILABLE"}</div> : <>
         {en.summary.generation_meter?.meter_id === "M1" ? <GenerationCard meter={en.summary.generation_meter} monthly={en.monthly} operatingDate={en.summary.as_of_operating_date} resetPeriod={en.summary.reset_period} activeGenerationWing={activeGenerationWing} /> : <div data-testid="energy-common-unavailable" className="p-4 text-gray-500">COMMON GENERATION UNAVAILABLE</div>}
       </>}
