@@ -5,6 +5,7 @@ The plaintext API key exists only inside the returned ZIP bytes: never logged, n
 
 import hashlib
 import io
+import json
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,7 @@ SYSTEMD_FILES = (
 )
 
 ROOT = "ems-pi-provisioning"
+PREFLIGHT_SOURCE = Path(__file__).with_name("provisioning_preflight.py")
 
 
 INSTALL_SH = r"""#!/bin/bash
@@ -81,8 +83,9 @@ INSTALL_SH = r"""#!/bin/bash
 #
 # Safety:
 # - Never formats disks.
-# - Data storage is prepared ONLY by the existing setup_pi.sh.
-# - setup_pi.sh requires an existing ext4 filesystem and never formats it.
+# - Existing data storage must already be mounted and verified.
+# - Existing OTA layouts require a separately coordinated update.
+# - Stage first, stop the controller, preserve old firmware; never delete data.
 
 set -euo pipefail
 
@@ -95,6 +98,26 @@ FW_DST="$PREFIX/opt/ems/pi_firmware"
 ENV_DST="$PREFIX/etc/ems/ems-controller.env"
 UNIT_DST="$PREFIX/etc/systemd/system"
 DATA_MOUNT="$PREFIX/mnt/ems-data"
+FW_PARENT="$(dirname "$FW_DST")"
+umask 077
+INSTALL_STARTED=0
+INSTALL_SUCCESS=0
+on_exit() {
+  code=$?
+  if [[ "$INSTALL_STARTED" == "1" && "$INSTALL_SUCCESS" != "1" ]]; then
+    if [[ "$SKIP_SYSTEMD" != "1" ]]; then
+      systemctl stop ems-controller.service || true
+    fi
+    echo "ERROR: installation incomplete. Controller left stopped where possible; previous firmware/staging retained. Review before restarting." >&2
+  fi
+  exit "$code"
+}
+trap on_exit EXIT
+
+if [[ "$SKIP_SYSTEMD" == "1" && -z "$PREFIX" ]]; then
+  echo "ERROR: systemd may be skipped only with an isolated install prefix." >&2
+  exit 2
+fi
 
 
 # ------------------------------------------------------------
@@ -118,9 +141,14 @@ fi
 
 REQUIRED_FILES=(
   "ems-controller.env"
+  "BUILD_INFO.json"
+  "tools/preflight.py"
 
   "firmware/ems_controller.py"
   "firmware/health_telemetry.py"
+  "firmware/gpio_input_diag.py"
+  "firmware/lcd_display.py"
+  "firmware/storage_health.py"
   "firmware/api_client.py"
   "firmware/config.py"
   "firmware/config_hash.py"
@@ -137,6 +165,9 @@ REQUIRED_FILES=(
   "firmware/ota_boot.sh"
   "firmware/ems-ota-stage.py"
   "firmware/setup_pi.sh"
+  "firmware/ems-controller.service"
+  "firmware/ems-reboot.path"
+  "firmware/ems-reboot.service"
   "firmware/energy/__init__.py"
   "firmware/energy/allocation.py"
   "firmware/energy/attribution.py"
@@ -233,54 +264,71 @@ fi
 
 
 # ------------------------------------------------------------
-# Data storage validation / preparation
+# Read-only preflight (no automatic storage setup or OTA slot replacement)
 # ------------------------------------------------------------
 
-if [[ ! -d "$DATA_MOUNT" ]]; then
+PREFLIGHT_ARGS=("$HERE" "$DATA_MOUNT" "$FW_DST")
+if [[ -n "$PREFIX" && "$SKIP_SYSTEMD" == "1" ]]; then
+  PREFLIGHT_ARGS+=(--layout-only)
+fi
+/usr/bin/python3 "$HERE/tools/preflight.py" "${PREFLIGHT_ARGS[@]}"
 
-  if [[ -n "${EMS_DATA_DEVICE:-}" && "$SKIP_SYSTEMD" != "1" ]]; then
 
-    echo "Preparing data storage with the existing safe setup_pi.sh..."
-    echo "The device will NOT be formatted."
+# ------------------------------------------------------------
+# Stage complete firmware BEFORE touching the running installation
+# ------------------------------------------------------------
 
-    EMS_DATA_DEVICE="$EMS_DATA_DEVICE" \
-      bash "$HERE/firmware/setup_pi.sh"
+install -d -m 0755 "$FW_PARENT"
+exec 9>"$FW_PARENT/.ems-install.lock"
+if ! flock -n 9; then
+  echo "ERROR: another installer is active; no controller files changed." >&2
+  exit 4
+fi
+STAGE="$(mktemp -d "$FW_PARENT/.ems-stage.XXXXXXXX")"
+cp -a "$HERE/firmware/." "$STAGE/"
+chmod 0755 "$STAGE" "$STAGE"/*.sh
+# Verify the staged bytes without running controller/installer code.
+/usr/bin/python3 - "$HERE/BUILD_INFO.json" "$STAGE" <<'PY'
+import hashlib, json, pathlib, sys
+info = json.loads(pathlib.Path(sys.argv[1]).read_text())
+root = pathlib.Path(sys.argv[2])
+digest = hashlib.sha256()
+for name in sorted(info["runtime_files"]):
+    digest.update(name.encode() + b"\0" + (root / name).read_bytes())
+if digest.hexdigest() != info["runtime_sha256"]:
+    raise SystemExit("ERROR: staged firmware fingerprint mismatch; active installation unchanged")
+PY
 
-  else
+if [[ -z "$PREFIX" ]] && getent passwd pi >/dev/null 2>&1; then
+  chown -R root:pi "$STAGE"
+fi
 
-    echo "ERROR: $DATA_MOUNT does not exist." >&2
-    echo "Prepare the data disk first with the existing safe mechanism:" >&2
-    echo >&2
-    echo "  EMS_DATA_DEVICE=/dev/disk/by-id/<your-ext4-partition> sudo -E ./install.sh" >&2
-    echo >&2
-    echo "(setup_pi.sh mounts an EXISTING ext4 device; it never formats anything.)" >&2
-
+INSTALL_STARTED=1
+if [[ "$SKIP_SYSTEMD" != "1" ]]; then
+  LOAD_STATE="$(systemctl show ems-controller.service -p LoadState --value)"
+  if [[ -z "$LOAD_STATE" ]]; then
+    echo "ERROR: cannot determine controller service state; active files unchanged." >&2
     exit 4
+  fi
+  if [[ "$LOAD_STATE" != "not-found" ]]; then
+    echo "Stopping controller before final checks; failures leave it stopped for review."
+    systemctl stop ems-controller.service
+    if systemctl is-active --quiet ems-controller.service; then
+      echo "ERROR: controller did not stop; active files unchanged." >&2
+      exit 4
+    fi
   fi
 fi
 
-
-# ------------------------------------------------------------
-# Install firmware
-# ------------------------------------------------------------
-
-echo "Installing firmware to $FW_DST ..."
-
-install -d -m 0755 \
-  "$FW_DST" \
-  "$(dirname "$ENV_DST")" \
-  "$UNIT_DST"
-
-cp "$HERE"/firmware/*.py "$HERE"/firmware/*.sh "$FW_DST"/
-rm -rf "$FW_DST"/energy
-cp -r "$HERE"/firmware/energy "$FW_DST"/energy
-
-chmod 0755 "$FW_DST"/*.sh
-
-if [[ -z "$PREFIX" ]] && getent passwd pi >/dev/null 2>&1; then
-  chown -R root:pi "$FW_DST"
+# Recheck after stop in case OTA metadata appeared during staging.
+/usr/bin/python3 "$HERE/tools/preflight.py" "${PREFLIGHT_ARGS[@]}"
+BACKUP_DIR="$(mktemp -d "$FW_PARENT/.ems-previous.XXXXXXXX")"
+echo "Preserving previous firmware under $BACKUP_DIR (no automatic cleanup)."
+if [[ -e "$FW_DST" ]]; then
+  mv "$FW_DST" "$BACKUP_DIR/firmware"
 fi
-
+mv "$STAGE" "$FW_DST"
+install -d -m 0755 "$(dirname "$ENV_DST")" "$UNIT_DST"
 
 # ------------------------------------------------------------
 # Verify installed firmware files
@@ -435,6 +483,7 @@ fi
 # Final result
 # ------------------------------------------------------------
 
+INSTALL_SUCCESS=1
 cat <<EOF
 
 ========================================
@@ -499,9 +548,8 @@ This package contains a LIVE device secret in:
 
   ems-controller.env
 
-Treat the ZIP as confidential.
-
-Copy it only to the target Raspberry Pi and delete it afterwards.
+Treat the ZIP as confidential. Store it securely; never upload the secret-bearing
+original publicly. No automatic file/data deletion is performed by the installer.
 
 Downloading a new provisioning package from EMS Cloud rotates the
 device credential. The previous package will then stop working.
@@ -519,22 +567,33 @@ INSTALLATION
 
      cd ems-pi-provisioning
 
-4. The data directory must already exist at:
+4. The existing ext4 data filesystem must already be mounted at:
 
      /mnt/ems-data
 
-   OR prepare an existing ext4 device using:
+   A directory alone is NOT enough: its actual UUID must match fstab.
+   Prepare storage separately through an approved procedure. This installer does
+   not automatically run setup_pi.sh, format, mount, or modify storage/fstab.
 
-     EMS_DATA_DEVICE=/dev/disk/by-id/<partition> sudo -E ./install.sh
+   Existing OTA metadata/slots cause a safe refusal. Coordinate an OTA-aware
+   update separately; NEVER delete OTA history to bypass the check.
 
-   The storage preparation mechanism NEVER formats a disk.
+   Required Python modules must already be available to /usr/bin/python3:
+   requests, gpiozero, lgpio, minimalmodbus and serial (pyserial). The installer
+   checks presence without importing GPIO/meter libraries or installing packages.
+
+   Inspect BUILD_INFO.json: package_schema must be 2 and includes a runtime SHA256.
+   Manifest/build hashes detect corruption; they are NOT a publisher signature.
 
 5. Install:
 
      sudo ./install.sh
 
-6. The installer validates the complete firmware package before
-   starting the controller.
+6. The installer validates prerequisites and staged firmware before stopping the
+   controller. It preserves the previous firmware in a restricted .ems-previous
+   directory, then replaces the base code. No energy/state/queue data or OTA slots
+   are deleted. Failures require review; do not blindly restart an interrupted
+   installation. Backups are retained, not automatically cleaned or restored.
 
 7. The installer waits for the EMS controller to reach a stable
    running state. A temporary "active" state during a crash/restart
@@ -551,6 +610,8 @@ install.sh
 ems-controller.env
 README.txt
 MANIFEST.sha256
+BUILD_INFO.json
+tools/preflight.py
 
 firmware/
   ems_controller.py
@@ -583,6 +644,8 @@ def _validate_source_files() -> None:
     """Fail package generation if any required source artifact is missing."""
 
     missing = []
+    if not PREFLIGHT_SOURCE.is_file():
+        missing.append("backend/provisioning_preflight.py")
 
     for filename in FIRMWARE_FILES:
         path = FIRMWARE_DIR / filename
@@ -721,6 +784,25 @@ def build_provisioning_zip(
                 source.read_bytes(),
                 0o755 if filename.endswith(".sh") else 0o644,
             )
+
+        # setup_pi.sh resolves units next to itself. Preserve its source bytes,
+        # but supply those existing dependencies at BOTH documented locations.
+        for filename in SYSTEMD_FILES:
+            add(f"firmware/{filename}", (FIRMWARE_DIR / filename).read_bytes())
+
+        runtime_files = sorted([*FIRMWARE_FILES, *SYSTEMD_FILES])
+        fingerprint = hashlib.sha256()
+        for filename in runtime_files:
+            fingerprint.update(filename.encode() + b"\0" + (FIRMWARE_DIR / filename).read_bytes())
+        add("BUILD_INFO.json", json.dumps({
+            "package_schema": 2,
+            "runtime_files": runtime_files,
+            "runtime_sha256": fingerprint.hexdigest(),
+            "installer_sha256": hashlib.sha256(INSTALL_SH.encode()).hexdigest(),
+            "requires_prepared_storage": True,
+            "existing_ota_policy": "REFUSE_WITHOUT_COORDINATED_UPDATE",
+        }, indent=2).encode())
+        add("tools/preflight.py", PREFLIGHT_SOURCE.read_bytes())
 
         # ----------------------------------------------------
         # Systemd

@@ -367,6 +367,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             rows = Q.wing_graph_rows(cur, did, w, f, t, bool(meters["M1"]["enabled"]), Q.consumption_meter_eligible(meters[METER_WING_INV[w]]), mode)
             return {"wing": w, "from": f.isoformat(), "to": t.isoformat(), "as_of_operating_date": today.isoformat(), "unit": "kWh",
                     "basis": basis, "calculation_mode": mode,
+                    "contract": "LEGACY_ADDITIVE_ACCOUNTING" if basis == "legacy" else "PHYSICAL_M1_MODE_CONSUMPTION_V1",
                     "series": ["required_kwh", "generated_kwh", "consumed_kwh"], "rows": rows,
                     "generation_meter_enabled": bool(meters["M1"]["enabled"]), "consumption_meter_enabled": bool(meters[METER_WING_INV[w]]["enabled"])}
         return run(fn)

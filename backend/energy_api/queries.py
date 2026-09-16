@@ -4,6 +4,7 @@ import calendar
 import math
 from datetime import date, timedelta
 from .operating_dates import require_qualified_open, utc_now
+from .mode_contract import operational_rows
 
 WINGS = ("A", "B", "C", "D")
 MAX_DAILY_RANGE_DAYS = 400
@@ -130,21 +131,24 @@ def target_for_date(timeline, d):
 
 # ---------------------------------------------------------------- graph rows (aligned by operating_date)
 def wing_graph_rows(cur, device_id, wing, frm, to, generation_enabled, consumption_enabled, calculation_mode=None):
-    """Legacy accounting mix by default; explicit calculation mode selects ONE source.
+    """None = legacy additive accounting; AUTO/MANUAL = operational M1 contract.
 
-The selected-source view shares this query pipeline, never rewrites the ledger,
-and never treats manual entries as editable absolute daily totals.
+    Explicit modes NEVER read/add manual adjustments. MANUAL changes consumption
+    to exact-month bill references, not the physical authority of generation.
     """
+    if calculation_mode not in (None, "AUTO", "MANUAL"):
+        raise ValueError("Unknown energy calculation mode")
     cur.execute("""SELECT operating_date, status, (wing_generation->>%s)::numeric AS gen, (wing_consumption->>%s)::numeric AS cons,
                           consumption_source->>%s AS cons_src, generation_source
                    FROM energy_daily WHERE device_id=%s AND operating_date BETWEEN %s AND %s ORDER BY operating_date""",
                 (wing, wing, wing, device_id, frm, to))
     days = {r["operating_date"]: r for r in cur.fetchall()}
-    cur.execute("""SELECT operating_date, kind, SUM(value_kwh) AS v FROM energy_adjustments
-                   WHERE device_id=%s AND wing=%s AND operating_date BETWEEN %s AND %s GROUP BY operating_date, kind""", (device_id, wing, frm, to))
     adj = {}
-    for r in cur.fetchall():
-        adj.setdefault(r["operating_date"], {})[r["kind"]] = float(r["v"])
+    if calculation_mode is None:
+        cur.execute("""SELECT operating_date, kind, SUM(value_kwh) AS v FROM energy_adjustments
+                       WHERE device_id=%s AND wing=%s AND operating_date BETWEEN %s AND %s GROUP BY operating_date, kind""", (device_id, wing, frm, to))
+        for r in cur.fetchall():
+            adj.setdefault(r["operating_date"], {})[r["kind"]] = float(r["v"])
     timeline = targets_timeline(cur, device_id, wing, frm, to)
     rows = []
     d = frm
@@ -155,16 +159,9 @@ and never treats manual entries as editable absolute daily totals.
         cons_phys = float(r["cons"]) if r and r["cons"] is not None and consumption_enabled else None
         gen_phys = gen_phys if r and r["generation_source"] == "PHYSICAL" and _physical(gen_phys) else None
         cons_phys = cons_phys if r and r["cons_src"] == "PHYSICAL" and _physical(cons_phys) else None
-        if calculation_mode is not None:
-            if calculation_mode == "AUTO":
-                a = {}  # No automatic substitution or addition of manual entries.
-            elif calculation_mode == "MANUAL":
-                gen_phys = cons_phys = None
-            else:
-                raise ValueError("Unknown energy calculation mode")
         gen = _combine(gen_phys, a.get("MANUAL_GENERATION"))
         cons = _combine(cons_phys, a.get("MANUAL_CONSUMPTION"))
-        req = target_for_date(timeline, d) if calculation_mode != "MANUAL" else None
+        req = target_for_date(timeline, d)
         gen_src, cons_src = _src(gen_phys, a.get("MANUAL_GENERATION")), _src(cons_phys, a.get("MANUAL_CONSUMPTION"))
         sources = {s for s in (gen_src, cons_src) if s != "UNAVAILABLE"}
         source = "UNAVAILABLE" if not sources else ("MIXED" if len(sources) > 1 or "MIXED" in sources else sources.pop())
@@ -174,8 +171,10 @@ and never treats manual entries as editable absolute daily totals.
                      "generation_minus_consumption_kwh": _r(gen - cons) if gen is not None and cons is not None else None,
                      "target_achievement_percent": ach, "target_status": status, "source": source,
                      "generation_source": gen_src, "consumption_source": cons_src,
-                     "day_status": ("MANUAL_ENTRIES" if source != "UNAVAILABLE" else "NO_DATA") if calculation_mode == "MANUAL" else r["status"] if r else "NO_DATA"})
+                     "day_status": r["status"] if r else "NO_DATA"})
         d += timedelta(days=1)
+    if calculation_mode is not None:
+        return operational_rows(cur, device_id, wing, frm, to, rows, calculation_mode, generation_enabled)
     return rows
 
 
@@ -184,11 +183,7 @@ def _physical(value):
 
 
 def calculation_view(cur, device_id, mode, version, meters, today):
-    """Bounded seven-day generation view using the existing graph calculation.
-
-Common generation is intentionally NOT summed from manual wing entries: there
-is no authoritative common manual-generation measurement in this contract.
-    """
+    """Bounded seven-day operational view; same source contract as comparison."""
     wings = {}
     for wing, mid in zip(WINGS, ("M2", "M3", "M4", "M5")):
         rows = wing_graph_rows(cur, device_id, wing, today - timedelta(days=6), today,
@@ -196,7 +191,10 @@ is no authoritative common manual-generation measurement in this contract.
         wings[wing] = {"wing": wing, "today": rows[-1],
                        "generation_trend": [{k: r[k] for k in ("date", "generated_kwh", "generation_source")} for r in rows]}
     return {"mode": mode, "version": version, "operating_date": today.isoformat(), "wings": wings,
-            "manual_entry_semantics": "ADDITIVE_ENTRIES", "common_generation_basis": "PHYSICAL_M1_ONLY"}
+            "manual_entry_semantics": "ADDITIVE_ENTRIES", "manual_entries_scope": "LEGACY_ACCOUNTING_ONLY",
+            "contract": "PHYSICAL_M1_MODE_CONSUMPTION_V1",
+            "consumption_basis": "MONTHLY_BILL_DAILY_REFERENCE" if mode == "MANUAL" else "PHYSICAL_CONSUMPTION_METERS",
+            "common_generation_basis": "PHYSICAL_M1_ONLY"}
 
 
 def _combine(phys, manual):

@@ -164,14 +164,14 @@ class ManualGenerationPolicyRegression(unittest.TestCase):
         self.state["device"]["energy_calculation_mode"] = "MANUAL"
         summary = self.summary(society_id="1", device_id=self.did, user=self._admin())
         today = summary["calculation"]["wings"]["A"]["today"]
-        self.assertEqual((today["generated_kwh"], today["generation_source"]), (23, "MANUAL"))
+        self.assertEqual((today["generated_kwh"], today["generation_source"]), (10, "PHYSICAL"))
         self.assertIsNone(today["consumed_kwh"], "MANUAL_GENERATION 23 must not create consumption")
         self.assertEqual(today["consumption_source"], "UNAVAILABLE")
         self.assertEqual(summary["generation_meter"]["generation"]["today"]["kwh"], 10, "common M1 must not include manual wing23")
         self.assertEqual((summary["references"]["allocation"]["generation_kwh"], summary["references"]["allocation"]["generation_source"]), (10, "PHYSICAL"), "allocation uses physical M1, never manual wing23")
         self.post_adjustment(data={"society_id": "1", "device_id": self.did, "wing": "A", "kind": "MANUAL_CONSUMPTION", "operating_date": "2026-09-12", "value_kwh": 7, "reason": "consumption only"}, user=self._admin())
         after = self.summary(society_id="1", device_id=self.did, user=self._admin())["calculation"]["wings"]["A"]["today"]
-        self.assertEqual((after["generated_kwh"], after["consumed_kwh"]), (23, 7))
+        self.assertEqual((after["generated_kwh"], after["consumed_kwh"]), (10, None), "accounting entries do not change operational readings")
         self.assertEqual(self.state["daily"], before_daily)
         self.assertEqual(self.state["bills"], before_bills)
 
@@ -238,12 +238,15 @@ class ManualGenerationPolicyRegression(unittest.TestCase):
         self.assertEqual((auto["generation_source"], auto["consumption_source"]), ("PHYSICAL", "PHYSICAL"))
 
         manual = Q.wing_graph_rows(cursor, self.did, "A", date(2026, 9, 12), date(2026, 9, 12), generation_enabled=True, consumption_enabled=True, calculation_mode="MANUAL")[0]
-        self.assertEqual((manual["generated_kwh"], manual["consumed_kwh"]), (23.0, 7.0))
-        self.assertEqual((manual["generation_source"], manual["consumption_source"]), ("MANUAL", "MANUAL"))
+        self.assertEqual((manual["generated_kwh"], manual["consumed_kwh"]), (10.0, None))
+        self.assertEqual((manual["generation_source"], manual["consumption_source"]), ("PHYSICAL", "UNAVAILABLE"))
+        self.assertEqual(manual["required_kwh"], 100.0)
 
         zero_day = Q.wing_graph_rows(cursor, self.did, "A", date(2026, 9, 13), date(2026, 9, 13), generation_enabled=True, consumption_enabled=True, calculation_mode="MANUAL")[0]
-        self.assertEqual(zero_day["generated_kwh"], 0.0)
-        self.assertEqual(zero_day["generation_source"], "MANUAL")
+        self.assertIsNone(zero_day["generated_kwh"], "a manual zero is not a physical measurement")
+        self.assertEqual(zero_day["generation_source"], "UNAVAILABLE")
+        legacy_zero = Q.wing_graph_rows(cursor, self.did, "A", date(2026, 9, 13), date(2026, 9, 13), True, True)[0]
+        self.assertEqual((legacy_zero["generated_kwh"], legacy_zero["generation_source"]), (0, "MANUAL"))
 
         calc = Q.calculation_view(cursor, self.did, "MANUAL", 1, {"M1": {"enabled": True}, "M2": {"enabled": True, "comm_status": "ONLINE"}, "M3": {"enabled": True, "comm_status": "ONLINE"}, "M4": {"enabled": True, "comm_status": "ONLINE"}, "M5": {"enabled": True, "comm_status": "ONLINE"}}, date(2026, 9, 12))
         self.assertEqual(calc["common_generation_basis"], "PHYSICAL_M1_ONLY")
@@ -283,8 +286,8 @@ class ManualGenerationPolicyRegression(unittest.TestCase):
         self.post_adjustment(data={"society_id": "1", "device_id": self.did, "wing": "A", "kind": "MANUAL_GENERATION", "operating_date": "2026-09-12", "value_kwh": 0, "reason": "real zero"}, user=self._admin())
         self.state["device"]["energy_calculation_mode"] = "MANUAL"
         rows = self.summary(society_id="1", device_id=self.did, user=self._admin())["calculation"]["wings"]
-        self.assertEqual((rows["A"]["today"]["generated_kwh"], rows["A"]["today"]["generation_source"]), (0, "MANUAL"))
-        self.assertIsNone(rows["B"]["today"]["generated_kwh"])
+        self.assertEqual((rows["A"]["today"]["generated_kwh"], rows["A"]["today"]["generation_source"]), (10, "PHYSICAL"))
+        self.assertEqual((rows["B"]["today"]["generated_kwh"], rows["B"]["today"]["generation_source"]), (0, "PHYSICAL"))
         self.state["daily"] = []
         before = deepcopy({k: self.state[k] for k in ("adjustments", "daily", "bills", "targets", "device", "commands", "commits")})
         audits = deepcopy(self.audit)
@@ -315,7 +318,7 @@ class ManualGenerationPolicyRegression(unittest.TestCase):
                 history = self.history(society_id="1", device_id=self.did, frm="2026-09-01", to="2026-09-12", range=None, granularity="monthly", user=self._admin())["rows"][0]
                 self.assertIsNone(history["generation_kwh"])
                 self.assertTrue(all(v is None for v in history["wing_generation"].values()))
-                for mode in (None, "AUTO"):
+                for mode in (None, "AUTO", "MANUAL"):
                     graph = Q.wing_graph_rows(cursor, self.did, "A", date(2026, 9, 12), date(2026, 9, 12), True, True, mode)[0]
                     self.assertIsNone(graph["generated_kwh"])
                     self.assertEqual(graph["generation_source"], "UNAVAILABLE")
