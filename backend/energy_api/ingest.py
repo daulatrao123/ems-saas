@@ -15,7 +15,7 @@ METER_ROLE = {"M1": "GENERATION", "M2": "CONSUMPTION", "M3": "CONSUMPTION", "M4"
 METER_WING = {"M1": None, "M2": "A", "M3": "B", "M4": "C", "M5": "D"}
 WINGS = ("A", "B", "C", "D")
 COMM_STATES = {"DISABLED", "NOT_CONFIGURED", "ONLINE", "DEGRADED", "OFFLINE"}
-READINGS_RETENTION_DAYS = 30
+MAX_CLOSED_DAYS_PER_SYNC = 31
 DEFAULT_ALLOCATION = {"enabled": False, "sequence": list(WINGS), "tolerance_kwh": 1.0, "persistence_s": 300,
                       "wings": {w: {"generation_attribution_enabled": True, "manual_target_kwh": None} for w in WINGS}}
 
@@ -39,9 +39,11 @@ def _wing_map(raw):
 
 
 def ensure_meter_rows(cur, device_id):
-    for mid in METER_IDS:
-        cur.execute("""INSERT INTO energy_meters (device_id, meter_id, role, wing) VALUES (%s, %s, %s, %s)
-                       ON CONFLICT (device_id, meter_id) DO NOTHING""", (device_id, mid, METER_ROLE[mid], METER_WING[mid]))
+    # One round trip for the same five defaults; never overwrite operator config.
+    values = ", ".join(["(%s, %s, %s, %s)"] * len(METER_IDS))
+    params = tuple(value for mid in METER_IDS for value in (device_id, mid, METER_ROLE[mid], METER_WING[mid]))
+    cur.execute(f"""INSERT INTO energy_meters (device_id, meter_id, role, wing) VALUES {values}
+                    ON CONFLICT (device_id, meter_id) DO NOTHING""", params)
 
 
 def normalize_day(raw, now=None):
@@ -96,18 +98,29 @@ def upsert_day(cur, device_id, day):
 
 
 def ingest(cur, device_id, energy, now):
-    """Store meter health, readings and ledger rows inside a SAVEPOINT: a bad energy block never fails the Pi sync."""
+    """Isolate energy writes; the caller MUST NOT acknowledge an incomplete block.
+
+    Legacy Pis remove all in-flight closed days on any successful sync. Keeping
+    the heartbeat transaction usable is not permission to send success=True.
+    """
+    if energy is None:  # Compatibility with controllers predating energy reports.
+        return {"days": 0, "accepted": True}
     if not isinstance(energy, dict):
-        return {"days": 0}
+        return {"days": 0, "accepted": False, "error": "INVALID_ENERGY_BLOCK"}
+    closed = energy.get("closed_days", [])
+    if not isinstance(closed, list) or len(closed) > MAX_CLOSED_DAYS_PER_SYNC:
+        # Never silently slice a batch and acknowledge the omitted history.
+        return {"days": 0, "accepted": False, "error": "INVALID_CLOSED_DAY_BATCH"}
     cur.execute("SAVEPOINT energy_ingest")
     try:
         out = _ingest(cur, device_id, energy, now)
         cur.execute("RELEASE SAVEPOINT energy_ingest")
         return out
-    except Exception as exc:  # isolate: the rest of /api/pi/sync (commands, acks, state) must still commit
+    except Exception as exc:
         cur.execute("ROLLBACK TO SAVEPOINT energy_ingest")
+        cur.execute("RELEASE SAVEPOINT energy_ingest")
         logging.getLogger("ems.energy").error("energy ingest failed device=%s: %s", device_id, exc)
-        return {"days": 0, "error": str(exc)[:200]}
+        return {"days": 0, "accepted": False, "error": "ENERGY_STORAGE_FAILED"}
 
 
 def _ingest(cur, device_id, energy, now):
@@ -128,11 +141,10 @@ def _ingest(cur, device_id, energy, now):
             cur.execute("""INSERT INTO energy_meter_readings (device_id, meter_id, ts, cumulative_kwh, power_kw) VALUES (%s,%s,%s,%s,%s)
                            ON CONFLICT DO NOTHING""", (device_id, mid, _ts(h["last_seen"]), _num(h["last_kwh"]), _num(h.get("power_kw"))))
     days, rejected = 0, []
-    closed = energy.get("closed_days")
-    closed = closed[:31] if isinstance(closed, list) else []
-    for raw in closed + [energy.get("today")]:
-        if raw is None:
-            continue
+    rows = list(energy.get("closed_days", []))
+    if energy.get("today") is not None:
+        rows.append(energy["today"])
+    for raw in rows:
         problem = day_problem(raw, now)
         if problem:
             rejected.append(quarantine(cur, device_id, raw, problem, now))
@@ -141,12 +153,13 @@ def _ingest(cur, device_id, energy, now):
         if day:
             upsert_day(cur, device_id, day)
             days += 1
-    cur.execute("DELETE FROM energy_meter_readings WHERE device_id=%s AND ts < NOW() - make_interval(days => %s)", (device_id, READINGS_RETENTION_DAYS))
+    # Retention is not a sync side effect. Archival/deletion requires approval.
     report = record_clock_report(cur, device_id, energy.get("today"), rejected, now)
-    return {"days": days, "clock_report": report}
+    return {"days": days, "clock_report": report, "accepted": not rejected,
+            **({"error": "ENERGY_ROWS_REJECTED"} if rejected else {})}
 
 
-def build_energy_config(cur, device_id, now=None):
+def build_energy_config(cur, device_id, now=None, *, reported_version=None):
     """Backend-authoritative config for the Pi: {"version", "bus", "meters": {Mx: {...}}}."""
     now = utc_now(now)
     cur.execute("SELECT energy_bus, energy_config_version, energy_allocation FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
@@ -159,6 +172,15 @@ def build_energy_config(cur, device_id, now=None):
     except HTTPException as exc:
         logging.getLogger("ems.energy").warning("Energy config withheld device=%s: %s", device_id, exc.detail)
         return None
+    try:
+        targets, version = reconcile_targets(cur, device_id, as_of, dev["energy_config_version"])
+    except HTTPException as exc:
+        logging.getLogger("ems.energy").warning("Energy config withheld device=%s: %s", device_id, exc.detail)
+        return None
+    # Still qualify the operating date and reconcile effective targets on EVERY
+    # request, including rollover. Skip only the unused full meter snapshot.
+    if type(reported_version) is int and reported_version == version:
+        return None
     ensure_meter_rows(cur, device_id)
     cur.execute("""SELECT meter_id, serial, modbus_address, model, register_map, phases, ct_ratio, max_kw, enabled
                    FROM energy_meters WHERE device_id=%s ORDER BY meter_id""", (device_id,))
@@ -167,11 +189,6 @@ def build_energy_config(cur, device_id, now=None):
         meters[r["meter_id"]] = {"enabled": bool(r["enabled"]), "serial": r["serial"], "modbus_address": r["modbus_address"], "model": r["model"],
                                  "register_map": r["register_map"], "phases": r["phases"],
                                  "ct_ratio": _num(r["ct_ratio"]), "max_kw": _num(r["max_kw"])}
-    try:
-        targets, version = reconcile_targets(cur, device_id, as_of, dev["energy_config_version"])
-    except HTTPException as exc:
-        logging.getLogger("ems.energy").warning("Energy config withheld device=%s: %s", device_id, exc.detail)
-        return None
     allocation = dev["energy_allocation"] or DEFAULT_ALLOCATION
     return {"version": version, "bus": dev["energy_bus"] or {}, "meters": meters,
             "allocation": allocation, "targets": targets}
@@ -180,7 +197,8 @@ def build_energy_config(cur, device_id, now=None):
 def config_reply(cur, device_id, energy, now=None):
     """Include energy_config in the sync reply only when the Pi runs a different version (or none)."""
     now = utc_now(now)
-    cfg = build_energy_config(cur, device_id, now)
+    reported = energy.get("config_version") if isinstance(energy, dict) else None
+    cfg = build_energy_config(cur, device_id, now, reported_version=reported)
     reported = record_report(cur, device_id, energy, now)
     if cfg is None:
         return None

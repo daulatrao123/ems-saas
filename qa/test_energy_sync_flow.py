@@ -183,22 +183,24 @@ class EnergySyncFlow(unittest.TestCase):
         raw = {"today":{"operating_date":"2099-01-01","generation_kwh":9999},
                "closed_days":[{"operating_date":"2026-09-15","status":"CLOSED","generation_kwh":23,"generation_source":"PHYSICAL"}]}
         out = ingest.ingest(conn.cursor(), DID, raw, NOW)
-        self.assertNotIn("error",out); conn.commit()
+        self.assertEqual(out["error"], "ENERGY_ROWS_REJECTED"); conn.commit()
+        self.assertFalse(out["accepted"], "a quarantine preview is not an ACK for the original")
         self.assertEqual(out["days"],1)
         self.assertEqual(self.db["daily"][(DID,date(2026,9,15))]["generation_kwh"],23)
         self.assertNotIn((DID,date(2099,1,1)),self.db["daily"])
         self.assertIn((DID,"2099-01-01"),self.db["quarantine"])
-        # Repeated bad uploads are bounded; another device's evidence is untouched.
+        # No age/count eviction; another device's evidence is untouched.
         self.db["quarantine"][(OTHER,"2099-01-01")] = {"first_seen":NOW,"last_seen":NOW}
         for month in range(1,4):
             conn = MemoryConnection(self.db)
             out = ingest.ingest(conn.cursor(),DID,{"closed_days":[{"operating_date":f"2099-{month:02d}-{day:02d}"} for day in range(1,29)],"today":{"operating_date":"2026-09-16"}},NOW)
-            self.assertNotIn("error",out); conn.commit()
-        self.assertEqual(len([k for k in self.db["quarantine"] if k[0]==DID]),64)
+            self.assertFalse(out["accepted"]); conn.commit()
+        self.assertEqual(len([k for k in self.db["quarantine"] if k[0]==DID]),84)
+        self.assertIn((DID,"2099-01-01"),self.db["quarantine"])
         self.assertIn((OTHER,"2099-01-01"),self.db["quarantine"])
         conn = MemoryConnection(self.db)
         result = ingest.ingest(conn.cursor(),DID,{"today":{"operating_date":"bad\x00date"}},NOW)
-        self.assertNotIn("error",result)
+        self.assertFalse(result["accepted"])
         self.assertNotIn("\x00",result["clock_report"]["reported_operating_date"])
 
     def test_migration_emits_only_additive_ddl_offline(self):

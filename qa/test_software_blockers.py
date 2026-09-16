@@ -64,7 +64,8 @@ class ClockQualificationTests(unittest.TestCase):
         self.assertIn('"generation_kwh": 23', calls[0][1][3])
         self.assertEqual(report["status"], "REJECTED")
         self.assertEqual(report["reported_operating_date"], "2099-01-01")
-        self.assertEqual(calls[-1][1], ("device", "device", 64))
+        self.assertTrue(all(not sql.lstrip().upper().startswith("DELETE") for sql, _ in calls))
+        self.assertLessEqual(len(calls[0][1][3]), 65500)
         self.assertTrue(all("energy_daily" not in sql or sql.startswith("SELECT") for sql, _ in calls))
 
 

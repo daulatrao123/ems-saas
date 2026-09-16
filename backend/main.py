@@ -1708,7 +1708,18 @@ def pi_sync(
                          ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good, hardware_fault, storage_health))
 
             # Energy (E2): meter health, latest cumulative readings, OPEN/CLOSED daily ledger rows (idempotent upsert).
-            energy_ingest.ingest(cur, device_id, payload.get("energy"), now)
+            energy_result = energy_ingest.ingest(cur, device_id, payload.get("energy"), now)
+            if energy_result.get("accepted") is not True:
+                # Legacy firmware ACKs ALL in-flight energy on HTTP 200 success.
+                # Commit heartbeat + any valid rows/quarantine, but withhold that
+                # ACK and do not lease commands or send config in a failed reply.
+                # Events remain on the Pi for its existing 60-second retry.
+                conn.commit()
+                return JSONResponse(status_code=503, content={
+                    "success": False, "device_id": str(device_id),
+                    "error": energy_result.get("error", "ENERGY_STORAGE_FAILED"),
+                    "energy_accepted": False,
+                }, headers={"Retry-After": "60"})
 
             for event in payload.get("events", []):
                 ev_id = event.get("eventId")

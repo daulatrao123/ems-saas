@@ -67,9 +67,10 @@ class AdjustmentMeterInitialization(unittest.TestCase):
                 self.assertEqual(self.ensure.call_args.args[1], self.fixture.did)
                 calls = state["queries"][query_start:]
                 inserts = [(q, p) for q, p in calls if q.startswith("insert into energy_meters")]
-                self.assertEqual([p[1] for _, p in inserts], ["M1", "M2", "M3", "M4", "M5"])
+                self.assertEqual(len(inserts), 1)
+                self.assertEqual(list(inserts[0][1][1::4]), ["M1", "M2", "M3", "M4", "M5"])
                 adjustment_index = next(i for i, (q, _) in enumerate(calls) if q.startswith("insert into energy_adjustments"))
-                self.assertEqual(sum(q.startswith("insert into energy_meters") for q, _ in calls[:adjustment_index]), 5)
+                self.assertEqual(sum(q.startswith("insert into energy_meters") for q, _ in calls[:adjustment_index]), 1)
                 self.assertFalse(any("status='open'" in q for q, _ in calls))
                 row = out["adjustment"]
                 self.assertEqual((row["kind"], row["operating_date"], row["value_kwh"], row["wing"]), (kind, day, value, wing))

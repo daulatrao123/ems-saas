@@ -15,7 +15,6 @@ from psycopg.types.json import Json
 MIN_DAY = date(1971, 1, 1)
 CLOCK_SKEW = timedelta(minutes=5)
 MAX_ZONE_OFFSET = timedelta(hours=14)
-QUARANTINE_ROWS_PER_DEVICE = 64
 
 
 def utc_now(now=None):
@@ -102,8 +101,6 @@ def record_clock_report(cur, did, today, rejected, now):
         report["status"] = "WARNING"
     cur.execute("""INSERT INTO energy_sync_state (device_id,clock_report) VALUES (%s,%s)
         ON CONFLICT (device_id) DO UPDATE SET clock_report=EXCLUDED.clock_report""", (did, Json(report)))
-    if rejected:
-        cur.execute("""DELETE FROM energy_day_quarantine WHERE device_id=%s AND date_key NOT IN
-            (SELECT date_key FROM energy_day_quarantine WHERE device_id=%s ORDER BY last_seen DESC,date_key LIMIT %s)""",
-                    (did, did, QUARANTINE_ROWS_PER_DEVICE))
+    # Do not evict older diagnostic evidence during ingestion. Each preview and
+    # each incoming batch is bounded; total retention requires an approved plan.
     return report
