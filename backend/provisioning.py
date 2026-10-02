@@ -61,6 +61,7 @@ FIRMWARE_FILES = (
     "energy/energy_state.py",
     "energy/meter_bus.py",
     "energy/meter_manager.py",
+    "energy/day_based.py",
     "energy/meter_registry.py",
     "energy/modbus_meter.py",
     "energy/register_maps.py",

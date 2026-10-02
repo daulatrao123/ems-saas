@@ -52,6 +52,29 @@ class ProvisioningP0Tests(unittest.TestCase):
         self.assertEqual(info["installer_sha256"], hashlib.sha256(package.INSTALL_SH.encode()).hexdigest())
         print("MOCKED_CURRENT_PACKAGE", json.dumps({"entries": len(z.namelist()), "runtime_files": len(info["runtime_files"]), "runtime_sha256": info["runtime_sha256"]}))
 
+    def test_day_based_firmware_is_packaged_and_integrity_checked(self):
+        import tempfile
+        z, root = self.archive, package.ROOT + "/"
+        for name in ("firmware/energy/day_based.py", "firmware/energy/meter_manager.py", "firmware/energy/allocation.py", "firmware/ems_controller.py", "BUILD_INFO.json", "MANIFEST.sha256"):
+            self.assertIn(root + name, z.namelist())
+        info = json.loads(z.read(root + "BUILD_INFO.json"))
+        self.assertIn("energy/day_based.py", info["runtime_files"])
+        for name in package.FIRMWARE_FILES:
+            self.assertIn(name, info["runtime_files"])
+            self.assertEqual(z.read(root + "firmware/" + name), (package.FIRMWARE_DIR / name).read_bytes())
+        for row in z.read(root + "MANIFEST.sha256").decode().splitlines():
+            digest, name = row.split("  ", 1)
+            self.assertEqual(hashlib.sha256(z.read(root + name)).hexdigest(), digest)
+        with tempfile.TemporaryDirectory() as tmp:
+            extracted = Path(tmp) / "pkg"
+            data = Path(tmp) / "data"
+            dest = Path(tmp) / "opt" / "firmware"
+            data.mkdir()
+            dest.parent.mkdir()
+            z.extractall(extracted)
+            fingerprint = preflight.check_installation(extracted / package.ROOT, data, dest, layout_only=True)
+        self.assertEqual(fingerprint, info["runtime_sha256"])
+
     def test_installer_syntax_safe_order_no_deletion_or_storage_bootstrap(self):
         shell = self.archive.read(package.ROOT + "/install.sh").decode()
         # Parser only: absolutely no bash execution of the script.
