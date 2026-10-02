@@ -130,6 +130,31 @@ class EnergySyncFlow(unittest.TestCase):
         out = ingest.config_reply(conn.cursor(), DID, {"config_version":reported}, now)
         conn.commit(); return out
 
+    def test_applied_energy_version_is_what_the_next_report_stores(self):
+        import logging
+        import sys
+        import tempfile
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pi_firmware"))
+        from energy.meter_manager import EnergyEngine
+        self.db["devices"][DID]["allocation_mode"] = "DAY_BASED"
+        saved = self.save()
+        cfg = self.reply(saved["config_version"] - 1)
+        self.assertEqual(cfg["version"], saved["config_version"])
+        self.assertEqual(cfg["allocation_mode"], "DAY_BASED")
+        self.assertFalse(cfg["meters"]["M1"]["enabled"])
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = EnergyEngine(tmp, feedback_provider=lambda: {}, operating_date_provider=lambda: "2026-09-16",
+                                  reset_day_provider=lambda: 15, write_allowed=lambda: True, logger=logging.getLogger("energy-version"))
+            ok, err = engine.apply_config(cfg)
+            self.assertTrue(ok, err)
+            self.assertEqual(engine.config_version, cfg["version"])
+            self.assertEqual(engine.snapshot()["config_version"], cfg["version"])
+        self.assertIsNone(self.reply(cfg["version"]))
+        delivery = self.get(society_id="1", device_id=DID, wing="A", user=USER)["delivery"]
+        self.assertEqual(delivery["desired_version"], cfg["version"])
+        self.assertEqual(delivery["reported_version"], cfg["version"])
+        self.assertEqual(delivery["status"], "REPORTED_CURRENT")
+
     def test_route_save_to_config_resend_report_and_same_day_correction(self):
         other = deepcopy(self.db["devices"][OTHER]); saved = self.save()
         self.assertEqual((saved["config_version"],saved["target"]["target_kwh_per_day"]),(5,23))

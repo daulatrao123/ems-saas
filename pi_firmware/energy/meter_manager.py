@@ -56,6 +56,7 @@ class EnergyEngine:
         self.allocation = AllocationPolicy(os.path.join(self.dir, "allocation.json"), self._writes_ok, now)
         self.day_strategy = DayBasedStrategy(os.path.join(self.dir, "day_based.json"), self._writes_ok)
         self._last_strategy = "policy"
+        self._day_enabled = None
         self.targets = {}
         self._last_feedback = {}
         stored = load_json(os.path.join(self.dir, "config.json"), None)
@@ -250,9 +251,11 @@ class EnergyEngine:
             if mode == "DAY_BASED":
                 today = self.ledger.snapshot_today()
                 self._last_strategy = "day"
+                enabled = [wing for wing in ("A", "B", "C", "D") if (wings.get(wing) or {}).get("ems_enabled")]
+                self._day_enabled = enabled
                 decision = self.day_strategy.evaluate({
                     "operating_date": today["operating_date"], "reset_day": self.reset_day(),
-                    "verified_active": verified_active(feedback), "wings": wings,
+                    "verified_active": verified_active(feedback, enabled), "wings": wings,
                 })
                 self.day_strategy.persist()
                 return decision
@@ -273,7 +276,8 @@ class EnergyEngine:
     def allocation_result(self, action, slot, success):
         with self._lock:
             if self._last_strategy == "day":
-                events = self.day_strategy.after_execution(action, slot, success, verified_active(self.feedback()))
+                events = self.day_strategy.after_execution(
+                    action, slot, success, verified_active(self.feedback(), self._day_enabled))
                 self.day_strategy.persist()
                 return events
             events = self.allocation.after_execution(action, slot, success, verified_active(self.feedback()))

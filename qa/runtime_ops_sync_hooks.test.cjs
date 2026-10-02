@@ -132,6 +132,8 @@ test("clock and delivery notices render actual data safely without implying hard
   assert.equal(nodeById(delivery, "energy-target-delivery-time"), undefined);
   const reported = Delivery({ delivery: { desired_version: 5, reported_version: 5, status: "REPORTED_CURRENT" } });
   assert.equal(nodeById(reported, "energy-target-delivery-status").props.children, "Controller reports current version");
+  assert.match(nodeById(reported, "energy-target-delivery-desired").props.children.join(""), /desired #5/);
+  assert.match(nodeById(reported, "energy-target-delivery-reported").props.children.join(""), /Pi reported #5/);
   assert.doesNotMatch(JSON.stringify(reported), /hardware.verified|HW VERIFIED/i);
 });
 function nodeById(tree, id) {

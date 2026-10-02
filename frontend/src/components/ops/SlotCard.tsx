@@ -63,6 +63,7 @@ export function SlotOperations({ device, code, slot, queue, isPending, readOnly,
   const [seenTarget, setSeenTarget] = useState(slot?.target_days);
   if (seenTarget !== slot?.target_days) { setSeenTarget(slot?.target_days); setDays(String(slot?.target_days ?? "")); }
   const n = Number(days); const validDays = Number.isInteger(n) && n >= 0 && n <= 31;
+  // used_days is the legacy quota counter. The calendar schedule follows target_days and does not advance this counter.
   const used = numberOrNull(slot?.used_days), target = numberOrNull(slot?.target_days);
   const remaining = target != null && used != null ? Math.max(0, target - used) : null;
   const busyDays = isPending(device.id, "set_days", code);

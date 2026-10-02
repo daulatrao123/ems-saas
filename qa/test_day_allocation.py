@@ -4,6 +4,7 @@ No live database. AllocationPolicy and energy_calculation_mode are not exercised
 """
 from __future__ import annotations
 
+import logging
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,9 @@ sys.path.insert(0, str(ROOT / "pi_firmware"))
 from energy_api import day_allocation as DA  # noqa: E402
 from energy_api.routes import create_router  # noqa: E402
 from config_hash import canonical_device_config  # noqa: E402
+from energy.allocation import verified_active  # noqa: E402
 from energy.day_based import DayBasedStrategy  # noqa: E402
+from energy.meter_manager import EnergyEngine  # noqa: E402
 
 DID = "22222222-2222-2222-2222-222222222222"
 
@@ -264,6 +267,130 @@ class DayStrategy(unittest.TestCase):
             wings["A"]["target_days"] = 30
             decision = strategy.evaluate({"operating_date": "2026-04-20", "reset_day": 15, "verified_active": "UNKNOWN", "wings": wings})
             self.assertIsNone(decision["action"])
+
+
+class _BatchCursor:
+    def __init__(self, commands, slots):
+        self.commands, self.slots, self.bumps, self._one, self._rows = commands, slots, 0, None, []
+
+    def execute(self, sql, params=()):
+        q = " ".join(sql.lower().split())
+        self._one, self._rows = None, []
+        if "from pi_commands" in q and "group by" not in q:
+            self._rows = [row for row in self.commands if row["allocation_batch_id"] == params[1]]
+        elif "group by allocation_batch_id" in q:
+            device, batch, this_max = params
+            newer = []
+            ids = {row["allocation_batch_id"] for row in self.commands if row["allocation_batch_id"] not in (None, batch)}
+            for bid in ids:
+                rows = [row for row in self.commands if row["allocation_batch_id"] == bid]
+                if rows and all(row["status"] in ("completed", "acked") for row in rows) and max(row["sequence_no"] for row in rows) > this_max:
+                    newer.append(1)
+            self._one = {"ok": 1} if newer else None
+        elif q.startswith("select target_days"):
+            self._one = {"target_days": self.slots[params[1]]}
+        elif q.startswith("update slot_configs"):
+            self.slots[params[2]] = params[0]
+        elif q.startswith("update societies"):
+            self.bumps += 1
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._one
+
+
+def _batch_rows(batch, days, status, sequence):
+    return [{"slot": wing, "params": {"days": days[wing]}, "status": status[wing], "sequence_no": sequence[wing], "allocation_batch_id": batch} for wing in days]
+
+
+class BatchPublication(unittest.TestCase):
+    def test_complete_batch_including_zero_replaces_previous_targets_once(self):
+        commands = _batch_rows("new", {"A": 0, "B": 2, "C": 28}, {"A": "completed", "B": "acked", "C": "completed"}, {"A": 4, "B": 5, "C": 6})
+        cur = _BatchCursor(commands, {"A": 6, "B": 12, "C": 12})
+        self.assertTrue(DA.publish_completed_batch(cur, DID, 1, "new"))
+        self.assertEqual(cur.slots, {"A": 0, "B": 2, "C": 28})
+        self.assertEqual(cur.bumps, 1)
+        self.assertFalse(DA.publish_completed_batch(cur, DID, 1, "new"))
+        self.assertEqual(cur.bumps, 1)
+
+    def test_expired_wing_does_not_publish_a_mixed_schedule(self):
+        commands = _batch_rows("new", {"A": 0, "B": 2, "C": 28}, {"A": "completed", "B": "completed", "C": "expired"}, {"A": 4, "B": 5, "C": 6})
+        cur = _BatchCursor(commands, {"A": 6, "B": 12, "C": 12})
+        self.assertFalse(DA.publish_completed_batch(cur, DID, 1, "new"))
+        self.assertEqual(cur.slots, {"A": 6, "B": 12, "C": 12})
+        self.assertEqual(cur.bumps, 0)
+
+    def test_same_idempotency_key_does_not_create_another_batch(self):
+        # The apply route returns the existing batch before queue_set_days. This locks that gate.
+        routes = (ROOT / "backend" / "energy_api" / "routes.py").read_text(encoding="utf-8")
+        self.assertIn('f"{idem}:{enabled[0]}"', routes)
+        self.assertIn('"duplicate": True', routes)
+
+    def test_older_complete_batch_cannot_overwrite_a_newer_complete_batch(self):
+        old = _batch_rows("old", {"A": 6, "B": 12, "C": 12}, {"A": "completed", "B": "completed", "C": "completed"}, {"A": 1, "B": 2, "C": 3})
+        new = _batch_rows("new", {"A": 0, "B": 2, "C": 28}, {"A": "completed", "B": "acked", "C": "completed"}, {"A": 4, "B": 5, "C": 6})
+        cur = _BatchCursor(old + new, {"A": 0, "B": 2, "C": 28})
+        self.assertFalse(DA.publish_completed_batch(cur, DID, 1, "old"))
+        self.assertEqual(cur.slots, {"A": 0, "B": 2, "C": 28})
+        self.assertEqual(cur.bumps, 0)
+
+    def test_manual_set_days_update_stays_outside_the_batch_gate(self):
+        main = (ROOT / "backend" / "main.py").read_text(encoding="utf-8")
+        gate = main[main.index('if status == "completed"'):main.index('elif cmd["command"] == "set_reset_day"')]
+        self.assertIn('if not cmd.get("allocation_batch_id")', gate)
+        self.assertIn("UPDATE slot_configs SET target_days = %s", gate)
+        self.assertIn("publish_completed_batch", main)
+
+
+class DayFeedbackScope(unittest.TestCase):
+    def engine(self, tmp, feedback, mode="DAY_BASED"):
+        engine = EnergyEngine(tmp, feedback_provider=lambda: feedback, operating_date_provider=lambda: "2026-04-20",
+                              reset_day_provider=lambda: 15, write_allowed=lambda: True, logger=logging.getLogger("day-feedback"))
+        ok, err = engine.apply_config({"version": 4, "allocation_mode": mode, "bus": {}, "meters": {}, "allocation": {"enabled": False}, "targets": {}})
+        self.assertTrue(ok, err)
+        self.assertFalse(engine.registry["M1"].enabled)
+        self.assertTrue(all(not engine.registry[mid].enabled for mid in ("M2", "M3", "M4", "M5")))
+        return engine
+
+    def wings(self, disabled="D"):
+        return {code: {"ems_enabled": code != disabled, "target_days": {"A": 10, "B": 12, "C": 8, "D": 0}[code]} for code in "ABCD"}
+
+    def test_disabled_unknown_feedback_does_not_block_enabled_wings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self.engine(tmp, {"A": "OFF", "B": "OFF", "C": "OFF", "D": "UNKNOWN"})
+            decision = engine.evaluate_allocation("READY", self.wings())
+            self.assertEqual(decision["action"], "ACTIVATE")
+            self.assertEqual(decision["slot"], "A")
+            self.assertEqual(engine._last_strategy, "day")
+            engine.feedback = lambda: {"A": "ON", "B": "OFF", "C": "OFF", "D": "UNKNOWN"}
+            engine.allocation_result("ACTIVATE", "A", True)
+            self.assertEqual(engine.day_strategy.state["last_applied"], "A")
+
+    def test_unknown_feedback_on_an_enabled_wing_still_blocks(self):
+        for disabled, feedback in (
+            ("D", {"A": "UNKNOWN", "B": "OFF", "C": "OFF", "D": "OFF"}),
+            ("", {"A": "OFF", "B": "OFF", "C": "OFF", "D": "UNKNOWN"}),
+            ("", {"A": "ON", "B": "ON", "C": "OFF", "D": "OFF"}),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                engine = self.engine(tmp, feedback)
+                decision = engine.evaluate_allocation("READY", self.wings(disabled or " "))
+                self.assertIsNone(decision["action"], feedback)
+
+    def test_auto_still_uses_every_wing_and_the_allocation_policy(self):
+        feedback = {"A": "OFF", "B": "OFF", "C": "OFF", "D": "UNKNOWN"}
+        self.assertEqual(verified_active(feedback), "UNKNOWN")
+        self.assertIsNone(verified_active(feedback, ("A", "B", "C")))
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self.engine(tmp, feedback, mode="AUTO")
+            decision = engine.evaluate_allocation("READY", self.wings())
+            self.assertEqual(engine._last_strategy, "policy")
+            self.assertIsNone(decision["action"])
+            manual = self.engine(tmp, feedback, mode="MANUAL")
+            self.assertIsNone(manual.evaluate_allocation("READY", self.wings())["action"])
+            self.assertEqual(manual._last_strategy, "manual")
 
 
 class ContractText(unittest.TestCase):

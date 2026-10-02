@@ -74,6 +74,7 @@ class ProvisioningP0Tests(unittest.TestCase):
             z.extractall(extracted)
             fingerprint = preflight.check_installation(extracted / package.ROOT, data, dest, layout_only=True)
         self.assertEqual(fingerprint, info["runtime_sha256"])
+        self.assertIn('"firmware/energy/day_based.py"', z.read(root + "install.sh").decode())
 
     def test_installer_syntax_safe_order_no_deletion_or_storage_bootstrap(self):
         shell = self.archive.read(package.ROOT + "/install.sh").decode()

@@ -20,6 +20,7 @@ from provisioning import build_provisioning_zip, service_unit_sha256
 from energy_api import ingest as energy_ingest
 import health_read_model
 from energy_api.routes import create_router as create_energy_router
+from energy_api.day_allocation import publish_completed_batch
 import logging
 _seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
 from fastapi.middleware.cors import CORSMiddleware
@@ -1845,7 +1846,7 @@ def pi_command_ack(
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, command, slot, params, status, attempt_count FROM pi_commands WHERE id = %s AND device_id = %s FOR UPDATE",
+                "SELECT id, command, slot, params, status, attempt_count, allocation_batch_id FROM pi_commands WHERE id = %s AND device_id = %s FOR UPDATE",
                 (command_id, device_id),
             )
             cmd = cur.fetchone()
@@ -1891,14 +1892,17 @@ def pi_command_ack(
                     days = int((cmd["params"] or {}).get("days", 0))
                     if slot not in SLOTS or not 0 <= days <= 31:
                         raise HTTPException(409, "Invalid set_days command data", headers={"X-EMS-Ack-Code": "INVALID_COMMAND_DATA"})
-                    cur.execute(
-                        "UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s",
-                        (days, device_id, slot),
-                    )
-                    cur.execute(
-                        "UPDATE societies SET config_version = config_version + 1 WHERE id = %s",
-                        (society_id,),
-                    )
+                    # Manual set_days publishes immediately. A DAY_BASED batch waits until every
+                    # wing in that batch is completed or acked, so one expiry cannot mix targets.
+                    if not cmd.get("allocation_batch_id"):
+                        cur.execute(
+                            "UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s",
+                            (days, device_id, slot),
+                        )
+                        cur.execute(
+                            "UPDATE societies SET config_version = config_version + 1 WHERE id = %s",
+                            (society_id,),
+                        )
                 elif cmd["command"] == "set_reset_day":
                     day = int((cmd["params"] or {}).get("day", DEFAULT_RESET_DAY))
                     if not 1 <= day <= 28:
@@ -1922,6 +1926,8 @@ def pi_command_ack(
             if cur.rowcount != 1:
                 raise HTTPException(409, f"Command state changed concurrently (expected {current})",
                                     headers={"X-EMS-Ack-Code": "CONCURRENT_CHANGE"})
+            if cmd.get("allocation_batch_id") and status in ("completed", "acked"):
+                publish_completed_batch(cur, device_id, society_id, cmd["allocation_batch_id"])
 
         conn.commit()
     except Exception:

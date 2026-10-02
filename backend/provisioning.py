@@ -176,6 +176,7 @@ REQUIRED_FILES=(
   "firmware/energy/energy_state.py"
   "firmware/energy/meter_bus.py"
   "firmware/energy/meter_manager.py"
+  "firmware/energy/day_based.py"
   "firmware/energy/meter_registry.py"
   "firmware/energy/modbus_meter.py"
   "firmware/energy/register_maps.py"

@@ -140,6 +140,58 @@ def application_status(rows):
     return "APPLYING"
 
 
+def publish_completed_batch(cur, device_id, society_id, batch_id):
+    """Write target_days only when every command in this DAY_BASED batch is completed or acked.
+
+    Until then the previous slot_configs remain the schedule the next Pi sync will deliver.
+    A newer batch that is already fully applied is not overwritten. Manual set_days has no
+    batch id and does not use this function. Publication is one cloud config update; the Pi
+    still applies that config on its next successful sync, not inside the set_days ACK.
+    """
+    if not batch_id:
+        return False
+    cur.execute(
+        """SELECT slot, params, status, sequence_no FROM pi_commands
+           WHERE device_id=%s AND allocation_batch_id=%s FOR UPDATE""",
+        (device_id, batch_id),
+    )
+    rows = list(cur.fetchall())
+    if not rows or any(str(row["status"]) not in APPLIED for row in rows):
+        return False
+    this_max = max(int(row["sequence_no"] or 0) for row in rows)
+    cur.execute(
+        """SELECT 1 FROM pi_commands
+           WHERE device_id=%s AND allocation_batch_id IS NOT NULL AND allocation_batch_id <> %s
+           GROUP BY allocation_batch_id
+           HAVING bool_and(status IN ('completed', 'acked')) AND max(sequence_no) > %s
+           LIMIT 1""",
+        (device_id, batch_id, this_max),
+    )
+    if cur.fetchone():
+        return False
+    changed = False
+    for row in rows:
+        params = row["params"] or {}
+        days = params.get("days", 0)
+        if isinstance(days, bool) or not isinstance(days, int) or not 0 <= int(days) <= 31:
+            raise ValueError("batch days must be 0-31")
+        days = int(days)
+        cur.execute(
+            "SELECT target_days FROM slot_configs WHERE device_id=%s AND slot=%s FOR UPDATE",
+            (device_id, row["slot"]),
+        )
+        current = cur.fetchone()
+        if current is None or int(current["target_days"]) != days:
+            cur.execute(
+                "UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s",
+                (days, device_id, row["slot"]),
+            )
+            changed = True
+    if changed:
+        cur.execute("UPDATE societies SET config_version = config_version + 1 WHERE id = %s", (society_id,))
+    return changed
+
+
 def queue_set_days(cur, device_id, days, batch_id, idempotency_key, now):
     """Insert one set_days command per wing in the current transaction. Caller commits."""
     cur.execute("SELECT next_command_sequence FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
