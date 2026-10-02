@@ -54,9 +54,10 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
         excessEnabled={excessEnabled} />)}
     </div>
   );
+  const logicalWings = device ? WINGS.filter((c) => device.slots[c]?.disabled === false) : [];
   const renderDayControls = (inputs: Record<string, ReactNode> = {}, hideSenders = false) => device && (
     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-      {WINGS.map((c) => <SlotOperations key={`${device.id}:${c}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} isPending={ops.isPending} readOnly={readOnly || hideSenders}
+      {logicalWings.map((c) => <SlotOperations key={`${device.id}:${c}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} isPending={ops.isPending} readOnly={readOnly || hideSenders}
         lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} allotmentInput={inputs[c]} />)}
     </div>
   );
@@ -98,7 +99,7 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
             <SectionHeading id="controls" number="04" title={readOnly ? "Days & command evidence" : "Controller controls"} context={readOnly ? "Read only" : "Operator actions"} />
           {visibility.dayAllocation && <details data-testid="allocation-day-controls" className="ops-disclosure" open>
             <summary data-testid="days-command-details-toggle" className="text-sm font-medium">Day allocation</summary>
-            {visibility.cycleSettings && societyId && <DayAllocationPanel societyId={societyId} deviceId={device.id} summary={energy.summary} readOnly={readOnly} refresh={energy.refresh} />}
+            {visibility.cycleSettings && societyId && <DayAllocationPanel societyId={societyId} deviceId={device.id} summary={energy.summary} readOnly={readOnly} refresh={energy.refresh} wings={logicalWings} />}
             {renderDayControls({}, true)}
           </details>}
           <div className={`grid gap-3 ${readOnly ? "" : "md:grid-cols-2 xl:grid-cols-3"}`}>

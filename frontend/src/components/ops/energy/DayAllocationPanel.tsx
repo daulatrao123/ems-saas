@@ -4,10 +4,8 @@ import api from "@/lib/api";
 import { btn, input, panel, tone } from "../DashboardHeader";
 import { EnergySummary } from "./types";
 
-const WINGS = ["A", "B", "C", "D"] as const;
-
-export function DayAllocationPanel({ societyId, deviceId, summary, readOnly, refresh }: {
-  societyId: string; deviceId: string; summary: EnergySummary | null; readOnly: boolean; refresh: () => Promise<void>;
+export function DayAllocationPanel({ societyId, deviceId, summary, readOnly, refresh, wings }: {
+  societyId: string; deviceId: string; summary: EnergySummary | null; readOnly: boolean; refresh: () => Promise<void>; wings: readonly string[];
 }) {
   const cycle = summary?.day_allocation?.cycle_days ?? 0;
   const [kind, setKind] = useState<"DAYS" | "UNITS">("DAYS");
@@ -16,7 +14,7 @@ export function DayAllocationPanel({ societyId, deviceId, summary, readOnly, ref
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const application = summary?.day_allocation?.application;
-  const body = { society_id: societyId, device_id: deviceId, type: kind, wings: Object.fromEntries(WINGS.map((wing) => [wing, Number(values[wing] || 0)])) };
+  const body = { society_id: societyId, device_id: deviceId, type: kind, wings: Object.fromEntries(wings.map((wing) => [wing, Number(values[wing] || 0)])) };
   const calculate = async () => {
     setBusy(true); setError("");
     try {
@@ -41,11 +39,11 @@ export function DayAllocationPanel({ societyId, deviceId, summary, readOnly, ref
       {(["DAYS", "UNITS"] as const).map((item) => <button key={item} type="button" disabled={readOnly || busy} onClick={() => { setKind(item); setDays(null); }} className={`${btn} ${kind === item ? tone.cyan : tone.gray}`}>{item}</button>)}
     </div>
     <div className="grid grid-cols-4 gap-2 mt-3">
-      {WINGS.map((wing) => <label key={wing} className="text-xs text-slate-500">{wing}
-        <input data-testid={`day-input-${wing}`} disabled={readOnly || busy} value={values[wing]} onChange={(e) => { setValues((current) => ({ ...current, [wing]: e.target.value })); setDays(null); }} className={`${input} mt-1`} />
+      {wings.map((wing) => <label key={wing} className="text-xs text-slate-500">{wing}
+        <input data-testid={`day-input-${wing}`} disabled={readOnly || busy} value={values[wing] || ""} onChange={(e) => { setValues((current) => ({ ...current, [wing]: e.target.value })); setDays(null); }} className={`${input} mt-1`} />
       </label>)}
     </div>
-    {days && <div data-testid="day-calculated" className="mt-3 text-sm">{WINGS.map((wing) => `${wing} ${days[wing] ?? "—"}`).join(" · ")}</div>}
+    {days && <div data-testid="day-calculated" className="mt-3 text-sm">{wings.map((wing) => `${wing} ${days[wing] ?? "—"}`).join(" · ")}</div>}
     {application && <div data-testid="day-application-status" className="mt-3 text-sm">
       <div>{application.status}{application.commands.map((command) => ` ${command.slot}:${command.status}`)}</div>
       <p data-testid="day-sync-note" className="mt-1 text-slate-500">A completed or acknowledged command stores the target in the cloud. The controller replaces its previous target only after its next successful sync.</p>

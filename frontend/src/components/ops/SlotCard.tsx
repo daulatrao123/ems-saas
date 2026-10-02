@@ -24,6 +24,8 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
   const busyAct = isPending(device.id, "set_active_slot", code), busyOff = isPending(device.id, "off_slot", code);
   const displayName = slot?.display_name?.trim();
   const customName = displayName && ![code, `slot ${code}`, `wing ${code}`].some((v) => v.toLowerCase() === displayName.toLowerCase()) ? displayName : null;
+  const meterDisabled = wing?.consumption_meter?.enabled === false;
+  const energyCard = <WingEnergyCard code={code} wing={wing} mode={mode} allocationMode={allocationMode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={meterDisabled || slot?.disabled || device.feedback_hardware_installed !== true || device.hardware_fault || slot?.feedback_enabled === false ? undefined : activeGenerationWing} />;
   return (
     <section data-testid={`slot-card-${code}`} data-state={state} className={`ops-wing ${panel} ${active ? "border-emerald-500/40" : ""} p-4 flex flex-col gap-4 min-w-0`}>
       <div className="flex items-start justify-between gap-2">
@@ -35,8 +37,9 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
         <dt className="text-gray-500">CONTACTOR</dt><dd data-testid={`slot-physical-${code}`} className={contactor === "ON" ? "text-emerald-300" : "text-gray-400"}>{contactor}</dd>
       </dl>
       {slot?.disabled && <div data-testid={`slot-exclusion-${code}`} className="text-xs leading-relaxed text-gray-400 border-t border-dashed border-gray-700 pt-3">Disabled logical wing · excluded from society consumption</div>}
-      {slot?.disabled ? <details data-testid={`slot-disabled-data-${code}`} className="ops-disclosure"><summary data-testid={`slot-disabled-data-toggle-${code}`} className="text-xs">Energy data & bill history</summary><WingEnergyCard code={code} wing={wing} mode={mode} allocationMode={allocationMode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={undefined} /></details>
-        : <WingEnergyCard code={code} wing={wing} mode={mode} allocationMode={allocationMode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={device.feedback_hardware_installed === true && !device.hardware_fault && slot?.feedback_enabled !== false ? activeGenerationWing : undefined} />}
+      {meterDisabled ? <div data-testid={`energy-meter-disabled-${code}`} className="text-xs text-gray-500 border-t border-dashed border-gray-700 pt-3">Physical consumption meter disabled</div>
+        : slot?.disabled ? <details data-testid={`slot-disabled-data-${code}`} className="ops-disclosure"><summary data-testid={`slot-disabled-data-toggle-${code}`} className="text-xs">Energy data & bill history</summary>{energyCard}</details>
+        : energyCard}
       {!readOnly && slot && !slot.disabled && (
         <div data-testid={`manual-control-${code}`} className="grid grid-cols-2 gap-2">
           <span data-testid={`manual-control-label-${code}`} className={`${label} col-span-2`}>{manualControlLabel}</span>
