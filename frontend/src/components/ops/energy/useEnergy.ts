@@ -2,13 +2,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import api from "@/lib/api";
 import { errorText } from "../types";
+import { AllocationMode } from "../allocationMode";
 import { CalculationMode, EnergySummary, EnergyComparison, ManualEntryInput } from "./types";
 import { readRequest } from "../readRequest";
 import { summaryValid, comparisonValid } from "./readValidation";
 import { useEnergyHistory } from "./useEnergyHistory";
 
-// One device-scoped source. Mode writes are calculation-only; manual writes append
-// existing adjustments. Neither path uses hardware commands or allocation writes.
+// One device-scoped source. Calculation-mode writes stay on their own request.
+// Allocation mode is a separate persisted setting and does not change calculation mode.
 export function useEnergy(societyId: string | null, deviceId: string | null) {
   const key = `${societyId}:${deviceId}`;
   const request = useRef(0);
@@ -87,5 +88,17 @@ export function useEnergy(societyId: string | null, deviceId: string | null) {
     events: current ? history.events : [], entries: current ? history.entries : [], panelErrors: current ? history.panelErrors : [], error: current ? error : "", loading: !!societyId && !!deviceId && (loading || !current),
     refresh: () => { setWrite((previous) => previous?.key === key ? { ...previous, error: "", notice: "" } : previous); return load(); },
     saving: busyKeys.includes(key), saveError: write?.key === key ? write.error : "", notice: write?.key === key ? write.notice : "",
-    setMode: (mode: CalculationMode) => mutate(mode), addEntry: (entry: ManualEntryInput) => mutate(null, entry) };
+    setMode: (mode: CalculationMode) => mutate(mode), addEntry: (entry: ManualEntryInput) => mutate(null, entry),
+    setAllocationMode: async (mode: AllocationMode) => {
+      if (!current || loading || !summary) return false;
+      const version = summary.allocation_mode_version ?? 0;
+      try {
+        await api.put("/api/energy/allocation-mode", { society_id: societyId, device_id: deviceId, mode, expected_version: version });
+        await load();
+        return true;
+      } catch (e) {
+        setError(errorText(e).detail);
+        return false;
+      }
+    } };
 }

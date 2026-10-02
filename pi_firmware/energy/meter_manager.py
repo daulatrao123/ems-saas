@@ -7,6 +7,7 @@ import threading
 import time
 
 from .allocation import AllocationPolicy, verified_active
+from .day_based import DayBasedStrategy
 from .attribution import ATTRIBUTED, FAULT, UNATTRIBUTED, attribute
 from .energy_ledger import DailyLedger
 from .energy_state import MeterBaselines, atomic_write_json, load_json
@@ -26,6 +27,7 @@ class EnergyEngine:
                  bus_factory=build_bus, now=time.time, poll_interval_s=POLL_INTERVAL_S):
         self.dir = os.path.join(data_dir, "energy")
         self.feedback = feedback_provider
+        self.reset_day = reset_day_provider
         self.write_allowed = write_allowed
         self.log = logger
         self.bus_factory = bus_factory
@@ -52,6 +54,8 @@ class EnergyEngine:
         self._days_in_flight = []
         self._last_loop_error = 0.0
         self.allocation = AllocationPolicy(os.path.join(self.dir, "allocation.json"), self._writes_ok, now)
+        self.day_strategy = DayBasedStrategy(os.path.join(self.dir, "day_based.json"), self._writes_ok)
+        self._last_strategy = "policy"
         self.targets = {}
         self._last_feedback = {}
         stored = load_json(os.path.join(self.dir, "config.json"), None)
@@ -236,9 +240,23 @@ class EnergyEngine:
 
     # ---------------------------------------------------------------- allocation policy (E3) — decisions only
     def evaluate_allocation(self, system_state, wings):
-        """Build the policy context from live engine data + verified feedback; returns the policy decision."""
+        """AUTO uses AllocationPolicy unchanged. DAY_BASED uses the calendar strategy. MANUAL does not act."""
         feedback = self.feedback()
         with self._lock:
+            mode = str(self.config.get("allocation_mode") or "AUTO").upper()
+            if mode == "MANUAL":
+                self._last_strategy = "manual"
+                return {"action": None, "slot": None, "events": []}
+            if mode == "DAY_BASED":
+                today = self.ledger.snapshot_today()
+                self._last_strategy = "day"
+                decision = self.day_strategy.evaluate({
+                    "operating_date": today["operating_date"], "reset_day": self.reset_day(),
+                    "verified_active": verified_active(feedback), "wings": wings,
+                })
+                self.day_strategy.persist()
+                return decision
+            self._last_strategy = "policy"
             today = self.ledger.snapshot_today()
             ctx = {
                 "now": self.now(), "operating_date": today["operating_date"], "system_state": system_state,
@@ -254,6 +272,10 @@ class EnergyEngine:
 
     def allocation_result(self, action, slot, success):
         with self._lock:
+            if self._last_strategy == "day":
+                events = self.day_strategy.after_execution(action, slot, success, verified_active(self.feedback()))
+                self.day_strategy.persist()
+                return events
             events = self.allocation.after_execution(action, slot, success, verified_active(self.feedback()))
             self.allocation.persist()
             return events

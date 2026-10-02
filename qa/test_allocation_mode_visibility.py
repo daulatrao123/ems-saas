@@ -71,8 +71,9 @@ def main():
     slot = read(FE / "SlotCard.tsx")
     types = read(FE / "energy" / "types.ts")
     check("dashboard defaults AllocationMode to AUTO and uses the shared helper", 'useState<AllocationMode>("AUTO")' in dash and "allocationVisibility(allocationMode)" in dash and "excessPresentationEnabled(allocationMode," in dash)
-    check("day allocation and cycle settings render only from helper flags", "visibility.dayAllocation &&" in dash and "visibility.cycleSettings &&" in dash and "<UnitAllotment" in dash)
-    check("member readOnly still hides the cycle editor and manual buttons stay operator-only", "{!readOnly && visibility.cycleSettings && <UnitAllotment" in dash and "{!readOnly && slot && !slot.disabled && (" in slot)
+    panel_days = read(FE / "energy" / "DayAllocationPanel.tsx")
+    check("day allocation and cycle settings render only from helper flags", "visibility.dayAllocation &&" in dash and "visibility.cycleSettings &&" in dash and "<DayAllocationPanel" in dash)
+    check("member readOnly still hides the cycle editor and manual buttons stay operator-only", "readOnly={readOnly}" in dash and "{!readOnly &&" in panel_days and "data-testid=\"day-apply\"" in panel_days and "{!readOnly && slot && !slot.disabled && (" in slot)
     check("manual commands are unchanged", 'queue(device.id, "set_active_slot", code)' in slot and 'queue(device.id, "off_slot", code)' in slot and 'queue(device.id, "set_days", code' in slot)
     check("meters and actual readings are not gated by AllocationMode", 'data-testid="energy-generation-card"' in read(FE / "energy" / "GenerationCard.tsx") and "allocationMode" not in read(FE / "energy" / "GenerationCard.tsx") and "ACTUAL GENERATION" in wing and "energy-wing-consumption-${w}" in wing and "showGenerationTarget(allocationMode" in wing)
     check("calculation mode select is still only AUTO and MANUAL", 'data-testid="energy-calculation-mode"' in panel and panel.split('data-testid="allocation-mode"')[0].count("DAY_BASED") == 0 and 'export type CalculationMode = "AUTO" | "MANUAL"' in types)
@@ -84,7 +85,7 @@ def main():
     check("backend calculation mode still rejects anything except AUTO and MANUAL", 'if mode not in ("AUTO", "MANUAL")' in backend and "DAY_BASED" not in backend)
     check("calculation-mode migration and AllocationPolicy are unchanged by this mode", "DAY_BASED" not in migration and "CHECK (energy_calculation_mode IN ('AUTO', 'MANUAL'))" in migration and "DAY_BASED" not in policy)
     frontend_hits = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "frontend").rglob("*.ts*") if "DAY_BASED" in read(p))
-    check("DAY_BASED stays in the allocation helper and its selector", frontend_hits == ["frontend/src/components/ops/allocationMode.ts", "frontend/src/components/ops/energy/EnergyPanel.tsx"], ", ".join(frontend_hits))
+    check("DAY_BASED stays in the allocation helper, its selector, and the summary type", frontend_hits == ["frontend/src/components/ops/allocationMode.ts", "frontend/src/components/ops/energy/EnergyPanel.tsx", "frontend/src/components/ops/energy/types.ts"], ", ".join(frontend_hits))
     print("ALLOCATION_MODE_VISIBILITY_OK")
 
 

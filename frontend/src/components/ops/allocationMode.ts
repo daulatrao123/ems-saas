@@ -1,5 +1,5 @@
-// Presentation-only allocation selection. Independent of CalculationMode (AUTO | MANUAL),
-// which remains the consumption data source. This value is not persisted.
+// Allocation presentation. Independent of CalculationMode (AUTO | MANUAL), which remains
+// the consumption data source. The persisted mode arrives from the energy summary.
 export type AllocationMode = "AUTO" | "MANUAL" | "DAY_BASED";
 export const ALLOCATION_MODES = ["AUTO", "MANUAL", "DAY_BASED"] as const;
 export type GenerationTargetVisibility = "show" | "optional" | "hide";

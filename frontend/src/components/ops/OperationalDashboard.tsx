@@ -7,13 +7,13 @@ import { StoragePanel } from "./StoragePanel";
 import { LcdMessagePanel } from "./LcdMessagePanel";
 import { SlotCard, SlotOperations } from "./SlotCard";
 import { SystemControls, ResetDayControl } from "./SystemControls";
-import { UnitAllotment } from "./UnitAllotment";
 import { LastResponse } from "./LastResponse";
 import { OperationalLogs } from "./OperationalLogs";
 import { Confirm, ConfirmDialog } from "./ConfirmDialog";
 import { EnergyPanel } from "./energy/EnergyPanel";
+import { DayAllocationPanel } from "./energy/DayAllocationPanel";
 import { useEnergy } from "./energy/useEnergy";
-import { AllocationMode, allocationVisibility, excessPresentationEnabled } from "./allocationMode";
+import { AllocationMode, allocationVisibility, excessPresentationEnabled, isAllocationMode } from "./allocationMode";
 import { WINGS } from "./energy/types";
 import { SLOT_CODES } from "./types";
 import { DashboardNavigation, SectionHeading } from "./DashboardSections";
@@ -26,11 +26,15 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
   const ops = useOperations(societyId);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [allocationMode, setAllocationMode] = useState<AllocationMode>("AUTO");
+  const [allocationSource, setAllocationSource] = useState("");
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
   const devices = ops.dash?.devices || [];
   const device = devices.find((d) => d.id === selectedDeviceId) || devices[0] || null;
   const energy = useEnergy(societyId, device?.id || null);
   const mode = energy.summary?.calculation?.mode;
+  const reportedMode = energy.summary?.allocation_mode;
+  const source = `${device?.id || ""}:${reportedMode || ""}:${energy.summary?.allocation_mode_version ?? ""}`;
+  if (reportedMode && isAllocationMode(reportedMode) && allocationSource !== source) { setAllocationSource(source); setAllocationMode(reportedMode); }
   const visibility = allocationVisibility(allocationMode);
   const excessEnabled = excessPresentationEnabled(allocationMode, energy.summary?.references?.grid.enabled === true);
   const reportedWing = energy.summary?.generation_meter?.active_generation_wing;
@@ -50,9 +54,9 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
         excessEnabled={excessEnabled} />)}
     </div>
   );
-  const renderDayControls = (inputs: Record<string, ReactNode> = {}) => device && (
+  const renderDayControls = (inputs: Record<string, ReactNode> = {}, hideSenders = false) => device && (
     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-      {WINGS.map((c) => <SlotOperations key={`${device.id}:${c}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} isPending={ops.isPending} readOnly={readOnly}
+      {WINGS.map((c) => <SlotOperations key={`${device.id}:${c}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} isPending={ops.isPending} readOnly={readOnly || hideSenders}
         lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} allotmentInput={inputs[c]} />)}
     </div>
   );
@@ -89,13 +93,13 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
       {!device ? <div className={`${panel} p-8 text-center text-gray-500 font-mono text-sm`}>NO PI DEVICE REGISTERED FOR THIS SOCIETY</div> : (
         <>
           <div data-testid="ops-device-identity" className="mt-5 text-xs text-gray-400 break-words">{device.name} · <span className="font-mono">{device.id}</span></div>
-          {societyId && <EnergyPanel societyId={societyId} societyName={ops.dash.society.name} controllerName={device.name} energy={energy} readOnly={readOnly} activeGenerationWing={activeGenerationWing} allocationMode={allocationMode} onAllocationMode={setAllocationMode} excessEnabled={excessEnabled}>{renderWings()}</EnergyPanel>}
+          {societyId && <EnergyPanel societyId={societyId} societyName={ops.dash.society.name} controllerName={device.name} energy={energy} readOnly={readOnly} activeGenerationWing={activeGenerationWing} allocationMode={allocationMode} onAllocationMode={energy.setAllocationMode} excessEnabled={excessEnabled}>{renderWings()}</EnergyPanel>}
           <section id="ops-controls" data-testid="dashboard-controls" className="ops-section space-y-5">
             <SectionHeading id="controls" number="04" title={readOnly ? "Days & command evidence" : "Controller controls"} context={readOnly ? "Read only" : "Operator actions"} />
-          {visibility.dayAllocation && <details data-testid="allocation-day-controls" className="ops-disclosure">
-            <summary data-testid="days-command-details-toggle" className="text-sm font-medium">Days, unit allotment & wing commands</summary>
-            {readOnly && renderDayControls()}
-            {!readOnly && visibility.cycleSettings && <UnitAllotment key={device.id} device={device} queue={ops.queue} isPending={ops.isPending} ask={setConfirm}>{renderDayControls}</UnitAllotment>}
+          {visibility.dayAllocation && <details data-testid="allocation-day-controls" className="ops-disclosure" open>
+            <summary data-testid="days-command-details-toggle" className="text-sm font-medium">Day allocation</summary>
+            {visibility.cycleSettings && societyId && <DayAllocationPanel societyId={societyId} deviceId={device.id} summary={energy.summary} readOnly={readOnly} refresh={energy.refresh} />}
+            {renderDayControls({}, true)}
           </details>}
           <div className={`grid gap-3 ${readOnly ? "" : "md:grid-cols-2 xl:grid-cols-3"}`}>
               <LastResponse last={last && !SLOT_CODES.includes(last.slot) ? last : null} row={lastRow} />

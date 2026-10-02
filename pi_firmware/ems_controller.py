@@ -850,7 +850,7 @@ class EMSController:
                 days = int(params.get("days"))
             except (TypeError, ValueError):
                 return "INVALID_TARGET_DAYS"
-            return None if 1 <= days <= 31 else "INVALID_TARGET_DAYS"
+            return None if 0 <= days <= 31 else "INVALID_TARGET_DAYS"
         if command == "set_reset_day":
             try:
                 day = int(params.get("day"))
@@ -1278,7 +1278,8 @@ class EMSController:
         try:
             decision = self.energy.evaluate_allocation(
                 system_state=self.state.system_state.value,
-                wings={s: {"ems_enabled": not bool(self.device_config.get("slots", {}).get(s, {}).get("disabled", True))} for s in SUPPORTED_SLOTS},
+                wings={s: {"ems_enabled": not bool(self.device_config.get("slots", {}).get(s, {}).get("disabled", True)),
+                           "target_days": int(self.device_config.get("slots", {}).get(s, {}).get("target_days") or 0)} for s in SUPPORTED_SLOTS},
             )
         except Exception as exc:
             logger.error("Energy allocation evaluation failed: %s", exc)

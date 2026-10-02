@@ -543,7 +543,7 @@ def validate_command(command: str, params: dict, slot: str = "") -> None:
     if command == "set_days":
         try: days = int(params.get("days"))
         except (TypeError, ValueError): raise HTTPException(400, "days must be an integer")
-        if not 1 <= days <= 31: raise HTTPException(400, "days must be 1-31")
+        if not 0 <= days <= 31: raise HTTPException(400, "days must be 0-31")
     if command == "set_reset_day":
         try: day = int(params.get("day"))
         except (TypeError, ValueError): raise HTTPException(400, "day must be an integer")
@@ -1889,7 +1889,7 @@ def pi_command_ack(
                 if cmd["command"] == "set_days":
                     slot = cmd["slot"]
                     days = int((cmd["params"] or {}).get("days", 0))
-                    if slot not in SLOTS or not 1 <= days <= 31:
+                    if slot not in SLOTS or not 0 <= days <= 31:
                         raise HTTPException(409, "Invalid set_days command data", headers={"X-EMS-Ack-Code": "INVALID_COMMAND_DATA"})
                     cur.execute(
                         "UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s",

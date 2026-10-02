@@ -18,7 +18,7 @@ import { SectionHeading } from "../DashboardSections";
 
 export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, children, societyId, societyName, controllerName, allocationMode, onAllocationMode, excessEnabled }: {
   energy: ReturnType<typeof useEnergy>; readOnly: boolean; activeGenerationWing?: string; children: ReactNode; societyId: string; societyName?: string; controllerName?: string;
-  allocationMode: AllocationMode; onAllocationMode: (mode: AllocationMode) => void; excessEnabled: boolean;
+  allocationMode: AllocationMode; onAllocationMode: (mode: AllocationMode) => Promise<boolean> | void; excessEnabled: boolean;
 }) {
   const mode = en.summary?.calculation?.mode;
   const key = `${societyId}:${en.summary?.device_id}:${mode}`;
@@ -40,8 +40,8 @@ export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, childr
           </select>
         </label>
         <label className="block text-xs text-gray-400">Allocation mode
-          <select data-testid="allocation-mode" aria-label="Allocation mode" value={allocationMode}
-            onChange={(e) => { if (isAllocationMode(e.target.value)) onAllocationMode(e.target.value); }} className={`${input} block mt-1 min-w-44`}>
+          <select data-testid="allocation-mode" aria-label="Allocation mode" value={allocationMode} disabled={readOnly || en.loading || en.saving}
+            onChange={(e) => { if (isAllocationMode(e.target.value)) void onAllocationMode(e.target.value); }} className={`${input} block mt-1 min-w-44`}>
             <option value="AUTO">AUTO</option><option value="MANUAL">MANUAL</option><option value="DAY_BASED">DAY BASED</option>
           </select>
         </label>

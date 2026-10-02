@@ -2,6 +2,7 @@
 RBAC: super_admin (any society) / society_admin (own society) write; member read-only (own society)."""
 import math
 import calendar
+import uuid
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,10 +16,25 @@ from .operating_dates import date_problem, require_qualified_open
 from .target_delivery import reconcile_targets, delivery_view
 from .commissioning import check_expected, basis_hash, register_problems
 from .ingest import DEFAULT_ALLOCATION, METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
+from . import day_allocation as DA
 
 VALUE_TYPES = {"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64"}
 KINDS = {"MANUAL_GENERATION", "MANUAL_CONSUMPTION", "ACCOUNTING"}
 WRITE_ROLES = {"super_admin", "society_admin"}
+
+
+def _day_allocation_view(cur, device_id, raw, today, reset_day):
+    start, end = DA.period_bounds(today, reset_day)
+    view = {"cycle_days": DA.cycle_length(today, reset_day), "period_start": start.isoformat(),
+            "period_end_exclusive": end.isoformat(), "reset_day": int(reset_day), "desired": raw, "application": None}
+    batch = raw.get("batch_id") if isinstance(raw, dict) else None
+    if not batch:
+        return view
+    cur.execute("SELECT slot, status FROM pi_commands WHERE allocation_batch_id=%s ORDER BY sequence_no", (batch,))
+    rows = cur.fetchall()
+    view["application"] = {"batch_id": str(batch), "status": DA.application_status(rows),
+                           "commands": [{"slot": row["slot"], "status": row["status"]} for row in rows]}
+    return view
 
 
 def validate_register_map(rmap):
@@ -67,6 +83,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         did = require_uuid(device_id, "device_id")
         cur.execute("""SELECT d.id, d.energy_bus, d.energy_config_version,
                               d.energy_calculation_mode, d.energy_calculation_version,
+                              d.allocation_mode, d.allocation_mode_version, d.day_allocation,
                               d.grid_export_enabled, d.grid_export_limit_kwh, d.grid_reference_version,
                               COALESCE(s.reset_day, 15) AS reset_day
                        FROM pi_devices d JOIN societies s ON s.id=d.society_id WHERE d.id=%s AND d.society_id=%s""" + (" FOR UPDATE OF d" if lock else ""), (did, sid))
@@ -273,6 +290,85 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             return {"success": True, "device_id": did, "mode": mode, "version": version}
         return run(fn, write=True)
 
+    @router.put("/allocation-mode")
+    def put_allocation_mode(data: dict, user: dict = Depends(get_current_user)):
+        sid = access(user, data.get("society_id"), write=True)
+        try:
+            mode = DA.parse_mode(data.get("mode"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        expected = data.get("expected_version")
+        if type(expected) is not int or expected < 0:
+            raise HTTPException(400, "expected_version must be a non-negative integer")
+        def fn(cur):
+            did = str(device(cur, sid, data.get("device_id"), ensure_meters=False, lock=True)["id"])
+            cur.execute("SELECT allocation_mode, allocation_mode_version FROM pi_devices WHERE id=%s FOR UPDATE", (did,))
+            current = cur.fetchone()
+            previous, version = current["allocation_mode"], current["allocation_mode_version"]
+            if expected != version:
+                raise HTTPException(409, "Allocation mode changed; refresh before saving")
+            if mode != previous:
+                cur.execute("""UPDATE pi_devices SET allocation_mode=%s,
+                               allocation_mode_version=allocation_mode_version+1,
+                               energy_config_version=energy_config_version+1
+                               WHERE id=%s RETURNING allocation_mode_version""", (mode, did))
+                version = cur.fetchone()["allocation_mode_version"]
+                log_audit(cur, user, sid, "ALLOCATION_MODE", {"device_id": did, "previous_mode": previous, "mode": mode, "version": version})
+            return {"success": True, "device_id": did, "mode": mode, "version": version}
+        return run(fn, write=True)
+
+    @router.post("/day-allocation/calculate")
+    def calculate_day_allocation(data: dict, user: dict = Depends(get_current_user)):
+        sid = access(user, data.get("society_id"), write=True)
+        def fn(cur):
+            dev = device(cur, sid, data.get("device_id"), ensure_meters=False)
+            did = str(dev["id"])
+            today = Q.device_today(cur, did, datetime.now(timezone.utc).date(), now=datetime.now(timezone.utc))
+            length = DA.cycle_length(today, dev["reset_day"])
+            cur.execute("SELECT slot, disabled FROM slot_configs WHERE device_id=%s", (did,))
+            enabled = [row["slot"] for row in cur.fetchall() if row["disabled"] is False]
+            try:
+                days = DA.resolve_days(str(data.get("type") or ""), data.get("wings") or {}, enabled, length)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            return {"device_id": did, "type": data.get("type"), "cycle_days": length, "reset_day": dev["reset_day"], "days": days, "enabled_wings": enabled}
+        return run(fn)
+
+    @router.post("/day-allocation/apply")
+    def apply_day_allocation(data: dict, user: dict = Depends(get_current_user)):
+        sid = access(user, data.get("society_id"), write=True)
+        idem = data.get("idempotency_key")
+        if not isinstance(idem, str) or not idem.strip():
+            raise HTTPException(400, "idempotency_key is required")
+        idem = idem.strip()[:100]
+        def fn(cur):
+            dev = device(cur, sid, data.get("device_id"), ensure_meters=False, lock=True)
+            did = str(dev["id"])
+            if (dev.get("allocation_mode") or "AUTO") != DA.DAY_MODE:
+                raise HTTPException(409, "Allocation mode must be the calendar day mode")
+            today = Q.device_today(cur, did, datetime.now(timezone.utc).date(), now=datetime.now(timezone.utc))
+            length = DA.cycle_length(today, dev["reset_day"])
+            cur.execute("SELECT slot, disabled FROM slot_configs WHERE device_id=%s", (did,))
+            enabled = [row["slot"] for row in cur.fetchall() if row["disabled"] is False]
+            try:
+                days = DA.resolve_days(str(data.get("type") or ""), data.get("wings") or {}, enabled, length)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            cur.execute("""SELECT id, slot, sequence_no, allocation_batch_id FROM pi_commands
+                           WHERE device_id=%s AND idempotency_key=%s""", (did, f"{idem}:{enabled[0]}"))
+            existing = cur.fetchone()
+            if existing:
+                return {"success": True, "status": "APPLYING", "duplicate": True, "batch_id": str(existing["allocation_batch_id"]), "device_id": did}
+            batch_id = str(uuid.uuid4())
+            now = datetime.now(timezone.utc)
+            commands = DA.queue_set_days(cur, did, days, batch_id, idem, now)
+            desired = {"type": data.get("type"), "input": data.get("wings"), "days": days, "cycle_days": length,
+                       "batch_id": batch_id, "idempotency_key": idem}
+            cur.execute("UPDATE pi_devices SET day_allocation=%s WHERE id=%s", (Json(desired), did))
+            log_audit(cur, user, sid, "DAY_ALLOCATION_APPLY", {"device_id": did, "batch_id": batch_id, "days": days, "cycle_days": length})
+            return {"success": True, "status": "APPLYING", "duplicate": False, "batch_id": batch_id, "device_id": did, "commands": commands, "days": days}
+        return run(fn, write=True)
+
     # ---------------------------------------------------------------- summary
     @router.get("/summary")
     def summary(society_id: str, device_id: str, user: dict = Depends(get_current_user)):
@@ -320,6 +416,9 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                     "manual_generation_operating_date": pi_today.isoformat() if pi_today is not None else None,
                     "generation_meter": generation_meter, "wings": wings,
                     "calculation": Q.calculation_view(cur, did, dev["energy_calculation_mode"], dev["energy_calculation_version"], meters, today),
+                    "allocation_mode": dev.get("allocation_mode") or "AUTO",
+                    "allocation_mode_version": dev.get("allocation_mode_version") if isinstance(dev.get("allocation_mode_version"), int) else 0,
+                    "day_allocation": _day_allocation_view(cur, did, dev.get("day_allocation"), today, dev["reset_day"]),
                     "references": R.overview(cur, dev, meters, today, calendar_today=calendar_today)}
         return run(fn)
 

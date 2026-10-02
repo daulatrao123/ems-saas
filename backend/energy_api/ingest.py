@@ -162,7 +162,7 @@ def _ingest(cur, device_id, energy, now):
 def build_energy_config(cur, device_id, now=None, *, reported_version=None):
     """Backend-authoritative config for the Pi: {"version", "bus", "meters": {Mx: {...}}}."""
     now = utc_now(now)
-    cur.execute("SELECT energy_bus, energy_config_version, energy_allocation FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
+    cur.execute("SELECT energy_bus, energy_config_version, energy_allocation, allocation_mode FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
     dev = cur.fetchone()
     if not dev:
         return None
@@ -191,7 +191,7 @@ def build_energy_config(cur, device_id, now=None, *, reported_version=None):
                                  "ct_ratio": _num(r["ct_ratio"]), "max_kw": _num(r["max_kw"])}
     allocation = dev["energy_allocation"] or DEFAULT_ALLOCATION
     return {"version": version, "bus": dev["energy_bus"] or {}, "meters": meters,
-            "allocation": allocation, "targets": targets}
+            "allocation": allocation, "allocation_mode": dev.get("allocation_mode") or "AUTO", "targets": targets}
 
 
 def config_reply(cur, device_id, energy, now=None):

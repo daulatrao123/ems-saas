@@ -59,7 +59,7 @@ export function SlotOperations({ device, code, slot, queue, isPending, readOnly,
   const [days, setDays] = useState(String(slot?.target_days ?? ""));
   const [seenTarget, setSeenTarget] = useState(slot?.target_days);
   if (seenTarget !== slot?.target_days) { setSeenTarget(slot?.target_days); setDays(String(slot?.target_days ?? "")); }
-  const n = Number(days); const validDays = Number.isInteger(n) && n >= 1 && n <= 31;
+  const n = Number(days); const validDays = Number.isInteger(n) && n >= 0 && n <= 31;
   const used = numberOrNull(slot?.used_days), target = numberOrNull(slot?.target_days);
   const remaining = target != null && used != null ? Math.max(0, target - used) : null;
   const busyDays = isPending(device.id, "set_days", code);
@@ -75,7 +75,7 @@ export function SlotOperations({ device, code, slot, queue, isPending, readOnly,
       {!readOnly && slot && !slot.disabled && (
         <div className="flex items-center gap-2 border-t border-[#1e2a3a] pt-3">
           <span className={label}>Days</span>
-          <input data-testid={`slot-days-input-${code}`} type="number" min={1} max={31} value={days} onChange={(e) => setDays(e.target.value)} className={`${input} w-16 text-center`} />
+          <input data-testid={`slot-days-input-${code}`} type="number" min={0} max={31} value={days} onChange={(e) => setDays(e.target.value)} className={`${input} w-16 text-center`} />
           <button data-testid={`slot-days-submit-${code}`} disabled={busyDays || !validDays || n === target} onClick={() => queue(device.id, "set_days", code, { days: n })} className={`${btn} ${tone.amber} flex-1`}>{busyDays ? "SENDING…" : "SET DAYS"}</button>
         </div>
       )}
