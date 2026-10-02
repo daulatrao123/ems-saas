@@ -5,15 +5,16 @@ import { QueueFn, SlotConfigFn } from "./useOperations";
 import { btn, input, label, panel, tone } from "./DashboardHeader";
 import { LastResponse } from "./LastResponse";
 import { WingEnergyCard } from "./energy/WingEnergyCard";
+import { AllocationMode } from "./allocationMode";
 import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary } from "./energy/types";
 
 type Props = { device: Device; code: WingCode; slot?: Slot; queue: QueueFn; setSlotConfig: SlotConfigFn; isPending: (d: string, c: string, s?: string) => boolean; readOnly: boolean;
   lastCmd?: CommandRow; lastResponse?: Response | null; wing?: WingSummary; allocation: AllocationConfig | null; activeGenerationWing?: string; allotmentInput?: ReactNode;
-  mode?: CalculationMode; comparison?: ComparisonSeries; excessEnabled?: boolean };
+  mode?: CalculationMode; allocationMode: AllocationMode; manualControlLabel: string; comparison?: ComparisonSeries; excessEnabled?: boolean };
 const telemetry = (v: string | undefined, offline: boolean) => offline ? "UNKNOWN (offline)" : v === "ON" || v === "OFF" ? v : "UNKNOWN";
 const numberOrNull = (v: number | undefined) => v != null && Number.isFinite(v) ? v : null;
 
-export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, readOnly, wing, allocation, activeGenerationWing, mode, comparison, excessEnabled = false }: Props) {
+export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, readOnly, wing, allocation, activeGenerationWing, mode, allocationMode, manualControlLabel, comparison, excessEnabled = false }: Props) {
   const active = device.active_slot === code;
   const state = !slot || typeof slot.disabled !== "boolean" ? "UNAVAILABLE" : slot.disabled ? "DISABLED" : active ? "ACTIVE" : "INACTIVE";
   const stateTone = slot?.disabled ? "text-gray-500 border-gray-700" : active ? "text-emerald-300 border-emerald-500/50 bg-emerald-500/10" : "text-gray-300 border-[#2a3646]";
@@ -34,10 +35,11 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
         <dt className="text-gray-500">CONTACTOR</dt><dd data-testid={`slot-physical-${code}`} className={contactor === "ON" ? "text-emerald-300" : "text-gray-400"}>{contactor}</dd>
       </dl>
       {slot?.disabled && <div data-testid={`slot-exclusion-${code}`} className="text-xs leading-relaxed text-gray-400 border-t border-dashed border-gray-700 pt-3">Disabled logical wing · excluded from society consumption</div>}
-      {slot?.disabled ? <details data-testid={`slot-disabled-data-${code}`} className="ops-disclosure"><summary data-testid={`slot-disabled-data-toggle-${code}`} className="text-xs">Energy data & bill history</summary><WingEnergyCard code={code} wing={wing} mode={mode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={undefined} /></details>
-        : <WingEnergyCard code={code} wing={wing} mode={mode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={device.feedback_hardware_installed === true && !device.hardware_fault && slot?.feedback_enabled !== false ? activeGenerationWing : undefined} />}
+      {slot?.disabled ? <details data-testid={`slot-disabled-data-${code}`} className="ops-disclosure"><summary data-testid={`slot-disabled-data-toggle-${code}`} className="text-xs">Energy data & bill history</summary><WingEnergyCard code={code} wing={wing} mode={mode} allocationMode={allocationMode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={undefined} /></details>
+        : <WingEnergyCard code={code} wing={wing} mode={mode} allocationMode={allocationMode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={device.feedback_hardware_installed === true && !device.hardware_fault && slot?.feedback_enabled !== false ? activeGenerationWing : undefined} />}
       {!readOnly && slot && !slot.disabled && (
-        <div className="grid grid-cols-2 gap-2">
+        <div data-testid={`manual-control-${code}`} className="grid grid-cols-2 gap-2">
+          <span data-testid={`manual-control-label-${code}`} className={`${label} col-span-2`}>{manualControlLabel}</span>
           <button data-testid={`cmd-set_active_slot-${device.id}-${code}`} disabled={active || busyAct} onClick={() => queue(device.id, "set_active_slot", code)} className={`${btn} ${tone.cyan}`}>{busyAct ? "EXECUTING…" : "ACTIVATE"}</button>
           <button data-testid={`cmd-off_slot-${device.id}-${code}`} disabled={!active || busyOff} onClick={() => queue(device.id, "off_slot", code)} className={`${btn} ${tone.red}`}>{busyOff ? "EXECUTING…" : "DEACTIVATE"}</button>
         </div>

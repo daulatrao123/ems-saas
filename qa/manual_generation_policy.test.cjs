@@ -100,6 +100,18 @@ function createManualGenerationHarness() {
   return { mount, loadComponent };
 }
 
+function loadAllocationModeModule() {
+  const full = path.join(__dirname, "..", "frontend", "src", "components", "ops", "allocationMode.ts");
+  const source = fs.readFileSync(full, "utf8");
+  const out = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
+    fileName: "allocationMode.ts",
+  }).outputText;
+  const compiled = { exports: {} };
+  vm.runInNewContext(out, { module: compiled, exports: compiled.exports, require(id) { throw new Error(`Unexpected import: ${id}`); }, console }, { filename: "allocationMode.compiled.cjs" });
+  return compiled.exports;
+}
+
 function loadEnergyPanel() {
   const tsxPath = path.join(__dirname, "..", "frontend", "src", "components", "ops", "energy", "EnergyPanel.tsx");
   const source = fs.readFileSync(tsxPath, "utf8");
@@ -125,6 +137,7 @@ function loadEnergyPanel() {
     if (id === "./ClockQualificationNotice") return { ClockQualificationNotice: () => null };
     if (id === "./TargetDeliveryStatus") return { TargetDeliveryStatus: () => null };
     if (id === "../DashboardSections") return { SectionHeading: () => null };
+    if (id === "../allocationMode") return loadAllocationModeModule();
     throw new Error(`Unexpected import: ${id}`);
   };
   vm.runInNewContext(out, { module, exports: module.exports, require: req, console }, { filename: "EnergyPanel.compiled.cjs" });

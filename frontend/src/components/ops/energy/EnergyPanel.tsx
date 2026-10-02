@@ -3,6 +3,7 @@ import { ReactNode, useState } from "react";
 import { btn, input, label, panel, tone } from "../DashboardHeader";
 import { AllocationTimeline } from "./AllocationTimeline";
 import { GenerationCard } from "./GenerationCard";
+import { AllocationMode, isAllocationMode } from "../allocationMode";
 import { CalculationMode } from "./types";
 import { useEnergy } from "./useEnergy";
 import { EnergyReferences } from "./EnergyReferences";
@@ -15,8 +16,9 @@ import { ClockQualificationNotice } from "./ClockQualificationNotice";
 import { TargetDeliveryStatus } from "./TargetDeliveryStatus";
 import { SectionHeading } from "../DashboardSections";
 
-export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, children, societyId, societyName, controllerName }: {
+export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, children, societyId, societyName, controllerName, allocationMode, onAllocationMode, excessEnabled }: {
   energy: ReturnType<typeof useEnergy>; readOnly: boolean; activeGenerationWing?: string; children: ReactNode; societyId: string; societyName?: string; controllerName?: string;
+  allocationMode: AllocationMode; onAllocationMode: (mode: AllocationMode) => void; excessEnabled: boolean;
 }) {
   const mode = en.summary?.calculation?.mode;
   const key = `${societyId}:${en.summary?.device_id}:${mode}`;
@@ -37,6 +39,12 @@ export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, childr
             <option value="AUTO">AUTO MODE</option><option value="MANUAL">MANUAL MODE</option>
           </select>
         </label>
+        <label className="block text-xs text-gray-400">Allocation mode
+          <select data-testid="allocation-mode" aria-label="Allocation mode" value={allocationMode}
+            onChange={(e) => { if (isAllocationMode(e.target.value)) onAllocationMode(e.target.value); }} className={`${input} block mt-1 min-w-44`}>
+            <option value="AUTO">AUTO</option><option value="MANUAL">MANUAL</option><option value="DAY_BASED">DAY BASED</option>
+          </select>
+        </label>
         <div data-testid="energy-as-of" className={label}>Energy · {en.summary ? `as of ${en.summary.as_of_operating_date}` : "UNAVAILABLE"}</div>
         <button data-testid="energy-refresh" disabled={en.saving || en.loading} onClick={() => { selectMonth(month); void en.refresh(); }} className={`${btn} ${tone.gray}`}>{en.loading ? "LOADING…" : "REFRESH"}</button>
       </div>
@@ -53,11 +61,11 @@ export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, childr
       {calendar.error && <div data-testid="calendar-comparison-error" role="alert" className="text-xs text-red-300">{calendar.error}</div>}
       {calendar.loading && <div data-testid="calendar-comparison-loading" role="status" className="text-xs text-gray-400">Loading {month} daily values…</div>}
       {children}
-      {month ? calendar.data && <CalendarSocietyComparison data={calendar.data} excessEnabled={en.summary?.references?.grid.enabled === true} /> : <SocietyEnergyComparison key={en.summary?.device_id} data={en.comparison} excessEnabled={en.summary?.references?.grid.enabled === true} />}
+      {month ? calendar.data && <CalendarSocietyComparison data={calendar.data} excessEnabled={excessEnabled} /> : <SocietyEnergyComparison key={en.summary?.device_id} data={en.comparison} excessEnabled={excessEnabled} />}
       {en.summary && <AllocationTimeline events={en.events} operatingDate={en.summary.as_of_operating_date} />}
     </section>
   );
   return <CalendarComparisonContext.Provider value={{ month, ...calendar, operatingDate: en.summary?.as_of_operating_date }}>
-    {en.summary?.references ? <EnergyReferences key={`${en.summary.device_id}:${mode}`} societyId={societyId} societyName={societyLabel} controllerName={controllerLabel} summary={en.summary} readOnly={readOnly} refresh={en.refresh} onSavedMonth={savedMonth}>{content}</EnergyReferences> : <>{content}<section id="ops-references" data-testid="references-unavailable" className="ops-section"><SectionHeading id="references" number="03" title="Baselines & calculation references" context="UNAVAILABLE" /></section></>}
+    {en.summary?.references ? <EnergyReferences key={`${en.summary.device_id}:${mode}`} societyId={societyId} societyName={societyLabel} controllerName={controllerLabel} summary={en.summary} readOnly={readOnly} refresh={en.refresh} onSavedMonth={savedMonth} excessEnabled={excessEnabled}>{content}</EnergyReferences> : <>{content}<section id="ops-references" data-testid="references-unavailable" className="ops-section"><SectionHeading id="references" number="03" title="Baselines & calculation references" context="UNAVAILABLE" /></section></>}
   </CalendarComparisonContext.Provider>;
 }

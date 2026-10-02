@@ -16,3 +16,5 @@ memory/
 test_reports/
 .pytest_cache/
 .ruff_cache/
+
+.venv/

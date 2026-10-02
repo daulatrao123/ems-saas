@@ -38,6 +38,18 @@ function byTestId(tree, testId) {
   return found;
 }
 
+function loadAllocationModeModule() {
+  const full = path.join(__dirname, "..", "frontend", "src", "components", "ops", "allocationMode.ts");
+  const source = fs.readFileSync(full, "utf8");
+  const out = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
+    fileName: "allocationMode.ts",
+  }).outputText;
+  const compiled = { exports: {} };
+  vm.runInNewContext(out, { module: compiled, exports: compiled.exports, require(id) { throw new Error(`Unexpected import: ${id}`); }, console }, { filename: "allocationMode.compiled.cjs" });
+  return compiled.exports;
+}
+
 function loadTsx(relPath, exportName, mocks = {}) {
   const full = path.join(__dirname, "..", relPath);
   const source = fs.readFileSync(full, "utf8");
@@ -102,6 +114,7 @@ function loadTsx(relPath, exportName, mocks = {}) {
       missingReason: loadTsx("frontend/src/components/ops/energy/comparisonLabels.ts", "missingReason"),
       monthLabel: loadTsx("frontend/src/components/ops/energy/comparisonLabels.ts", "monthLabel"),
     };
+    if (id === "../allocationMode") return loadAllocationModeModule();
     throw new Error(`Unexpected import: ${id}`);
   };
   vm.runInNewContext(out, { module, exports: module.exports, require: req, console, URLSearchParams, AbortController, setInterval: () => 1, clearInterval: () => {} }, { filename: `${exportName}.compiled.cjs` });

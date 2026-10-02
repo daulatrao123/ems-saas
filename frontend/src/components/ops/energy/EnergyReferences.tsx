@@ -8,8 +8,8 @@ import { dailyRate, referenceSource } from "./referenceTypes";
 import { ConsumptionScopeLabel } from "./ConsumptionScopeLabel";
 import { SectionHeading } from "../DashboardSections";
 
-export function EnergyReferences({ societyId, societyName, controllerName, summary, readOnly, refresh, onSavedMonth, children }: {
-  societyId: string; societyName: string; controllerName: string; summary: EnergySummary; readOnly: boolean; refresh: () => void; onSavedMonth: (month: string) => void; children: ReactNode;
+export function EnergyReferences({ societyId, societyName, controllerName, summary, readOnly, refresh, onSavedMonth, excessEnabled, children }: {
+  societyId: string; societyName: string; controllerName: string; summary: EnergySummary; readOnly: boolean; refresh: () => void; onSavedMonth: (month: string) => void; excessEnabled: boolean; children: ReactNode;
 }) {
   const [editor, setEditor] = useState<WingCode | null>(null);
   const data = summary.references;
@@ -36,7 +36,7 @@ export function EnergyReferences({ societyId, societyName, controllerName, summa
       </div>
     </details>
     <div data-testid="allocation-reference-operating-date" className="text-xs text-gray-400">Allocation / Grid reference date: {summary.as_of_operating_date} · Pi operating day</div>
-    <GridReferencePanel key={`${summary.device_id}:${data.grid.version}`} societyId={societyId} deviceId={summary.device_id} grid={data.grid} allocation={data.allocation} readOnly={readOnly} onSaved={refresh} />
+    <GridReferencePanel key={`${summary.device_id}:${data.grid.version}`} societyId={societyId} deviceId={summary.device_id} grid={data.grid} allocation={data.allocation} readOnly={readOnly} onSaved={refresh} excessEnabled={excessEnabled} />
     </section>
     {editor && <BillHistoryDialog societyId={societyId} societyName={societyName} controllerName={controllerName} operatingDate={summary.as_of_operating_date} deviceId={summary.device_id} initialWing={editor} data={data} readOnly={readOnly} onClose={() => setEditor(null)} onSavedMonth={onSavedMonth} />}
   </BillHistoryContext.Provider>;

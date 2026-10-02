@@ -6,8 +6,8 @@ import { errorText } from "../types";
 import { AllocationReference, GridReference, dailyRate } from "./referenceTypes";
 import { fmtKwh } from "./types";
 
-export function GridReferencePanel({ societyId, deviceId, grid, allocation: a, readOnly, onSaved }: {
-  societyId: string; deviceId: string; grid: GridReference; allocation: AllocationReference; readOnly: boolean; onSaved: () => void;
+export function GridReferencePanel({ societyId, deviceId, grid, allocation: a, readOnly, onSaved, excessEnabled }: {
+  societyId: string; deviceId: string; grid: GridReference; allocation: AllocationReference; readOnly: boolean; onSaved: () => void; excessEnabled: boolean;
 }) {
   const [enabled, setEnabled] = useState(grid.enabled), [limit, setLimit] = useState(grid.limit_kwh_day === null ? "" : String(grid.limit_kwh_day));
   const [busy, setBusy] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState("");
@@ -44,7 +44,7 @@ export function GridReferencePanel({ societyId, deviceId, grid, allocation: a, r
         </div>)}</div>
         <div data-testid="quota-completion" className="text-cyan-200">All required quotas satisfied? {a.all_quotas_satisfied ? "YES" : a.all_quotas_known && a.generation_kwh !== null ? "NO" : "UNAVAILABLE"}</div>
         <div data-testid="quota-total-unmet" className="text-amber-300">Total unmet: {fmtKwh(a.unmet_kwh)}</div>
-      {grid.enabled && <><div aria-hidden="true" className="text-gray-600">↓</div><div data-testid="allocation-excess" className="flex justify-between gap-3"><span>Excess · calculated reference</span><span>{fmtKwh(a.excess_kwh)}</span></div>
+      {excessEnabled && <><div aria-hidden="true" className="text-gray-600">↓</div><div data-testid="allocation-excess" className="flex justify-between gap-3"><span>Excess · calculated reference</span><span>{fmtKwh(a.excess_kwh)}</span></div>
       <div aria-hidden="true" className="text-gray-600">↓</div><div data-testid="allocation-grid" className="flex justify-between gap-3 text-cyan-200"><span>Grid · calculated reference</span><span>{fmtKwh(a.grid_allocation_kwh)}</span></div></>}
       <div data-testid="allocation-grid-status" className="text-gray-400 break-words">{a.status} · {a.reason.replaceAll("_", " ")}</div>
       <div data-testid="allocation-reference-provenance" className="text-gray-500">Reference allocation · not live dispatch</div>
