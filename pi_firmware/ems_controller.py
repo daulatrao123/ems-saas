@@ -40,6 +40,7 @@ from offline_queue import OfflineQueue
 from gpio_manager import GPIOManager
 from api_client import ApiClient
 import ota_manager
+import firmware_release
 import config as _cfg
 from smart_health import SmartHealthMonitor
 from energy import EnergyEngine
@@ -149,6 +150,7 @@ class EMSController:
         self.firmware_version = ota_manager.running_version(FIRMWARE_VERSION)
         self._boot_confirmed = False
         self._ota_requested = None
+        self._ota_manifest = None
         self._restart_for_ota = False
         self._restart_requested = False   # `restart` command: exit(3) -> systemd restarts us
         self._reboot_requested = False    # `reboot` command: marker -> root path unit reboots OS
@@ -637,12 +639,14 @@ class EMSController:
         return {
             "deviceId": DEVICE_ID,
             "firmwareVersion": self.firmware_version,
+            "otaAgent": firmware_release.AGENT,
             # Signed OTA state (RAM cache refreshed on OTA events only).
             "otaState": self._ota_status.get("state"),
             "otaVersion": self._ota_status.get("version"),
             "otaError": self._ota_status.get("error"),
             "otaAttempts": self._ota_status.get("attempts", 0),
             "lastGoodFirmwareVersion": self._ota_status.get("last_good"),
+            "otaOperationId": self._ota_status.get("operation_id"),
             "flashBytesToday": int(
                 resource_status.get("storage", {}).get("logical_writes", 0) or 0
             ),
@@ -778,9 +782,24 @@ class EMSController:
             "error": pending.get("error"),
             "attempts": int(pending.get("attempts", 0) or 0),
             "last_good": active.get("previous_version") or self.firmware_version,
+            "operation_id": pending.get("operation_id"),
         }
 
     def _consider_firmware(self, response: dict):
+        offer = response.get("ota")
+        if isinstance(offer, dict):
+            operation_id = str(offer.get("operation_id") or "")
+            desired = str(offer.get("firmware_version") or "").strip()
+            pending = ota_manager.pending_info()
+            if not operation_id or not desired or desired == self.firmware_version or self._restart_for_ota or not self._boot_confirmed:
+                return
+            if pending.get("operation_id") == operation_id and pending.get("state") in ("VERIFYING", "STAGED", "ACTIVATING", "HEALTH_CHECK"):
+                return
+            if ota_manager.exhausted(desired):
+                return
+            self._ota_manifest = offer.get("manifest") if isinstance(offer.get("manifest"), dict) else None
+            self._ota_requested = desired
+            return
         desired = response.get("firmware_desired_version")
         if not isinstance(desired, str) or not desired.strip():
             return
@@ -791,6 +810,7 @@ class EMSController:
             return  # bounded: MAX_ATTEMPTS_PER_VERSION failures -> wait for a new release
         if not self._boot_confirmed:
             return  # never chain an OTA onto an unconfirmed boot
+        self._ota_manifest = None
         self._ota_requested = desired
 
     def _run_ota_if_requested(self):
@@ -802,10 +822,11 @@ class EMSController:
         if self.state.system_state != SystemState.READY:
             return
         try:
-            manifest = self.api.download_firmware(version)
+            manifest = getattr(self, "_ota_manifest", None) or self.api.download_firmware(version)
+            self._ota_manifest = None
             if manifest is None:
                 raise ota_manager.OTAVerificationError("DOWNLOAD_FAILED")
-            ota_manager.stage_signed_firmware(manifest, self.firmware_version)
+            ota_manager.stage_signed_firmware(manifest, self.firmware_version, self.device_config.get("hardware_profile") or "EMS-4CH-v1")
             if not ota_manager.activate_staged(self.firmware_version):
                 raise ota_manager.OTAVerificationError("ACTIVATION_FAILED")
         except ota_manager.OTAVerificationError as exc:
@@ -956,7 +977,14 @@ class EMSController:
             self._store_lcd_message(response.get("lcd_message"))
 
         # OTA health check = boot() succeeded AND cloud sync succeeded on this firmware.
+        # Schema 1 also requires the staged release files to compile. No relay is energized.
         if not self._boot_confirmed:
+            healthy, reason = ota_manager.release_health(self.firmware_version)
+            if not healthy:
+                ota_manager.fail_health(reason)
+                self._ota_status = self._read_ota_status()
+                self.running = False
+                return False
             self._boot_confirmed = True
             if ota_manager.confirm_boot():
                 self.firmware_version = ota_manager.running_version(FIRMWARE_VERSION)

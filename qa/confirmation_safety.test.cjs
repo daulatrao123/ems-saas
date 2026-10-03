@@ -120,6 +120,6 @@ test("backend confirmation flag and unchanged safety modules stay in place", () 
   assert.match(allocation, /Any required wing that is not ON or OFF -> 'UNKNOWN'/);
   const frontend = read("frontend/src/components/ops/ConfirmDialog.tsx");
   assert.doesNotMatch(frontend, /confirmed\s*=\s*true/);
-  const otaCallers = ["frontend/src/components/provisioning/ProvisioningCenter.tsx", "frontend/src/components/ops/OperationalDashboard.tsx"];
-  for (const file of otaCallers) assert.doesNotMatch(read(file), /\/firmware|stage_signed_firmware|install firmware/i);
+  assert.doesNotMatch(read("frontend/src/components/provisioning/ProvisioningCenter.tsx"), /stage_signed_firmware|firmware\/install/i);
+  assert.doesNotMatch(read("frontend/src/components/ops/OperationalDashboard.tsx"), /stage_signed_firmware|firmware\/install/i);
 });

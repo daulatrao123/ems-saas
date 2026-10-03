@@ -53,6 +53,7 @@ FIRMWARE_FILES = (
     "memory_manager.py",
     "offline_queue.py",
     "ota_manager.py",
+    "firmware_release.py",
     "resource_guard.py",
     "smart_health.py",
     "state.py",

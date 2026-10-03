@@ -6,6 +6,7 @@ import { OpsShell, useRoleSession } from "@/components/ops/OpsShell";
 import { Dot, btn, label, panel, tone } from "@/components/ops/DashboardHeader";
 import { DeviceStateBadges } from "@/components/StateBadges";
 import { CreateSocietyForm, CreateUserForm } from "@/components/provisioning/SuperAdminForms";
+import { FirmwareReleases } from "@/components/provisioning/FirmwareReleases";
 
 type Device = { id: string; name: string; online: boolean; slots?: Record<string, unknown>; config_state?: string | null; ota_state?: string | null; storage_state?: string | null };
 type Society = { id: number; name: string; location: string; status?: string; pi_online: boolean; devices?: Device[] };
@@ -45,6 +46,7 @@ export default function SuperAdminDashboard() {
         <CreateSocietyForm onCreated={() => load()} />
         <CreateUserForm societies={active.map((s) => ({ id: s.id, name: s.name }))} />
       </div>
+      <div className="mb-6"><FirmwareReleases /></div>
       <div className={`${label} mb-2`}>Active societies</div>
       <div data-testid="active-societies" className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">{active.map((s) => <SocietyCard key={s.id} s={s} retired={false} />)}{!active.length && <div className="text-gray-500">No active societies.</div>}</div>
       {retired.length > 0 && (

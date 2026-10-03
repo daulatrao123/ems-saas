@@ -205,7 +205,7 @@ class ApiClient:
             )
             if response.status_code != 200:
                 return None
-            if len(response.content) > 3 * 1024 * 1024:
+            if len(response.content) > 8 * 1024 * 1024:
                 return None
             data = response.json()
             return data if isinstance(data, dict) else None

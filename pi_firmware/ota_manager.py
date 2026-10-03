@@ -118,9 +118,11 @@ def _atomic_json(path: Path, value: dict):
             json.dump(value, f, separators=(",", ":"), sort_keys=True)
             f.flush(); os.fsync(f.fileno())
         os.replace(tmp, path)
-        dfd = os.open(path.parent, os.O_DIRECTORY)
-        try: os.fsync(dfd)
-        finally: os.close(dfd)
+        dir_flag = getattr(os, "O_DIRECTORY", None)
+        if dir_flag is not None:
+            dfd = os.open(path.parent, dir_flag)
+            try: os.fsync(dfd)
+            finally: os.close(dfd)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
 
@@ -167,9 +169,12 @@ def exhausted(version: str) -> bool:
 
 # ---------------------------------------------------------------- staging / activation
 
-def stage_signed_firmware(manifest: dict, running: str) -> str:
+def stage_signed_firmware(manifest: dict, running: str, hardware_profile: str = "EMS-4CH-v1") -> str:
     """verify -> write inactive slot (temp dir, fsync, atomic rename) -> pending STAGED.
-    Never touches the active slot; activation is a separate explicit step."""
+    Never touches the active slot; activation is a separate explicit step.
+    schema_version 1 is a multi-file release. Older manifests stay single-file."""
+    if isinstance(manifest, dict) and manifest.get("schema_version") == 1:
+        return stage_multifile_release(manifest, running, hardware_profile)
     fields = verify_manifest(manifest, running)
     version = fields["version"]
     OTA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -208,8 +213,111 @@ def activate_staged(running: str = "") -> bool:
     if not (slot / "ems_controller.py").exists():
         return False
     _atomic_json(PENDING, {**p, "state": "ACTIVATING"})
-    _atomic_json(ACTIVE, {"active": p["target"], "version": p["version"], "boot_confirmed": False,
-                          "previous": p["previous"], "previous_version": running})
+    active_doc = {"active": p["target"], "version": p["version"], "boot_confirmed": False,
+                  "previous": p["previous"], "previous_version": running}
+    if p.get("schema_version") == 1:
+        active_doc["schema_version"] = 1
+    _atomic_json(ACTIVE, active_doc)
+    return True
+
+
+def stage_multifile_release(manifest: dict, running: str, hardware_profile: str = "EMS-4CH-v1") -> str:
+    """Stage a schema 1 release into the inactive slot. The active slot is not deleted."""
+    import firmware_release
+
+    def verify_signature(key_id, signature, payload):
+        keys = trusted_keys()
+        if not keys or key_id not in keys:
+            return False
+        try:
+            pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(keys[key_id]))
+            pub.verify(base64.b64decode(signature), payload)
+            return True
+        except (InvalidSignature, ValueError, TypeError):
+            return False
+
+    operation_id = str(manifest.get("operation_id") or "")
+    pending = pending_info()
+    if operation_id and pending.get("operation_id") == operation_id and pending.get("state") in ("VERIFIED", "STAGED", "ACTIVATING", "HEALTH_CHECK"):
+        return str(pending.get("version") or "")
+    try:
+        fields = firmware_release.verify_release(manifest, running, hardware_profile, verify_signature)
+    except firmware_release.ReleaseError as exc:
+        raise OTAVerificationError(exc.code)
+    version = fields["version"]
+    OTA_ROOT.mkdir(parents=True, exist_ok=True)
+    active_name = active_info().get("active", "a")
+    target = SLOT_B if active_name == "a" else SLOT_A
+    for stale in OTA_ROOT.glob("ems-ota-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+    temp = Path(tempfile.mkdtemp(prefix="ems-ota-", dir=str(OTA_ROOT)))
+    try:
+        _atomic_json(PENDING, {"version": version, "state": "VERIFYING", "schema_version": 1, "operation_id": operation_id, "sha256": fields["package_sha256"]})
+        for item in fields["files"]:
+            dest = temp / item["path"]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest.resolve().relative_to(temp.resolve())
+            except ValueError:
+                raise OTAVerificationError("PATH_REJECTED")
+            with open(dest, "wb") as handle:
+                handle.write(item["content"])
+                handle.flush()
+                os.fsync(handle.fileno())
+            if hashlib.sha256(dest.read_bytes()).hexdigest() != item["sha256"]:
+                raise OTAVerificationError("FILE_SHA256_MISMATCH")
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(temp, target)
+        slot_name = "b" if active_name == "a" else "a"
+        _atomic_json(PENDING, {"version": version, "state": "STAGED", "schema_version": 1, "operation_id": operation_id,
+                               "target": slot_name, "previous": active_name, "sha256": fields["package_sha256"], "key_id": fields["key_id"]})
+        return version
+    except Exception:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
+
+
+def release_health(expected_version: str) -> tuple:
+    """Safe post-update check. Does not construct GPIO or energize a relay.
+    Legacy single-file boots stay on the existing boot-and-sync confirmation."""
+    active = active_info()
+    pending = pending_info()
+    if not active or active.get("boot_confirmed", True) is not False:
+        return True, ""
+    if pending.get("schema_version") != 1 and active.get("schema_version") != 1:
+        return True, ""
+    if str(active.get("version") or "") != str(expected_version):
+        return False, "VERSION_MISMATCH"
+    slot = SLOT_A if active.get("active") == "a" else SLOT_B
+    import firmware_release
+    for rel in firmware_release.REQUIRED:
+        path = slot / rel
+        if not path.is_file():
+            return False, "MISSING_REQUIRED_FILE"
+        try:
+            compile(path.read_text(encoding="utf-8"), rel, "exec")
+        except (OSError, SyntaxError, UnicodeError):
+            return False, "MODULE_IMPORT_FAILED"
+    return True, ""
+
+
+def fail_health(reason: str) -> bool:
+    """Switch back to the previous slot and report ROLLED_BACK. The new slot is kept for diagnosis."""
+    data = active_info()
+    if not data or data.get("boot_confirmed", True) is not False:
+        return False
+    prev = data.get("previous") or pending_info().get("previous")
+    if prev not in ("a", "b"):
+        prev = "a" if data.get("active") == "b" else "b"
+    failed_version = str(data.get("version", ""))
+    _atomic_json(ACTIVE, {"active": prev, "version": data.get("previous_version") or "rollback", "boot_confirmed": True,
+                          "rolled_back_from": failed_version})
+    if failed_version:
+        record_failure(failed_version, reason or "HEALTH_CHECK_FAILED")
+    pending = pending_info()
+    _atomic_json(PENDING, {**pending, "state": "ROLLED_BACK", "error": reason or "HEALTH_CHECK_FAILED", "version": failed_version})
+    logger.critical("OTA health check failed (%s); rolled back to slot %s", reason, prev)
     return True
 
 

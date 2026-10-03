@@ -21,6 +21,7 @@ from energy_api import ingest as energy_ingest
 import health_read_model
 from energy_api.routes import create_router as create_energy_router
 import hardware_capabilities as hwcap
+import firmware_ota
 import capability_service
 from energy_api.day_allocation import publish_completed_batch
 import logging
@@ -1647,6 +1648,9 @@ def download_firmware(
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
+            multifile = firmware_ota.download_manifest(cur, device_id, version)
+            if multifile:
+                return JSONResponse(multifile, headers={"X-EMS-Device-ID": str(device_id)})
             cur.execute("SELECT version, code, sha256, signature, key_id, min_firmware_version FROM firmware_versions WHERE version = %s", (version,))
             fv = cur.fetchone()
             if not fv:
@@ -1760,6 +1764,9 @@ def pi_sync(
             ota_state = payload.get("otaState")
             if ota_state is not None and ota_state not in OTA_STATES:
                 raise HTTPException(400, "otaState must be a known OTA state")
+            operation_id = payload.get("otaOperationId")
+            if operation_id is not None and (not isinstance(operation_id, str) or len(operation_id) > 64):
+                raise HTTPException(400, "otaOperationId must be a short string")
             for f in ("otaVersion", "otaError", "lastGoodFirmwareVersion", "firmwareVersion"):
                 if payload.get(f) is not None and (not isinstance(payload.get(f), str) or len(payload[f]) > 128):
                     raise HTTPException(400, f"{f} must be a short string")
@@ -1877,6 +1884,10 @@ def pi_sync(
             cur.execute("SELECT * FROM pi_commands WHERE device_id = %s AND status = 'queued' ORDER BY sequence_no ASC NULLS FIRST, created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED", (device_id,))
             cmd = cur.fetchone()
 
+            firmware_ota.remember_agent(cur, device_id, payload.get("otaAgent"))
+            if operation_id and ota_state:
+                firmware_ota.note_progress(cur, device_id, operation_id, ota_state)
+            ota_offer = firmware_ota.sync_offer(cur, device_id, payload.get("otaAgent"))
             reply = {
                 "success": True,
                 "command": None,
@@ -1894,6 +1905,8 @@ def pi_sync(
                 "reconciled_commands": reconciled,
                 "lcd_message": active_lcd_message(cur, device_id, now),
             }
+            if ota_offer:
+                reply["ota"] = ota_offer
             energy_cfg = energy_ingest.config_reply(cur, device_id, payload.get("energy"), now)
             if energy_cfg is not None:
                 reply["energy_config"] = energy_cfg
@@ -2502,3 +2515,4 @@ def member_events(last_id: int = 0, user: dict = Depends(get_current_user)):
         conn.close()
 
 app.include_router(create_energy_router(get_db, get_current_user, log_audit, require_uuid))
+app.include_router(firmware_ota.create_router(get_db, get_current_user, log_audit, require_role))

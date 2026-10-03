@@ -18,6 +18,7 @@ import { WINGS } from "./energy/types";
 import { SLOT_CODES } from "./types";
 import { DashboardNavigation, SectionHeading } from "./DashboardSections";
 import { ConfigurationGaps } from "./ConfigurationGaps";
+import { FirmwareUpdate } from "./FirmwareUpdate";
 
 // Society → Status → Slots A–D → Days → Controls → Last Response → LCD → Logs. Frontend only: same APIs,
 // same command contracts, same tenant checks (backend authoritative). readOnly hides controls for members
@@ -94,6 +95,7 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
       {!device ? <div className={`${panel} p-8 text-center text-gray-500 font-mono text-sm`}>NO PI DEVICE REGISTERED FOR THIS SOCIETY</div> : (
         <>
           <div data-testid="ops-device-identity" className="mt-5 text-xs text-gray-400 break-words">{device.name} · <span className="font-mono">{device.id}</span></div>
+          {!readOnly && <FirmwareUpdate deviceId={device.id} deviceName={device.name} ask={setConfirm} />}
           {societyId && <EnergyPanel societyId={societyId} societyName={ops.dash.society.name} controllerName={device.name} energy={energy} readOnly={readOnly} activeGenerationWing={activeGenerationWing} allocationMode={allocationMode} onAllocationMode={energy.setAllocationMode} excessEnabled={excessEnabled} ask={setConfirm}>{renderWings()}</EnergyPanel>}
           <section id="ops-controls" data-testid="dashboard-controls" className="ops-section space-y-5">
             <SectionHeading id="controls" number="04" title={readOnly ? "Days & command evidence" : "Controller controls"} context={readOnly ? "Read only" : "Operator actions"} />
