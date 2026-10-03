@@ -17,8 +17,11 @@ from unittest.mock import patch
 from uuid import UUID
 import zipfile
 
+import time
+
 import psycopg
 from psycopg.types.json import Json
+from backend import cloud_obs
 from starlette.responses import JSONResponse
 from backend.energy_api import ingest
 from backend import provisioning
@@ -88,6 +91,13 @@ class SyncConnection(MemoryConnection):
     def close(self): self.closed = True
 
 
+def normalize_physical_toggle(value):
+    if isinstance(value, bool):
+        value = "ON" if value else "OFF"
+    text = "UNKNOWN" if value is None else str(value).upper()
+    return text if text in ("ON", "OFF", "UNKNOWN") else "UNKNOWN"
+
+
 def sync_function(conn, device_id=DID):
     """Actual endpoint body; auth/HTTP/health are inert fixtures, no main import."""
     tree = ast.parse((ROOT / "backend/main.py").read_text())
@@ -100,13 +110,16 @@ def sync_function(conn, device_id=DID):
           "authenticate_pi": lambda *a: (device_id, 1), "get_db": lambda: conn,
           "datetime": Clock, "timezone": timezone, "timedelta": timedelta,
           "metric_inc": lambda *a: None, "SLOTS": list("ABCD"), "Json": Json,
-          "normalize_toggle_input": lambda _: None, "normalize_storage_health": lambda _: {},
+          "normalize_toggle_input": lambda _: None, "normalize_physical_toggle": normalize_physical_toggle, "normalize_storage_health": lambda _: {},
           "health_read_model": SimpleNamespace(normalize_report=lambda *a: {"cpu": {"celsius": None}, "boot": {"count": None}}, watchdog_enabled=lambda _: None),
           "dict_row": None, "DEFAULT_RESET_DAY": 15, "canonical_device_config": lambda *a: {},
           "config_hash": lambda _: "0" * 64, "derive_config_state": lambda *a: "DESIRED",
           "OTA_STATES": (), "CONFIG_ERROR_CODES": (), "energy_ingest": ingest,
           "EXECUTED_IDS_MAX": 50, "COMMAND_DELIVERY_LEASE_SECONDS": 120,
-          "active_lcd_message": lambda *a: None, "JSONResponse": JSONResponse}
+          "active_lcd_message": lambda *a: None, "JSONResponse": JSONResponse,
+          "time": time, "cloud_obs": cloud_obs,
+          "hwcap": SimpleNamespace(default_capabilities=lambda: {}),
+          "firmware_ota": SimpleNamespace(remember_agent=lambda *a, **k: None, note_progress=lambda *a, **k: None, sync_offer=lambda *a, **k: None)}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[func], type_ignores=[])), "offline_pi_sync", "exec"), ns)
     return ns["pi_sync"]
 

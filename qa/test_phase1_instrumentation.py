@@ -217,22 +217,33 @@ class Instrumentation(unittest.TestCase):
             queue.close()
 
     def test_statement_counter_does_not_rewrite_sql(self):
-        seen = []
+        source = (ROOT / "backend" / "cloud_obs.py").read_text(encoding="utf-8")
+        main = (ROOT / "backend" / "main.py").read_text(encoding="utf-8")
+        self.assertNotIn("cur.execute =", source)
+        self.assertNotIn("cur.execute =", main)
+        self.assertNotIn("attach_statement_counter", source)
+        self.assertNotIn("attach_statement_counter", main)
 
-        class Cur:
-            def execute(self, query, params=None, *, prepare=None, binary=None):
-                seen.append((query, params))
-                self.rowcount = 1
-                return self
+        class ReadOnlyCursor:
+            def __init__(self):
+                self.calls = []
 
-        cur = Cur()
-        stats = cloud_obs.attach_statement_counter(cur)
-        cur.execute("UPDATE pi_devices SET last_seen = %s WHERE id = %s", ("t", "d"))
+            @property
+            def execute(self):
+                def run(query, params=None, *, prepare=None, binary=None):
+                    self.calls.append(query)
+                    return self
+                return run
+
+        cur = ReadOnlyCursor()
+        with self.assertRaises(AttributeError):
+            cur.execute = lambda *args: None
         cur.execute("SELECT 1")
-        self.assertEqual(stats["statements"], 2)
-        self.assertEqual(stats["rows"]["pi_devices"], 1)
-        self.assertEqual(seen[0][0], "UPDATE pi_devices SET last_seen = %s WHERE id = %s")
-        self.assertNotIn("SELECT", stats["rows"])
+        self.assertEqual(cur.calls, ["SELECT 1"])
+        cloud_obs.finish_sync("dev", 1, 200, 0.01, True, None, None, None)
+        event = [row for row in cloud_obs.snapshot()["recent"] if row["kind"] == "sync"][-1]
+        self.assertEqual(event["statements"], "UNKNOWN")
+        self.assertEqual(event["rows_committed"], "UNKNOWN")
 
     def test_observer_failures_do_not_change_operations(self):
         def boom(*args, **kwargs):
@@ -372,6 +383,55 @@ class Instrumentation(unittest.TestCase):
         main = (ROOT / "backend" / "main.py").read_text(encoding="utf-8")
         self.assertIn("safe_observe", main[main.index("cloud_obs.finish_sync(") - 120:main.index("cloud_obs.finish_sync(")])
         self.assertIn("safe_observe", main[main.index("cloud_obs.record_ack(") - 120:main.index("cloud_obs.record_ack(")])
+
+    def test_sync_succeeds_without_patching_cursor_execute(self):
+        from datetime import datetime, timezone
+        from qa.test_cloud_limits_storage import SyncConnection, SyncCursor, fixture, sync_function
+
+        empty = SyncConnection(fixture())
+        result = sync_function(empty)(None, {"slots": {wing: {} for wing in "ABCD"}})
+        self.assertTrue(result["success"])
+        self.assertIsNone(result["command"])
+        self.assertEqual(empty.commits, 1)
+        self.assertTrue(empty.closed)
+
+        class Queued(SyncCursor):
+            def execute(self, sql, params=()):
+                super().execute(sql, params)
+                query = " ".join(sql.lower().split())
+                if query.startswith("select") and "from pi_commands" in query and "queued" in query:
+                    self.one = {
+                        "id": "11111111-1111-1111-1111-111111111111",
+                        "command": "set_days", "slot": "A", "params": {"days": 6},
+                        "sequence_no": 3, "allocation_batch_id": "batch-1",
+                        "expires_at": datetime(2026, 10, 3, tzinfo=timezone.utc),
+                        "attempt_count": 0,
+                    }
+                if "returning attempt_count" in query:
+                    self.one = {"attempt_count": 1}
+
+        class QueuedConnection(SyncConnection):
+            def cursor(self, **_kwargs):
+                return Queued(self)
+
+        queued = QueuedConnection(fixture())
+        delivered = sync_function(queued)(None, {"slots": {wing: {} for wing in "ABCD"}})
+        self.assertEqual(delivered["success"], True)
+        self.assertEqual(delivered["command"], "set_days")
+        self.assertEqual(delivered["slot"], "A")
+        self.assertEqual(queued.commits, 1)
+        self.assertTrue(queued.closed)
+
+        original = cloud_obs.finish_sync
+        cloud_obs.finish_sync = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("observer failed"))
+        try:
+            broken = SyncConnection(fixture())
+            still = sync_function(broken)(None, {"slots": {wing: {} for wing in "ABCD"}})
+        finally:
+            cloud_obs.finish_sync = original
+        self.assertTrue(still["success"])
+        self.assertEqual(broken.commits, 1)
+        self.assertTrue(broken.closed)
 
 
 if __name__ == "__main__":

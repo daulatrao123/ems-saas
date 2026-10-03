@@ -1704,14 +1704,13 @@ def pi_sync(
 
     conn = get_db()
     obs_started = time.perf_counter()
-    obs_stats = {"statements": 0, "rows": {}}
+    obs_stats = None
     obs_committed = False
     obs_http = 200
     obs_command = None
     reply = None
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            obs_stats = cloud_obs.attach_statement_counter(cur, "sync")
             cur.execute("UPDATE pi_devices SET last_seen = %s, firmware_version = %s WHERE id = %s",
                         (now, payload.get("firmwareVersion", "unknown"), device_id))
 
@@ -2031,7 +2030,6 @@ def pi_command_ack(
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cloud_obs.attach_statement_counter(cur, "ack")
             cur.execute(
                 "SELECT id, command, slot, params, status, attempt_count, allocation_batch_id FROM pi_commands WHERE id = %s AND device_id = %s FOR UPDATE",
                 (command_id, device_id),

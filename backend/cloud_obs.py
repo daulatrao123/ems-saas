@@ -124,63 +124,6 @@ def idempotency_hash(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
-def attach_statement_counter(cur, component="sync"):
-    """Count execute calls and positive write rowcounts. SQL text is unchanged.
-
-    Counting failures are ignored. Errors from the original execute propagate.
-    """
-    stats = {"statements": 0, "rows": {}}
-    original = cur.execute
-
-    def execute(query, params=None, *, prepare=None, binary=None):
-        try:
-            stats["statements"] += 1
-        except Exception:
-            note_observation_error(component)
-        if params is None:
-            result = original(query, prepare=prepare, binary=binary)
-        else:
-            result = original(query, params, prepare=prepare, binary=binary)
-        try:
-            kind = _write_kind(query)
-            count = getattr(cur, "rowcount", -1)
-            if kind and isinstance(count, int) and count > 0:
-                stats["rows"][kind] = stats["rows"].get(kind, 0) + count
-        except Exception:
-            note_observation_error(component)
-        return result
-
-    cur.execute = execute
-    return stats
-
-
-def _write_kind(query):
-    q = " ".join(str(query).split()).lower()
-    if not (q.startswith("insert") or q.startswith("update") or q.startswith("delete")):
-        return None
-    if q.startswith("update pi_devices set last_seen"):
-        return "pi_devices"
-    if q.startswith("insert into slot_state"):
-        return "slot_state"
-    if q.startswith("insert into pi_state"):
-        return "pi_state"
-    if "update pi_commands set status='expired'" in q:
-        return "pi_commands_expiry"
-    if "update pi_commands set status='queued', delivered_at" in q:
-        return "pi_commands_lease"
-    if "update pi_commands set status='delivered'" in q:
-        return "pi_commands_delivery"
-    if "update pi_commands set status=" in q:
-        return "pi_commands"
-    if "update slot_configs set target_days" in q:
-        return "slot_configs"
-    if "update societies set config_version" in q or "update societies set reset_day" in q:
-        return "societies"
-    if "energy_" in q:
-        return "energy"
-    return None
-
-
 def finish_sync(device_id, society_id, http_status, duration_s, committed, statement_stats, delivery, config):
     _inc("sync_requests_total")
     if int(http_status) < 400 and committed:
@@ -195,15 +138,21 @@ def finish_sync(device_id, society_id, http_status, duration_s, committed, state
         slot = _bound(delivery.get("slot") or "none", SLOTS, "none")
         _dim("command_delivery_by_type", command)
         _dim("command_delivery_by_slot", slot)
-    rows_attempted = dict((statement_stats or {}).get("rows") or {})
-    rows_committed = rows_attempted if committed else {}
+    if isinstance(statement_stats, dict) and isinstance(statement_stats.get("statements"), int):
+        statements = statement_stats["statements"]
+        rows_attempted = dict(statement_stats.get("rows") or {})
+        rows_committed = rows_attempted if committed else {}
+    else:
+        statements = "UNKNOWN"
+        rows_attempted = "UNKNOWN"
+        rows_committed = "UNKNOWN"
     _event("sync", {
         "device_id": device_id,
         "society_id": society_id,
         "http_status": int(http_status),
         "duration_ms": int(duration_s * 1000),
         "transaction": "committed" if committed else "rolled_back",
-        "statements": int((statement_stats or {}).get("statements") or 0),
+        "statements": statements,
         "rows_committed": rows_committed,
         "rows_attempted": rows_attempted,
         "command_delivered": delivered,
