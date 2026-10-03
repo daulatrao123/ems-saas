@@ -395,6 +395,16 @@ class OfflineQueue:
 
         with self.lock:
             try:
+                # Idle polling has nothing to expire or claim. A read under the
+                # same lock avoids a write transaction. Any DELIVERED row, including
+                # an expired one, still takes the durable BEGIN IMMEDIATE path below.
+                pending = self.conn.execute(
+                    "SELECT 1 FROM commands WHERE status='DELIVERED' LIMIT 1"
+                ).fetchone()
+                if pending is None:
+                    device_obs.safe_observe("queue", lambda: device_obs.claim_empty(False))
+                    return None
+
                 self.conn.execute(
                     "BEGIN IMMEDIATE;"
                 )

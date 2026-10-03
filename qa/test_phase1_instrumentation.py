@@ -197,6 +197,7 @@ class Instrumentation(unittest.TestCase):
         device_obs._counts["claim_next_empty"] = 0
         device_obs._counts["claim_next_command"] = 0
         device_obs._counts["claim_next_commit"] = 0
+        device_obs._counts["claim_next_tx_started"] = 0
         device_obs._counts["claim_next_rollback"] = 0
 
         class Storage:
@@ -208,12 +209,15 @@ class Instrumentation(unittest.TestCase):
             queue = offline_queue.OfflineQueue(Storage())
             self.assertIsNone(queue.claim_next())
             self.assertEqual(device_obs._counts["claim_next_empty"], 1)
-            self.assertEqual(device_obs._counts["claim_next_commit"], 1)
+            self.assertEqual(device_obs._counts["claim_next_commit"], 0)
+            self.assertEqual(device_obs._counts["claim_next_tx_started"], 0)
             self.assertEqual(device_obs._counts["claim_next_command"], 0)
             self.assertTrue(queue.add_command("cmd-1", "A", "ACTIVATE", "2026-01-01T00:00:00+00:00", "2999-01-01T00:00:00+00:00"))
             self.assertEqual(queue.claim_next(), ("cmd-1", "A", "ACTIVATE"))
             self.assertEqual(device_obs._counts["claim_next_command"], 1)
+            self.assertEqual(device_obs._counts["claim_next_commit"], 1)
             self.assertEqual(queue.claim_next(), None)
+            self.assertEqual(device_obs._counts["claim_next_commit"], 1)
             queue.close()
 
     def test_statement_counter_does_not_rewrite_sql(self):
