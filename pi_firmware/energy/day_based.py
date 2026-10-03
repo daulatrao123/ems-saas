@@ -3,6 +3,7 @@
 AllocationPolicy is not used here. A verified wing that this strategy did not apply pauses the
 operating day instead of being forced back to the schedule.
 """
+import json
 import time
 from datetime import date
 
@@ -49,6 +50,11 @@ def scheduled_wing(days, index, enabled):
     return None
 
 
+def _written_form(state):
+    """Bytes-equivalent form of the dict atomic_write_json would store."""
+    return json.dumps(state, separators=(",", ":"))
+
+
 class DayBasedStrategy:
     def __init__(self, path, write_allowed=lambda: True):
         self.path = path
@@ -66,8 +72,10 @@ class DayBasedStrategy:
     def persist(self):
         started = time.perf_counter()
         previous = dict(self._persisted_snapshot) if isinstance(self._persisted_snapshot, dict) else None
-        changed = self.state != self._persisted_snapshot
         scheduled = self.state.get("scheduled")
+        changed = _written_form(self.state) != _written_form(self._persisted_snapshot)
+        if self.dirty and not changed:
+            self.dirty = False
         if not self.dirty or not self.write_allowed():
             device_obs.safe_observe("day_based", lambda: device_obs.note_persist(
                 False, False, scheduled, self.path, time.perf_counter() - started, previous))
