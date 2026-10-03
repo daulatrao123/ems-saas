@@ -240,6 +240,28 @@ def note_batch(device_id, society_id, batch_id, rows, published, targets, supers
     })
 
 
+def note_software_recovery(fields):
+    """Bounded recovery record. Never raises and never touches PostgreSQL."""
+    try:
+        body = fields if isinstance(fields, dict) else {}
+        _inc("software_command_recovery_total")
+        _event("software_command_recovery", {
+            "device_id": body.get("device_id"),
+            "command_id": body.get("command_id"),
+            "command": body.get("command"),
+            "sequence_no": body.get("sequence_no"),
+            "previous_status": body.get("previous_status"),
+            "resulting_status": body.get("resulting_status"),
+            "recovery_reason": body.get("recovery_reason"),
+            "allocation_batch_id": body.get("allocation_batch_id"),
+            "idempotent": bool(body.get("idempotent")),
+            "recovered": bool(body.get("recovered")),
+            "expired": bool(body.get("expired")),
+        })
+    except Exception:
+        return
+
+
 def note_allocation(kind, http_status, duration_s, body, idempotency_hash_value=None):
     _inc("allocation_calculate_total" if kind == "calculate" else "allocation_apply_total")
     commands = (body or {}).get("commands") or []

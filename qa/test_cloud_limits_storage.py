@@ -21,7 +21,7 @@ import time
 
 import psycopg
 from psycopg.types.json import Json
-from backend import cloud_obs
+from backend import cloud_obs, command_reliability
 from starlette.responses import JSONResponse
 from backend.energy_api import ingest
 from backend import provisioning
@@ -117,7 +117,7 @@ def sync_function(conn, device_id=DID):
           "OTA_STATES": (), "CONFIG_ERROR_CODES": (), "energy_ingest": ingest,
           "EXECUTED_IDS_MAX": 50, "COMMAND_DELIVERY_LEASE_SECONDS": 120,
           "active_lcd_message": lambda *a: None, "JSONResponse": JSONResponse,
-          "time": time, "cloud_obs": cloud_obs,
+          "time": time, "cloud_obs": cloud_obs, "command_reliability": command_reliability,
           "hwcap": SimpleNamespace(default_capabilities=lambda: {}),
           "firmware_ota": SimpleNamespace(remember_agent=lambda *a, **k: None, note_progress=lambda *a, **k: None, sync_offer=lambda *a, **k: None)}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[func], type_ignores=[])), "offline_pi_sync", "exec"), ns)
@@ -140,7 +140,7 @@ class CloudLimitsTests(unittest.TestCase):
             self.assertTrue(conn.closed)
             counts = {op: sum(q.startswith(op) for q, _ in conn.trace) for op in ("select", "insert", "update", "delete", "savepoint", "release")}
             counts["total"] = len(conn.trace)
-            self.assertEqual(counts["total"], 36 if active else 31)
+            self.assertEqual(counts["total"], 37 if active else 32)
             self.assertEqual(counts["delete"], 0)
             self.assertEqual(sum(q.startswith("insert into energy_meter_readings") for q, _ in conn.trace), 5 if active else 0)
             self.assertNotIn("energy_config", result, "an unchanged reported version needs no Pi config write")

@@ -24,6 +24,7 @@ import hardware_capabilities as hwcap
 import firmware_ota
 import capability_service
 import cloud_obs
+import command_reliability
 from energy_api.day_allocation import publish_completed_batch
 import logging
 _seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
@@ -1904,6 +1905,7 @@ def pi_sync(
                 "UPDATE pi_commands SET status='expired', error='COMMAND_EXPIRED' WHERE device_id=%s AND status IN ('queued','delivered') AND expires_at <= %s",
                 (device_id, now),
             )
+            command_reliability.expire_stuck_software_commands(cur, device_id, now)
 
             cur.execute("SELECT * FROM pi_commands WHERE device_id = %s AND status = 'queued' ORDER BY sequence_no ASC NULLS FIRST, created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED", (device_id,))
             cmd = cur.fetchone()
@@ -2031,7 +2033,7 @@ def pi_command_ack(
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, command, slot, params, status, attempt_count, allocation_batch_id FROM pi_commands WHERE id = %s AND device_id = %s FOR UPDATE",
+                "SELECT id, command, slot, params, status, attempt_count, allocation_batch_id, sequence_no FROM pi_commands WHERE id = %s AND device_id = %s FOR UPDATE",
                 (command_id, device_id),
             )
             cmd = cur.fetchone()
@@ -2091,14 +2093,29 @@ def pi_command_ack(
                     # Manual set_days publishes immediately. A DAY_BASED batch waits until every
                     # wing in that batch is completed or acked, so one expiry cannot mix targets.
                     if not cmd.get("allocation_batch_id"):
-                        cur.execute(
-                            "UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s",
-                            (days, device_id, slot),
-                        )
-                        cur.execute(
-                            "UPDATE societies SET config_version = config_version + 1 WHERE id = %s",
-                            (society_id,),
-                        )
+                        if command_reliability.newer_set_days_committed(cur, device_id, slot, cmd.get("sequence_no")):
+                            cloud_obs.safe_observe("ack", lambda: cloud_obs.note_software_recovery({
+                                "device_id": str(device_id),
+                                "command_id": str(command_id),
+                                "command": "set_days",
+                                "sequence_no": cmd.get("sequence_no"),
+                                "previous_status": current,
+                                "resulting_status": "completed",
+                                "recovery_reason": "STALE_SET_DAYS_SUPERSEDED",
+                                "allocation_batch_id": None,
+                                "idempotent": False,
+                                "recovered": True,
+                                "expired": False,
+                            }))
+                        else:
+                            cur.execute(
+                                "UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s",
+                                (days, device_id, slot),
+                            )
+                            cur.execute(
+                                "UPDATE societies SET config_version = config_version + 1 WHERE id = %s",
+                                (society_id,),
+                            )
                 elif cmd["command"] == "set_reset_day":
                     day = int((cmd["params"] or {}).get("day", DEFAULT_RESET_DAY))
                     if not 1 <= day <= 28:
