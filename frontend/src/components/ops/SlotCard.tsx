@@ -30,11 +30,12 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
     <section data-testid={`slot-card-${code}`} data-state={state} className={`ops-wing ${panel} ${active ? "border-emerald-500/40" : ""} p-4 flex flex-col gap-4 min-w-0`}>
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0"><h2 data-testid={`slot-heading-${code}`} className="text-base font-bold text-white">Wing {code}</h2><div data-testid={`slot-name-${code}`} className={`${label} break-words`}>Slot {code}{customName ? ` · ${customName}` : ""}</div></div>
-        <span data-testid={`slot-state-${code}`} className={`px-2 py-0.5 text-[10px] font-bold border ${stateTone}`}>{state}</span>
+        <span data-testid={`slot-state-${code}`} className={`px-2 py-0.5 text-[10px] font-bold border ${stateTone}`}>{state === "ACTIVE" ? "COMMANDED" : state}</span>
       </div>
       <dl className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[10px]">
         <dt className="text-gray-500">LOGICAL SLOT</dt><dd data-testid={`slot-enabled-${code}`} className="text-gray-300">{typeof slot?.disabled === "boolean" ? slot.disabled ? "DISABLED" : "ENABLED" : "UNAVAILABLE"}</dd>
         <dt className="text-gray-500">CONTACTOR</dt><dd data-testid={`slot-physical-${code}`} className={contactor === "ON" ? "text-emerald-300" : "text-gray-400"}>{contactor}</dd>
+        <dt className="text-gray-500">FEEDBACK</dt><dd data-testid={`slot-feedback-${code}`} className="text-gray-300">{contactor === "UNKNOWN" ? "NOT VERIFIED" : (active && contactor === "ON") || (!active && contactor === "OFF") ? "VERIFIED" : "NOT VERIFIED"}</dd>
       </dl>
       {slot?.disabled && <div data-testid={`slot-exclusion-${code}`} className="text-xs leading-relaxed text-gray-400 border-t border-dashed border-gray-700 pt-3">Disabled logical wing · excluded from society consumption</div>}
       {slot?.disabled ? <details data-testid={`slot-disabled-data-${code}`} className="ops-disclosure"><summary data-testid={`slot-disabled-data-toggle-${code}`} className="text-xs">Energy data & bill history</summary>{energyCard}</details>

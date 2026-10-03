@@ -263,3 +263,80 @@ test("malformed optional health never crashes or manufactures measured/verified 
     assert.equal(byTestId(tree, "watchdog-hardware-status").props.children, "UNKNOWN");
   });
 });
+
+test("commanded wing is not shown as physical contactor proof", () => {
+  const device = mkDevice({ version: 1, sampled_at: "2026-01-31T23:59:50Z", status: "CURRENT", max_age_seconds: 120, cpu: { celsius: 40, source: "LINUX_THERMAL" }, boot: { count: 1 }, watchdog: { hardware_state: "INACTIVE", service_timeout_us: 0 } });
+  device.feedback_hardware_installed = true;
+  device.emergency_stop = false;
+  device.active_slot = "B";
+  for (const code of ["A", "B", "C", "D"]) {
+    device.slots[code].feedback_enabled = true;
+    device.slots[code].physical_toggle = code === "B" ? "ON" : "OFF";
+  }
+  const verified = StatusStrip({ device, resetDay: 15 });
+  assert.equal(byTestId(verified, "stat-active-slot").props.children[0].props.children, "Commanded Wing");
+  assert.equal(byTestId(verified, "stat-active-slot-value").props.children, "B");
+  assert.match(byTestId(verified, "stat-active-slot-detail").props.children, /Physical B/);
+  assert.match(byTestId(verified, "stat-active-slot-detail").props.children, /Feedback VERIFIED/);
+  assert.doesNotMatch(byTestId(verified, "stat-active-slot-detail").props.children, /FAULT/);
+
+  device.slots.B.physical_toggle = "UNKNOWN";
+  const mismatch = StatusStrip({ device, resetDay: 15 });
+  assert.match(byTestId(mismatch, "stat-active-slot-detail").props.children, /Physical UNKNOWN/);
+  assert.match(byTestId(mismatch, "stat-active-slot-detail").props.children, /NOT VERIFIED/);
+
+  device.slots.A.physical_toggle = "ON";
+  device.slots.B.physical_toggle = "ON";
+  device.emergency_stop = true;
+  const multiple = StatusStrip({ device, resetDay: 15 });
+  assert.match(byTestId(multiple, "stat-active-slot-detail").props.children, /Physical MULTIPLE/);
+  assert.match(byTestId(multiple, "stat-active-slot-detail").props.children, /FAULT/);
+});
+
+test("an UNKNOWN feedback channel is not hidden by another ON channel", () => {
+  const health = { version: 1, sampled_at: "2026-01-31T23:59:50Z", status: "CURRENT", max_age_seconds: 120, cpu: { celsius: 40, source: "LINUX_THERMAL" }, boot: { count: 1 }, watchdog: { hardware_state: "INACTIVE", service_timeout_us: 0 } };
+  function deviceWith(readings, extra = {}) {
+    const device = mkDevice(health);
+    device.connected = true;
+    device.feedback_hardware_installed = true;
+    device.hardware_fault = null;
+    device.emergency_stop = false;
+    device.active_slot = "A";
+    for (const code of ["A", "B", "C", "D"]) {
+      device.slots[code].feedback_enabled = true;
+      device.slots[code].physical_toggle = readings[code];
+    }
+    Object.assign(device, extra);
+    return device;
+  }
+  function detail(device) {
+    return byTestId(StatusStrip({ device, resetDay: 15 }), "stat-active-slot-detail").props.children;
+  }
+
+  const mixed = deviceWith({ A: "ON", B: "UNKNOWN", C: "OFF", D: "OFF" });
+  const mixedDetail = detail(mixed);
+  assert.match(mixedDetail, /Physical UNKNOWN/);
+  assert.match(mixedDetail, /NOT VERIFIED/);
+  assert.doesNotMatch(mixedDetail, /Physical A/);
+  assert.equal(mixed.slots.A.physical_toggle, "ON");
+  assert.equal(mixed.slots.B.physical_toggle, "UNKNOWN");
+
+  const single = detail(deviceWith({ A: "ON", B: "OFF", C: "OFF", D: "OFF" }));
+  assert.match(single, /Physical A/);
+  assert.match(single, /Feedback VERIFIED/);
+  assert.doesNotMatch(single, /FAULT/);
+
+  const twoOn = detail(deviceWith({ A: "ON", B: "ON", C: "OFF", D: "OFF" }));
+  assert.match(twoOn, /Physical MULTIPLE/);
+  assert.match(twoOn, /NOT VERIFIED/);
+  assert.match(twoOn, /FAULT/);
+
+  const allOff = detail(deviceWith({ A: "OFF", B: "OFF", C: "OFF", D: "OFF" }, { active_slot: null }));
+  assert.match(allOff, /Physical OFF/);
+  assert.match(allOff, /Feedback VERIFIED/);
+  assert.doesNotMatch(allOff, /FAULT/);
+
+  const offline = detail(deviceWith({ A: "ON", B: "OFF", C: "OFF", D: "OFF" }, { feedback_hardware_installed: false }));
+  assert.match(offline, /Physical UNKNOWN/);
+  assert.match(offline, /NOT VERIFIED/);
+});

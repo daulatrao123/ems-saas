@@ -69,6 +69,14 @@ UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 limiter = Limiter(key_func=get_remote_address)
 
 
+def normalize_physical_toggle(value):
+    """Contactor feedback stored in slot_state.physical_toggle. Commanded, relay, and MULTIPLE never fit."""
+    if isinstance(value, bool):
+        value = "ON" if value else "OFF"
+    text = "UNKNOWN" if value is None else str(value).upper()
+    return text if text in ("ON", "OFF", "UNKNOWN") else "UNKNOWN"
+
+
 def pi_rate_key(request: Request) -> str:
     """Per-device limit for Pi endpoints (many Pis share one NAT IP); falls back to IP."""
     dev = (request.headers.get("X-Device-ID") or "").strip()
@@ -1593,10 +1601,7 @@ def pi_sync(
             for slot_code, w in slots_payload.items():
                 if slot_code not in SLOTS: continue
                 # `physical_toggle` is the CONTACTOR FEEDBACK state (historical column name).
-                physical_toggle = w.get("physical_toggle", w.get("physicalToggle", "UNKNOWN"))
-                if isinstance(physical_toggle, bool): physical_toggle = "ON" if physical_toggle else "OFF"
-                physical_toggle = str(physical_toggle).upper()
-                if physical_toggle not in ("ON", "OFF", "UNKNOWN"): physical_toggle = "UNKNOWN"
+                physical_toggle = normalize_physical_toggle(w.get("physical_toggle", w.get("physicalToggle", "UNKNOWN")))
                 toggle_input = normalize_toggle_input(toggle_payload.get(slot_code))
 
                 cur.execute("""INSERT INTO slot_state (device_id, slot, physical_toggle, toggle_input, used_days, clicks)
@@ -2236,7 +2241,8 @@ def admin_dashboard(society_id: str, user: dict = Depends(require_society_access
                     "connected": is_pi_online(pi),
                     "active_slot": pi.get("active_slot") if pi else None,
                     "slots": slots_data,
-                    "hardware_fault": pi.get("hardware_fault") if pi else None,
+                        "hardware_fault": pi.get("hardware_fault") if pi else None,
+                    "emergency_stop": bool(pi.get("emergency_stop")) if pi else False,
                     "storage_health": ({k: v for k, v in (pi.get("storage_health") or {}).items() if k != "controller_health"} or None) if pi else None,
                     # T7 convergence evidence (read-only exposure; no UI yet)
                     "config_version": pi.get("config_version") if pi else None,
@@ -2372,6 +2378,7 @@ def member_dashboard(user: dict = Depends(get_current_user)):
                     "active_slot": pi.get("active_slot") if pi else None,
                     "slots": slots_data,
                     "hardware_fault": pi.get("hardware_fault") if pi else None,
+                    "emergency_stop": bool(pi.get("emergency_stop")) if pi else False,
                 })
 
             return { "devices": devices_data, "reset_day": DEFAULT_RESET_DAY }

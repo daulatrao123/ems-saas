@@ -12,6 +12,7 @@ export type Device = {
   id: string; name: string; connected: boolean; active_slot: string | null; slots: Record<string, Slot>;
   config_state?: string | null; config_error?: string | null; ota_state?: string | null; storage_state?: string | null;
   firmware_version?: string | null; last_sync?: string | null; telemetry?: Telemetry; hardware_fault?: string | null;
+  emergency_stop?: boolean;
   storage_health?: StorageHealth | null; lcd?: { available?: boolean; error?: string | null; message_id?: number | null } | null;
   feedback_hardware_installed?: boolean;
 };

@@ -23,52 +23,60 @@ B
 C
 D
 
-Each channel contains:
+Each channel contains three recorded assignments:
 
-1. Relay output
-2. Physical toggle input
-3. Contactor detect/feedback input
+1. Production relay output. GPIOManager opens this pin.
+2. Retired/reserved toggle input. Recorded so the pin cannot be reused.
+   GPIOManager does not open it. It is not a production control input.
+3. Production contactor detect/feedback input. GPIOManager opens this pin.
 
-Total:
+Total recorded assignments:
 
-4 relay outputs
-4 toggle inputs
-4 detect/feedback inputs
+4 production relay outputs
+4 retired/reserved toggle inputs
+4 production detect/feedback inputs
 
-Total GPIO signals = 12.
+Total recorded GPIO signals = 12.
+Production GPIOManager opens exactly 8 of them: the 4 relays and the 4 feedback inputs.
 
 ---
 
 # 2. AUTHORITATIVE GPIO MAP
 
-| Channel | Relay OUT | Toggle IN | Detect IN |
-|---------|-----------|-----------|-----------|
-| A       | GPIO17    | GPIO5     | GPIO19    |
-| B       | GPIO27    | GPIO6     | GPIO16    |
-| C       | GPIO23    | GPIO13    | GPIO20    |
-| D       | GPIO22    | GPIO12    | GPIO21    |
+| Channel | Production relay OUT | Retired/reserved toggle | Production feedback IN |
+|---------|----------------------|-------------------------|------------------------|
+| A       | GPIO17               | GPIO5                   | GPIO19                 |
+| B       | GPIO27               | GPIO6                   | GPIO16                 |
+| C       | GPIO23               | GPIO13                  | GPIO20                 |
+| D       | GPIO22               | GPIO12                  | GPIO21                 |
 
 BCM GPIO numbers:
 
 A:
-- relay = 17
-- toggle = 5
-- detect = 19
+- production relay = 17
+- retired/reserved toggle = 5
+- production feedback = 19
 
 B:
-- relay = 27
-- toggle = 6
-- detect = 16
+- production relay = 27
+- retired/reserved toggle = 6
+- production feedback = 16
 
 C:
-- relay = 23
-- toggle = 13
-- detect = 20
+- production relay = 23
+- retired/reserved toggle = 13
+- production feedback = 20
 
 D:
-- relay = 22
-- toggle = 12
-- detect = 21
+- production relay = 22
+- retired/reserved toggle = 12
+- production feedback = 21
+
+GPIOManager opens only:
+
+17, 27, 23, 22, 19, 16, 20, 21
+
+LCD I2C remains BCM 2 (SDA) and BCM 3 (SCL). Those pins are not EMS channel pins.
 
 ---
 
@@ -99,43 +107,32 @@ All relays MUST start OFF.
 
 ---
 
-# 4. TOGGLE INPUT
+# 4. RETIRED / RESERVED TOGGLE INPUT
 
-Toggle inputs are logically ACTIVE-HIGH.
+These pins are retired. They are not production control inputs.
 
-Expected electrical arrangement:
+BCM assignment, retained so the pin cannot be given to another function:
 
-GPIO input
-+
-internal pull-down
-+
-external switch/contact to 3V3 (through a series resistor / protection)
+A = GPIO5
+B = GPIO6
+C = GPIO13
+D = GPIO12
 
-Therefore:
+The profile still records `toggle_active_low: false` for this historical
+assignment. That flag does not make the pin live.
 
-GPIO LOW  -> toggle OFF
-GPIO HIGH -> toggle ON
+GPIOManager MUST NOT open these pins.
+GPIOManager.toggles stays empty.
+process_toggle_events() discards edges and returns 0.
+A level on these pins MUST NOT energize a relay, clear FAULT, or request a channel.
 
-Firmware MUST use:
+The input diagnostic reports each pin as:
 
-Button(
-    pin,
-    pull_up=False,
-    bounce_time=0.05
-)
+RESERVED / RETIRED / NOT USED BY CONTROLLER
 
-(gpiozero: pull_up=False selects the internal pull-down; the input is "pressed"
-when HIGH.)
+and does not open it. There is no maintenance mode that claims these pins.
 
-Toggle polarity is independent from relay polarity (relays stay ACTIVE-LOW) and
-from detect polarity (detect stays ACTIVE-LOW).
-
-Boot rule: the level present at initialisation is REPORTED but is NOT an edge.
-Only transitions after initialisation generate toggle requests. A toggle that is
-already HIGH at boot does not energise anything.
-
-Presence rule: a LOW toggle input means "OFF or not wired". A digital input
-CANNOT tell a present-but-OFF wing from an absent one; see §17.
+Do not attach a new switch to these pins and expect the controller to read it.
 
 ---
 
@@ -223,48 +220,29 @@ Never make the new relay before the previous relay is safely OFF.
 
 ---
 
-# 8. PHYSICAL TOGGLE BEHAVIOUR
+# 8. RETIRED TOGGLE BEHAVIOUR
 
-A physical toggle is a real control input.
-
-Firmware MUST continuously monitor all four toggle inputs:
+The retired toggle pins are not monitored and are not a control path.
 
 A = GPIO5
 B = GPIO6
 C = GPIO13
 D = GPIO12
 
-Toggle state changes MUST generate a software event.
+The controller does not generate toggle ON or toggle OFF requests from these
+pins. Channel changes come from the cloud command path and the energy
+allocator, both of which still pass through break-before-make and the FAULT
+gate.
 
-Expected behaviour:
-
-Toggle ON:
-- request corresponding channel ON.
-
-Toggle OFF:
-- request corresponding channel OFF.
-
-If another channel is active:
-- perform normal break-before-make transition.
-
-If toggle operation conflicts with safety/interlock rules:
-- reject operation and enter/retain FAULT as appropriate.
-
-Physical toggle operation MUST NOT directly bypass the command/interlock
-state machine.
+A retired pin MUST NOT bypass the command/interlock state machine, because
+the controller does not read it.
 
 ---
 
-# 9. TOGGLE DEBOUNCE
+# 9. RETIRED TOGGLE DEBOUNCE
 
-Mechanical toggle transitions must be debounced.
-
-Recommended:
-
-bounce_time = 0.05 seconds
-
-A toggle transition must not generate repeated commands because of contact
-bounce.
+No production debounce applies. GPIOManager does not register a callback on
+BCM 5, 6, 13, or 12, so contact bounce on those pins cannot generate a command.
 
 ---
 
@@ -289,27 +267,27 @@ but this must not be represented as physical contactor confirmation.
 
 Every GPIO must be unique across:
 
-relay outputs
-toggle inputs
-detect inputs
+production relay outputs
+retired/reserved toggle inputs
+production feedback inputs
 
 Current authoritative allocation:
 
-17 relay A
-5  toggle A
-19 detect A
+17 production relay A
+5  retired/reserved toggle A
+19 production feedback A
 
-27 relay B
-6  toggle B
-16 detect B
+27 production relay B
+6  retired/reserved toggle B
+16 production feedback B
 
-23 relay C
-13 toggle C
-20 detect C
+23 production relay C
+13 retired/reserved toggle C
+20 production feedback C
 
-22 relay D
-12 toggle D
-21 detect D
+22 production relay D
+12 retired/reserved toggle D
+21 production feedback D
 
 No GPIO may be assigned to two functions.
 
@@ -410,10 +388,10 @@ Before production deployment verify electrically:
 
 1. Relay GPIO LOW activates relay.
 2. Relay GPIO HIGH deactivates relay.
-3. Toggle inactive reads HIGH.
-4. Toggle active reads LOW.
-5. Detect inactive reads HIGH.
-6. Detect active reads LOW.
+3. Retired toggle GPIOs 5/6/13/12 are not opened by the controller or by the input diagnostic.
+4. Do not validate those retired pins as live switches.
+5. Feedback inactive reads HIGH.
+6. Feedback active reads LOW.
 7. No GPIO is electrically shorted to another GPIO.
 8. Inputs use appropriate isolation/protection for the installed contactor
    feedback circuit.
@@ -438,11 +416,9 @@ Firmware tests MUST cover:
 - all 12 GPIOs are unique
 - relay active-low
 - relay startup OFF
-- toggle A event
-- toggle B event
-- toggle C event
-- toggle D event
-- toggle debounce
+- retired toggles 5/6/13/12 are reserved and are not opened by GPIOManager
+- retired toggle events do not energize a relay or clear FAULT
+- the input diagnostic does not open retired toggle pins
 - detect A
 - detect B
 - detect C
@@ -458,27 +434,25 @@ Firmware tests MUST cover:
 - failed feedback ON confirmation => FAULT
 - failed feedback OFF confirmation => FAULT
 - break-before-make is enforced
-- toggle active-high (GPIO HIGH -> ON, LOW -> OFF)
-- boot: already-HIGH toggle generates no edge / no relay action
-- GPIO initialisation failure -> FAULT, relays untouched, hardware_fault reported
-- logically disabled slot toggle -> rejected SLOT_DISABLED
+- feedback remains active-low with pull-up
+- GPIOManager opens exactly 17, 27, 23, 22, 19, 16, 20, 21
+- LCD BCM 2/3 and UART/SPI/ID EEPROM pins stay unassigned
+- GPIO initialisation failure -> FAULT, relays OFF, hardware_fault reported
 
-Implemented by `test_reports/hw_source_of_truth_test.py` and `test_reports/hw_truth_v2_test.py` (mock gpiozero; run alone).
+Implemented by `qa/hw_source_of_truth_test.py` (mock gpiozero; run alone).
 
 ---
 
-# 17. PHYSICAL PRESENCE (NOT DETECTABLE WITH THIS MAP)
+# 17. PHYSICAL PRESENCE
 
-The 12-GPIO map carries NO presence signal. With active-high pull-down toggles a
-LOW input is produced equally by:
+The retired toggle pins are not a presence input. GPIOManager does not read
+them, and firmware MUST NOT derive "hardware present" or a channel request
+from BCM 5, 6, 13, or 12.
 
-1. a physical toggle that exists and is OFF
-2. an unwired / absent wing
-
-Firmware and cloud therefore MUST NOT derive "hardware present" from toggle or
-detect levels, and MUST NOT probe by driving outputs. "Logical slot enabled" is
-an explicit administrative setting (cloud `slot_configs.disabled`), separate from
-toggle state and contactor feedback.
+Contactor feedback reports the contactor auxiliary contact. It is not a wing
+presence strap. Firmware MUST NOT probe by driving outputs. "Logical slot
+enabled" is an explicit administrative setting (cloud `slot_configs.disabled`),
+separate from contactor feedback.
 
 If true presence detection is required, the hardware must add one of:
 
@@ -494,15 +468,18 @@ Such a signal must be added to this document first, then to the firmware.
 
 4 CHANNELS:
 
-A = Relay17 / Toggle5 / Detect19
-B = Relay27 / Toggle6 / Detect16
-C = Relay23 / Toggle13 / Detect20
-D = Relay22 / Toggle12 / Detect21
+A = production relay 17 / retired toggle 5 / production feedback 19
+B = production relay 27 / retired toggle 6 / production feedback 16
+C = production relay 23 / retired toggle 13 / production feedback 20
+D = production relay 22 / retired toggle 12 / production feedback 21
 
 Relay = ACTIVE-LOW
-Detect = ACTIVE-LOW
-Toggle = ACTIVE-HIGH (pull-down, HIGH = ON)
+Feedback = ACTIVE-LOW, pull-up, LOW = contactor ON
+Retired toggles = reserved, not opened, not production control inputs
 
-12 unique GPIO signals.
+GPIOManager opens exactly: 17, 27, 23, 22, 19, 16, 20, 21
+LCD I2C: SDA 2, SCL 3
+
+12 unique recorded GPIO signals. 8 are opened in production.
 
 This document is the single source of truth.

@@ -5,8 +5,10 @@ Do not tick any box without a physical Pi, relay board and (optionally) feedback
 
 Hardware contract: see `HARDWARE_SOURCE_OF_TRUTH.md` (BCM). Relays A/B/C/D = GPIO 17/27/23/22 (ACTIVE-LOW: pin LOW = relay ON),
 toggles A/B/C/D = GPIO 5/6/13/12 (ACTIVE-HIGH: pull-down, HIGH = ON, LOW = OFF-or-unwired), detect/feedback A/B/C/D = GPIO 19/16/20/21 (pull-up, LOW = contactor ON).
-Effective feedback = device `feedback_hardware_installed` AND slot `feedback_enabled`. Physical toggles are real inputs and go through the same interlock FSM as cloud commands. Logical slot enable is admin config (`ENABLE/DISABLE` on the slot card); a LOW toggle never implies hardware presence.
-Input-only diagnostic (never touches relays): `cd /mnt/ems-data && sudo -u pi GPIOZERO_PIN_FACTORY=lgpio python3 /opt/ems/pi_firmware/gpio_input_diag.py`
+Effective feedback = device `feedback_hardware_installed` AND slot `feedback_enabled`. Retired toggle pins BCM 5/6/13/12 stay reserved and must not be reused; they do not energize relays. Logical slot enable is admin config (`ENABLE/DISABLE` on the slot card).
+
+Contactor feedback wiring is not approved for a live coil until an electrician confirms the auxiliary contact. Required: isolated dry contact or optocoupler, 3.3 V GPIO logic, internal pull-up, LOW = contactor ON. Do not pull a GPIO up to 5 V. Do not connect contactor coil voltage to a Raspberry Pi pin. Do not run a live coil test from this repository's automated tests; those tests use mocked GPIO.
+Feedback diagnostic, only while `ems-controller` is stopped. It opens feedback GPIOs 19/16/20/21 and does not open relays or retired toggles 5/6/13/12: `sudo systemctl stop ems-controller && cd /mnt/ems-data && sudo -u pi GPIOZERO_PIN_FACTORY=lgpio python3 /opt/ems/pi_firmware/gpio_input_diag.py`
 
 | # | Step | Expected evidence | Pass |
 |---|------|-------------------|------|
@@ -22,8 +24,8 @@ Input-only diagnostic (never touches relays): `cd /mnt/ems-data && sudo -u pi GP
 | 8 | Slot A → ACTIVATE (`set_active_slot`) | Last Response: DELIVERED → EXECUTING | ☐ |
 | 9 | Observe relay A (GPIO 17, pin driven LOW) | Relay physically energises (LED/click/meter); GPIO 17 HIGH again after DEACTIVATE | ☐ |
 | 10 | If feedback installed + slot feedback enabled: contactor closes, detect GPIO 19 goes LOW | Result `VERIFIED_ON`; without feedback hardware result is `GPIO_CONFIRMED` and PHYSICAL stays `UNKNOWN` | ☐ |
-| 10b | Physical toggle B (GPIO 6 driven HIGH) while A active | Break-before-make: relay A OFF (and feedback OFF confirmed if enabled), interlock delay, then relay B ON; cloud shows `toggle` event `TOGGLE B ON -> OK`; top-level `toggle_input.B` = true in snapshot; dashboard slot B shows PHYSICAL TOGGLE ON | ☐ |
-| 10c | Toggle B released (GPIO 6 LOW) | Relay B OFF; `TOGGLE B OFF -> OK`. Toggle of a non-active channel OFF = no action. In FAULT a toggle produces `toggle_rejected` and no relay change | ☐ |
+| 10b | With the controller running, confirm retired toggle pins BCM 5/6/13/12 are not claimed | `gpio_input_diag.py` is not used while the service is up. Snapshot `toggle_input` is null for A–D. Driving BCM 6 does not change the active relay | ☐ |
+| 10c | Stop `ems-controller`, run `gpio_input_diag.py`, start the service again | Toggles print `RESERVED / RETIRED / NOT USED BY CONTROLLER` for GPIO 5/6/13/12. Only feedback GPIO 19/16/20/21 are read. Service returns ONLINE and no relay was energized by the diagnostic | ☐ |
 | 10d | Bench: hold two detect inputs LOW at once / one detect LOW with relays OFF | System FAULT, all relays OFF, no automatic recovery until service restart + healthy reconciliation | ☐ |
 | 11 | Backend `pi_commands` row | `hardware_verified_at` set with a positive verification token | ☐ |
 | 12 | Last Response | Status COMPLETED **only after** HW VERIFIED timestamp; never before | ☐ |

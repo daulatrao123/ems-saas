@@ -1,4 +1,4 @@
-"""HARDWARE_SOURCE_OF_TRUTH.md §16: all 42 legacy assertions preserved.
+"""Hardware GPIO contract. Retired toggle pins stay reserved and are not opened.
 
 REAL GPIOManager + EMSController; built-in mock gpiozero, cloud and storage
 environment are MOCKED. No Raspberry Pi/HIL. Run as a separate process:
@@ -16,6 +16,15 @@ import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
+
+if not hasattr(os, "statvfs"):
+    class _Vfs:
+        f_bavail = 10**9
+        f_blocks = 10**9
+        f_frsize = 4096
+        f_bfree = 10**9
+        f_bsize = 4096
+    os.statvfs = lambda _path: _Vfs()
 
 sys.path.insert(0, os.path.dirname(__file__))
 import phase05_sim_common as H  # noqa: E402
@@ -137,45 +146,62 @@ def map_and_inputs():
         check("relay pins wired per map", {s: r.pin for s, r in g.relays.items()} == {"A": 17, "B": 27, "C": 23, "D": 22})
         check("relay ON drives pin LOW", (g.relays["A"].on(), g.relays["A"].pin_level_high is False)[1]); g.relays["A"].off()
 
-        # ---------------------------------------------------------------- §4 / §5 inputs
-        check("toggle inputs: Button(pull_up=False [pull-down, HIGH=ON], bounce_time=0.05) on GPIO 5/6/13/12", {s: b.pin for s, b in g.toggles.items()} == {"A": 5, "B": 6, "C": 13, "D": 12}
-              and all(b.pull_up is False and b.bounce_time == 0.05 for b in g.toggles.values()))
+        # ---------------------------------------------------------------- inputs: feedback is live; retired toggles are reserved and not claimed
+        opened = {r.pin for r in g.relays.values()} | {b.pin for b in g.feedback_inputs.values()}
+        reserved_toggles = {s: CH[s]["toggle_gpio"] for s in "ABCD"}
+        check("GPIOManager does not open retired toggle pins", g.toggles == {} and g.toggle_inputs() == {s: None for s in "ABCD"})
         check("detect inputs: Button(pull_up=True, bounce_time=0.05) on GPIO 19/16/20/21", {s: b.pin for s, b in g.feedback_inputs.items()} == {"A": 19, "B": 16, "C": 20, "D": 21}
               and all(b.pull_up is True and abs(b.bounce_time - 0.05) < 1e-9 for b in g.feedback_inputs.values()))
-        check("toggle GPIO5 LOW reads OFF, GPIO5 HIGH reads ON (active-high)", g.toggle_inputs()["A"] is False and (g.toggles["A"]._set_level(True), g.toggle_inputs()["A"] is True)[1] and g.toggles["A"].level_high); g.toggles["A"]._set_level(False); g.pop_toggle_events()
+        check("retired toggle pins stay reserved at BCM 5/6/13/12 and are not opened", reserved_toggles == {"A": 5, "B": 6, "C": 13, "D": 12}
+              and set(reserved_toggles.values()).isdisjoint(opened))
+        profile_pins = set(pins)
+        protected = {0, 1, 2, 3, 7, 8, 9, 10, 11, 14, 15}
+        check("LCD I2C BCM 2/3 and Pi ID/SPI/UART pins are not assigned or opened", {2, 3}.isdisjoint(profile_pins) and {2, 3}.isdisjoint(opened)
+              and protected.isdisjoint(profile_pins) and opened == {17, 27, 23, 22, 19, 16, 20, 21})
+
+    import gpio_input_diag as diag
+    opened_by_diag = []
+
+    class RecordingButton:
+        def __init__(self, pin, pull_up=None, bounce_time=None):
+            opened_by_diag.append(pin)
+            self.is_pressed = False
+
+        def close(self):
+            return None
+
+    report = diag.read_inputs(button_cls=RecordingButton, samples=1, interval_s=0)
+    check("input diagnostic reports retired toggles and does not open them",
+          opened_by_diag == [19, 16, 20, 21]
+          and {s: r["gpio"] for s, r in report["toggles"].items()} == {"A": 5, "B": 6, "C": 13, "D": 12}
+          and all(r["status"] == "RESERVED" and r["role"] == "RETIRED" and r["ownership"] == "NOT USED BY CONTROLLER" and r["opened"] is False
+                  for r in report["toggles"].values())
+          and {s: r["gpio"] for s, r in report["detects"].items()} == {"A": 19, "B": 16, "C": 20, "D": 21})
 
 
 def controller_toggles():
-    # ---------------------------------------------------------------- §8 / §9 toggle events through the controller
+    # Retired toggles must not become a second way to energize a relay.
     ctrl = ec.EMSController()
     try:
         ctrl.device_config.update(cfg(False)); ok = ctrl.boot()
-        check("controller boots READY with all relays OFF", ok and ctrl.state.system_state == SystemState.READY and not any(r.is_active for r in ctrl.gpio.relays.values()))
+        relays = {s: r.is_active for s, r in ctrl.gpio.relays.items()}
+        check("controller boots READY with all relays OFF", ok and ctrl.state.system_state == SystemState.READY and relays == {s: False for s in "ABCD"})
         assert ok is True and ctrl.state.system_state == SystemState.READY, "clean controller must boot READY"
-        def toggle(slot, on): ctrl.gpio.toggles[slot]._set_level(on)  # active-high: HIGH = ON
-        def relays(): return {s: r.is_active for s, r in ctrl.gpio.relays.items()}
-        def last_event(t="toggle"): ev = [e for e in ctrl._pending_events if e["type"] == t]; return ev[-1]["message"] if ev else ""
-        for s in "ABCD":
-            toggle(s, True); n = ctrl.process_toggle_events()
-            check(f"toggle {s} event -> channel {s} ON via interlock FSM (n={n})", n == 1 and relays() == {x: x == s for x in "ABCD"} and ctrl.state.active_slot == s and f"TOGGLE {s} gpio={CH[s]['toggle_gpio']} edge=OFF->ON" in last_event() and "result=OK" in last_event(), str(relays()))
-            if s != "D": toggle(s, False); ctrl.process_toggle_events()
-        check("toggle A->B->C->D each performed break-before-make (only one relay ever ON)", relays() == {"A": False, "B": False, "C": False, "D": True})
-        toggle("A", True); ctrl.process_toggle_events()
-        check("D -> A transition via toggle while D active (break-before-make)", relays() == {"A": True, "B": False, "C": False, "D": False} and ctrl.state.active_slot == "A")
-        toggle("B", False); n = ctrl.process_toggle_events()
-        check("toggle OFF on a non-active channel is a silent no-op", n == 0 and relays()["A"] is True)
-        toggle("A", False); n = ctrl.process_toggle_events()
-        check("toggle OFF on the active channel -> channel OFF", n == 1 and not any(relays().values()) and ctrl.state.active_slot is None)
-        # gpiozero applies bounce_time; the mock fires only on a state CHANGE.
-        before = len(ctrl._pending_events); toggle("C", True); toggle("C", True); toggle("C", True); n = ctrl.process_toggle_events()
-        check("toggle debounce: repeated identical levels = exactly one command", n == 1 and len(ctrl._pending_events) == before + 1 and relays()["C"])
-        check("snapshot: top-level toggle_input bools, no per-slot duplicate, contactor UNKNOWN without feedback", ctrl._build_snapshot()["toggle_input"] == {"A": False, "B": False, "C": True, "D": True} and "toggle_input" not in ctrl._build_snapshot()["slots"]["C"] and ctrl._build_snapshot()["slots"]["C"]["physical_toggle"] == "UNKNOWN" and ctrl._build_snapshot()["hardware_fault"] is None)
-        check("toggle event flows to cloud events[] stream", any(e["type"] == "toggle" for e in ctrl._build_snapshot()["events"]))
-        ctrl.state.system_state = SystemState.CLOUD_OFFLINE; toggle("C", False); n = ctrl.process_toggle_events()
-        check("toggles work while CLOUD_OFFLINE and restore that state", n == 1 and not relays()["C"] and ctrl.state.system_state == SystemState.CLOUD_OFFLINE)
-        ctrl.state.system_state = SystemState.READY
-        ctrl.state.system_state = SystemState.FAULT; toggle("B", True); n = ctrl.process_toggle_events()
-        check("toggle while FAULT -> rejected, no relay change, toggle_rejected event", n == 0 and not any(relays().values()) and "reason=FAULT" in last_event("toggle_rejected") and "result=REJECTED" in last_event("toggle_rejected"))
+        check("booted controller opens relays 17/27/23/22 and feedback 19/16/20/21 only",
+              {s: r.pin for s, r in ctrl.gpio.relays.items()} == {"A": 17, "B": 27, "C": 23, "D": 22}
+              and {s: b.pin for s, b in ctrl.gpio.feedback_inputs.items()} == {"A": 19, "B": 16, "C": 20, "D": 21}
+              and all(r.active_high is False for r in ctrl.gpio.relays.values())
+              and all(b.pull_up is True for b in ctrl.gpio.feedback_inputs.values())
+              and ctrl.gpio.toggles == {})
+        n = ctrl.process_toggle_events()
+        check("discarded toggle events do not energize a relay", n == 0 and {s: r.is_active for s, r in ctrl.gpio.relays.items()} == {s: False for s in "ABCD"} and ctrl.state.active_slot is None)
+        snap = ctrl._build_snapshot()
+        check("snapshot does not invent toggle or contactor state", snap["toggle_input"] == {s: None for s in "ABCD"}
+              and all(snap["slots"][s]["physical_toggle"] == "UNKNOWN" for s in "ABCD") and snap["hardware_fault"] is None
+              and not any(e["type"] in ("toggle", "toggle_rejected") for e in snap["events"]))
+        ctrl.state.system_state = SystemState.FAULT
+        n = ctrl.process_toggle_events()
+        check("discarded toggle events do not clear FAULT or energize a relay", n == 0 and ctrl.state.system_state == SystemState.FAULT and not any(r.is_active for r in ctrl.gpio.relays.values()))
     finally:
         ctrl.shutdown()
         stop_gpio(ctrl.gpio)
@@ -235,13 +261,30 @@ def feedback_and_interlock():
         check("safety monitor detects unexpected contactor ON while CLOUD_OFFLINE -> FAULT", st.system_state == SystemState.FAULT)
 
 
-if __name__ == "__main__":
+EXPECTED_CHECKS = 35
+
+
+def run_hardware_contract():
+    R.clear()
     print("GPIO/cloud/storage environment: MOCKED. GPIO timing: real. Raspberry Pi/HIL NOT performed.")
     with patch.object(gm, "time", GPIO_TIME), patch.object(ec, "ApiClient", Api), \
             patch.object(ec.EMSController, "_install_signal_handlers", lambda self: None):
         map_and_inputs()
         controller_toggles()
         feedback_and_interlock()
-    assert len(R) == 42, "all 42 legacy assertions must execute"
-    print(f"\n{sum(R)}/{len(R)} passed")
-    sys.exit(0 if all(R) else 1)
+    return list(R)
+
+
+def test_hardware_source_of_truth():
+    results = run_hardware_contract()
+    assert len(results) == EXPECTED_CHECKS, f"{len(results)} checks ran, contract requires {EXPECTED_CHECKS}"
+    assert all(results), f"{sum(results)}/{len(results)} passed"
+
+
+if __name__ == "__main__":
+    results = run_hardware_contract()
+    print(f"\n{sum(results)}/{len(results)} passed")
+    if len(results) != EXPECTED_CHECKS:
+        print(f"FAIL check count {len(results)} != {EXPECTED_CHECKS}")
+        sys.exit(1)
+    sys.exit(0 if results and all(results) else 1)

@@ -146,6 +146,7 @@ class GPIOManager:
             # controller stays alive in FAULT to report the fault; systemd must not crash-loop.
             self.hardware_fault = f"GPIO_INIT_FAILED: {type(exc).__name__}: {exc}"
             logger.critical("%s -- controller will run in FAULT with no GPIO.", self.hardware_fault)
+            self._deenergize_all()
             self._release_devices()
             self.monitor_thread = None
             return
@@ -167,6 +168,15 @@ class GPIOManager:
         self.relays.clear()
         self.feedback_inputs.clear()
         self.toggles.clear()
+
+    def _deenergize_all(self):
+        """Drive every relay output OFF. Does not claim feedback OFF or VERIFIED_ON."""
+        for slot, relay in list(self.relays.items()):
+            try:
+                relay.off()
+            except Exception as exc:
+                logger.error("Unable to de-energize slot %s: %s", slot, exc)
+            self.state_manager.set_gpio_output(slot, GpioOutputState.OFF)
 
     # ============================================================
     # TOGGLE INPUTS (events only: never drive relays from here)
@@ -331,6 +341,7 @@ class GPIOManager:
 
         if self.hardware_fault:
             logger.critical("Reconciliation refused: %s", self.hardware_fault)
+            self._deenergize_all()
             self.state_manager.system_state = SystemState.FAULT
             self.state_manager.save_state(immediate=True)
             return False
@@ -384,6 +395,7 @@ class GPIOManager:
 
         if snapshot is None:
             logger.critical("Hardware reconciliation feedback deadline expired.")
+            self._deenergize_all()
             self.state_manager.system_state = SystemState.FAULT
             return False
 
@@ -402,6 +414,9 @@ class GPIOManager:
                 active_relays,
             )
 
+            for slot, on in feedback_states.items():
+                self.state_manager.set_feedback(slot, FeedbackState.ON if on else FeedbackState.OFF)
+            self._deenergize_all()
             self.state_manager.system_state = (
                 SystemState.FAULT
             )
@@ -415,6 +430,9 @@ class GPIOManager:
                 active_feedbacks,
             )
 
+            for slot, on in feedback_states.items():
+                self.state_manager.set_feedback(slot, FeedbackState.ON if on else FeedbackState.OFF)
+            self._deenergize_all()
             self.state_manager.system_state = (
                 SystemState.FAULT
             )
@@ -458,6 +476,7 @@ class GPIOManager:
                     immediate=True,
                 )
 
+                self._deenergize_all()
                 self.state_manager.system_state = (
                     SystemState.FAULT
                 )
@@ -469,6 +488,7 @@ class GPIOManager:
         # --------------------------------------------------------
 
         if time.perf_counter() >= deadline:
+            self._deenergize_all()
             self.state_manager.system_state = SystemState.FAULT
             return False
 
@@ -541,6 +561,7 @@ class GPIOManager:
             for slot in enabled:
                 self.state_manager.set_feedback(slot, FeedbackState.PENDING)
                 self.state_manager.set_verification(slot, VerificationState.PENDING)
+            self._deenergize_all()
             self.state_manager.system_state = SystemState.FAULT
             return False
 
@@ -632,6 +653,7 @@ class GPIOManager:
                                 current_active, VerificationState.TIMEOUT, immediate=True
                             )
 
+                            self._deenergize_all()
                             self.state_manager.system_state = (
                                 SystemState.FAULT
                             )
@@ -655,6 +677,7 @@ class GPIOManager:
                         self.state_manager.set_gpio_output(target_slot, GpioOutputState.OFF)
                         self.state_manager.set_commanded(target_slot, CommandedState.OFF)
                         self.state_manager.set_verification(current_active, result, immediate=True)
+                        self._deenergize_all()
                         self.state_manager.system_state = SystemState.FAULT
                         return False
 
@@ -748,6 +771,7 @@ class GPIOManager:
                         immediate=True,
                     )
 
+                    self._deenergize_all()
                     self.state_manager.system_state = (
                         SystemState.FAULT
                     )
@@ -850,6 +874,7 @@ class GPIOManager:
                         immediate=True,
                     )
 
+                    self._deenergize_all()
                     self.state_manager.system_state = (
                         SystemState.FAULT
                     )
@@ -903,6 +928,7 @@ class GPIOManager:
                             if result == VerificationState.PENDING:
                                 logger.critical("Slot %s feedback cannot be qualified.", slot)
                                 self.state_manager.set_verification(slot, result, immediate=True)
+                                self._deenergize_all()
                                 self.state_manager.system_state = SystemState.FAULT
                                 break
 
@@ -924,6 +950,7 @@ class GPIOManager:
                                     immediate=True,
                                 )
 
+                                self._deenergize_all()
                                 self.state_manager.system_state = (
                                     SystemState.FAULT
                                 )
@@ -946,6 +973,7 @@ class GPIOManager:
                                     immediate=True,
                                 )
 
+                                self._deenergize_all()
                                 self.state_manager.system_state = (
                                     SystemState.FAULT
                                 )
@@ -957,6 +985,7 @@ class GPIOManager:
                     exc,
                 )
 
+                self._deenergize_all()
                 self.state_manager.system_state = (
                     SystemState.FAULT
                 )

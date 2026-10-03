@@ -999,6 +999,11 @@ class EMSController:
 
         command_id, slot, action = claimed
 
+        if self.state.system_state == SystemState.FAULT:
+            logger.critical("Refusing command %s: system is FAULT. No relay will be energized.", command_id)
+            self.queue.update_status(command_id, "FAILED", "FAULT", "hardware FAULT; command refused")
+            return True
+
         logger.info(
             "Executing command %s action=%s slot=%s",
             command_id,

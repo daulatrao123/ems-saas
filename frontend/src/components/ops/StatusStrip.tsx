@@ -24,10 +24,19 @@ export function StatusStrip({ device, resetDay }: { device: Device | null; reset
   const cpu = measured == null ? "UNKNOWN" : freshness !== "CURRENT" ? freshness : `${measured.toFixed(1)}°C`;
   const up = fmtUptime(t?.uptime_seconds) || "N/A";
   const boots = count == null ? "UNKNOWN" : freshness !== "CURRENT" ? freshness : String(count);
+  const live = device?.connected === true && device.feedback_hardware_installed === true && !device.hardware_fault;
+  const enabledSlots = live ? SLOT_CODES.filter((c) => device!.slots[c] && device!.slots[c].feedback_enabled !== false) : [];
+  const reading = (code: string) => device!.slots[code].physical_toggle;
+  const unknown = enabledSlots.some((c) => reading(c) !== "ON" && reading(c) !== "OFF");
+  const ons = enabledSlots.filter((c) => reading(c) === "ON");
+  const physical = !live || unknown ? "UNKNOWN" : ons.length > 1 ? "MULTIPLE" : ons.length === 1 ? ons[0] : "OFF";
+  const commanded = device?.active_slot || null;
+  const verified = live && physical !== "MULTIPLE" && physical !== "UNKNOWN" && ((physical === "OFF" && !commanded) || physical === commanded);
+  const fault = device?.emergency_stop === true || !!device?.hardware_fault || physical === "MULTIPLE";
   return (
     <div data-testid="status-strip" className={panel}>
     <div className="ops-metric-grid grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 divide-y xl:divide-y-0 divide-[#1e2a3a]">
-      <Stat id="active-slot" name="Active Slot" value={device?.active_slot || "—"} sub={device?.active_slot ? device.slots[device.active_slot]?.display_name : "none active"} tone="text-cyan-300" />
+      <Stat id="active-slot" name="Commanded Wing" value={commanded || "—"} sub={`Commanded, not physical proof · Physical ${physical} · Feedback ${verified ? "VERIFIED" : "NOT VERIFIED"}${fault ? " · FAULT" : ""}`} tone="text-cyan-300" />
       <Stat id="slots" name="Slots" value={slots.length ? `${enabled} / ${slots.length}` : "—"} sub="enabled / configured" />
       <Stat id="reset-day" name="Reset Day" value={String(resetDay)} sub="day of month" />
       <Stat id="next-reset" name="Next Reset" value={nextResetDate(resetDay)} sub="derived from reset day" />
