@@ -1712,8 +1712,11 @@ def pi_sync(
     reply = None
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("UPDATE pi_devices SET last_seen = %s, firmware_version = %s WHERE id = %s",
-                        (now, payload.get("firmwareVersion", "unknown"), device_id))
+            incoming_firmware = payload.get("firmwareVersion", "unknown")
+            cur.execute("""UPDATE pi_devices SET last_seen = %s,
+                           firmware_version = CASE WHEN firmware_version IS DISTINCT FROM %s THEN %s ELSE firmware_version END
+                           WHERE id = %s""",
+                        (now, incoming_firmware, incoming_firmware, device_id))
 
             slots_payload = payload.get("slots", payload.get("wings", {}))
             # Physical toggle inputs (top-level, additive): true/false/null per slot; absent -> UNKNOWN.
@@ -1729,7 +1732,11 @@ def pi_sync(
                                VALUES (%s, %s, %s, %s, %s, %s)
                                ON CONFLICT (device_id, slot) DO UPDATE SET
                                physical_toggle=EXCLUDED.physical_toggle, toggle_input=EXCLUDED.toggle_input,
-                               used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks""",
+                               used_days=EXCLUDED.used_days, clicks=EXCLUDED.clicks
+                               WHERE slot_state.physical_toggle IS DISTINCT FROM EXCLUDED.physical_toggle
+                                  OR slot_state.toggle_input IS DISTINCT FROM EXCLUDED.toggle_input
+                                  OR slot_state.used_days IS DISTINCT FROM EXCLUDED.used_days
+                                  OR slot_state.clicks IS DISTINCT FROM EXCLUDED.clicks""",
                             (device_id, slot_code, physical_toggle, toggle_input, int(w.get("used_days", w.get("usedDays", 0))), int(w.get("clicks", 0))))
             hardware_fault = payload.get("hardware_fault")
             hardware_fault = str(hardware_fault)[:500] if hardware_fault else None
