@@ -1017,8 +1017,11 @@ class EMSController:
 
         self._ack_sent_events()
         self.energy.sync_succeeded()
-        if isinstance(response.get("energy_config"), dict):
-            self.energy.apply_config(response["energy_config"])
+        energy_cfg = response.get("energy_config", None)
+        if isinstance(energy_cfg, dict):
+            self.energy.apply_config(energy_cfg)
+        elif energy_cfg is not None:
+            device_obs.safe_observe("sync", lambda: device_obs.note_energy_config_received(None, "rejected", False, False, "NOT_OBJECT"))
         self._auth_rejected_logged = False
 
         if self.state.system_state == (

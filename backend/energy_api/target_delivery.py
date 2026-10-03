@@ -8,6 +8,11 @@ from psycopg.types.json import Json
 import math
 from fastapi import HTTPException
 
+try:
+    import cloud_obs
+except ImportError:  # repo-root tests import this module as backend.energy_api.target_delivery
+    from backend import cloud_obs
+
 
 def reconcile_targets(cur, did, as_of, version, *, force=False):
     cur.execute("""SELECT DISTINCT ON (wing) id, wing, target_kwh_per_day, effective_from FROM energy_generation_targets
@@ -30,12 +35,41 @@ def reconcile_targets(cur, did, as_of, version, *, force=False):
     return targets, int(version)
 
 
-def record_report(cur, did, energy, now):
+def _report_category(energy):
+    if not isinstance(energy, dict) or "config_version" not in energy:
+        return "missing"
+    value = energy.get("config_version")
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    return "other"
+
+
+def record_report(cur, did, energy, now, society_id=None):
     value = energy.get("config_version") if isinstance(energy, dict) else None
     version = value if type(value) is int and 0 <= value <= 2147483647 else None
+    category = _report_category(energy)
+    cur.execute("SELECT reported_config_version FROM energy_sync_state WHERE device_id=%s", (did,))
+    row = cur.fetchone()
+    previous = row.get("reported_config_version") if isinstance(row, dict) else None
     cur.execute("""INSERT INTO energy_sync_state (device_id,reported_config_version,reported_at) VALUES (%s,%s,%s)
         ON CONFLICT (device_id) DO UPDATE SET reported_config_version=EXCLUDED.reported_config_version, reported_at=EXCLUDED.reported_at""",
                 (did, version, now))
+    accepted = version is not None
+    try:
+        cloud_obs.safe_observe("sync", lambda: cloud_obs.note_energy_report_stored(
+            did, society_id, category, accepted, previous, version,
+            "ACCEPTED" if accepted else "NON_INTEGER_OR_MISSING",
+        ))
+    except Exception:
+        cloud_obs.note_observation_error("sync")
     return version
 
 

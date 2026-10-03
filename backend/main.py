@@ -1933,7 +1933,7 @@ def pi_sync(
             }
             if ota_offer:
                 reply["ota"] = ota_offer
-            energy_cfg = energy_ingest.config_reply(cur, device_id, payload.get("energy"), now)
+            energy_cfg = energy_ingest.config_reply(cur, device_id, payload.get("energy"), now, society_id=society_id)
             if energy_cfg is not None:
                 reply["energy_config"] = energy_cfg
             if cmd:

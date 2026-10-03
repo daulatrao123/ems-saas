@@ -24,12 +24,19 @@ _counts = {
     "config_apply_changed": 0,
     "config_apply_unchanged": 0,
     "config_apply_rejected": 0,
+    "energy_config_received_total": 0,
+    "energy_config_accepted_total": 0,
+    "energy_config_rejected_total": 0,
+    "energy_config_report_integer": 0,
+    "energy_config_report_missing": 0,
     "observation_errors_total": 0,
 }
 _error_components = {}
 _sqlite = {"journal_mode": "UNKNOWN", "synchronous": "UNKNOWN"}
 _last_config = None
 _last_persist = None
+_last_energy_received = None
+_last_energy_report = None
 
 
 def note_observation_error(component):
@@ -155,6 +162,46 @@ def config_apply(device_id, incoming_version, current_version, incoming_hash, cu
         return
 
 
+def note_energy_config_received(version, validation, persisted, applied, reason):
+    """Last energy-config receive only. Never raises and does not change config."""
+    try:
+        valid = type(version) is int
+        accepted = validation == "accepted"
+        _inc("energy_config_received_total")
+        _inc("energy_config_accepted_total" if accepted else "energy_config_rejected_total")
+        body = {
+            "t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "version": version if valid else None,
+            "version_is_integer": valid,
+            "validation": "accepted" if accepted else "rejected",
+            "persisted": bool(persisted),
+            "applied": bool(applied),
+            "reason": None if accepted else str(reason or "REJECTED")[:80],
+        }
+        with _lock:
+            global _last_energy_received
+            _last_energy_received = body
+    except Exception:
+        return
+
+
+def note_energy_config_report(config_version):
+    """Record the snapshot version exactly. Never replaces null with a number."""
+    try:
+        valid = type(config_version) is int
+        _inc("energy_config_report_integer" if valid else "energy_config_report_missing")
+        body = {
+            "t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "config_version": config_version if valid else None,
+            "valid_integer": valid,
+        }
+        with _lock:
+            global _last_energy_report
+            _last_energy_report = body
+    except Exception:
+        return
+
+
 def _file_size(path):
     if not path:
         return "UNKNOWN"
@@ -209,6 +256,8 @@ def snapshot(db_file=None, state_file=None, telemetry_dir=None, day_based_path=N
         sqlite_settings = dict(_sqlite)
         last_config = dict(_last_config) if isinstance(_last_config, dict) else None
         last_persist = dict(_last_persist) if isinstance(_last_persist, dict) else None
+        last_energy_received = dict(_last_energy_received) if isinstance(_last_energy_received, dict) else None
+        last_energy_report = dict(_last_energy_report) if isinstance(_last_energy_report, dict) else None
     files = _sqlite_files(db_file)
     files.update(_log_gauges())
     files["state_bytes"] = _file_size(state_file)
@@ -222,4 +271,6 @@ def snapshot(db_file=None, state_file=None, telemetry_dir=None, day_based_path=N
                    "synchronous": sqlite_settings.get("synchronous", "UNKNOWN")},
         "last_config_apply": last_config,
         "last_day_based_persist": last_persist,
+        "last_energy_config_received": last_energy_received,
+        "last_energy_config_report": last_energy_report,
     }

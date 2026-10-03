@@ -10,6 +10,11 @@ from .target_delivery import reconcile_targets, record_report
 from . import queries as Q
 from fastapi import HTTPException
 
+try:
+    import cloud_obs
+except ImportError:  # repo-root tests import this package as backend.energy_api
+    from backend import cloud_obs
+
 METER_IDS = ("M1", "M2", "M3", "M4", "M5")
 METER_ROLE = {"M1": "GENERATION", "M2": "CONSUMPTION", "M3": "CONSUMPTION", "M4": "CONSUMPTION", "M5": "CONSUMPTION"}
 METER_WING = {"M1": None, "M2": "A", "M3": "B", "M4": "C", "M5": "D"}
@@ -159,28 +164,42 @@ def _ingest(cur, device_id, energy, now):
             **({"error": "ENERGY_ROWS_REJECTED"} if rejected else {})}
 
 
-def build_energy_config(cur, device_id, now=None, *, reported_version=None):
+def _trace_delivery(trace, reason, desired, changed=False):
+    if isinstance(trace, dict):
+        trace["reason"] = reason
+        trace["desired_version"] = desired if type(desired) is int else None
+        trace["version_changed"] = bool(changed)
+
+
+def build_energy_config(cur, device_id, now=None, *, reported_version=None, trace=None):
     """Backend-authoritative config for the Pi: {"version", "bus", "meters": {Mx: {...}}}."""
     now = utc_now(now)
     cur.execute("SELECT energy_bus, energy_config_version, energy_allocation, allocation_mode FROM pi_devices WHERE id=%s FOR UPDATE", (device_id,))
     dev = cur.fetchone()
     if not dev:
+        _trace_delivery(trace, "DEVICE_MISSING", None)
         return None
+    desired_before = dev["energy_config_version"] if type(dev["energy_config_version"]) is int else None
     # Invalid OPEN data must not select future targets, nor abort the rest of Pi sync.
     try:
         as_of = Q.device_today(cur, device_id, now.date(), now=now)
     except HTTPException as exc:
         logging.getLogger("ems.energy").warning("Energy config withheld device=%s: %s", device_id, exc.detail)
+        _trace_delivery(trace, "OPERATING_DAY", desired_before)
         return None
     try:
         targets, version = reconcile_targets(cur, device_id, as_of, dev["energy_config_version"])
     except HTTPException as exc:
         logging.getLogger("ems.energy").warning("Energy config withheld device=%s: %s", device_id, exc.detail)
+        _trace_delivery(trace, "TARGET_INVALID", desired_before)
         return None
+    changed = type(desired_before) is int and version != desired_before
     # Still qualify the operating date and reconcile effective targets on EVERY
     # request, including rollover. Skip only the unused full meter snapshot.
     if type(reported_version) is int and reported_version == version:
+        _trace_delivery(trace, "ALREADY_REPORTED", version, changed)
         return None
+    _trace_delivery(trace, "GENERATED", version, changed)
     ensure_meter_rows(cur, device_id)
     cur.execute("""SELECT meter_id, serial, modbus_address, model, register_map, phases, ct_ratio, max_kw, enabled
                    FROM energy_meters WHERE device_id=%s ORDER BY meter_id""", (device_id,))
@@ -194,12 +213,29 @@ def build_energy_config(cur, device_id, now=None, *, reported_version=None):
             "allocation": allocation, "allocation_mode": dev.get("allocation_mode") or "AUTO", "targets": targets}
 
 
-def config_reply(cur, device_id, energy, now=None):
+def _observe_delivery(device_id, society_id, trace, stored, attached):
+    reason = trace.get("reason")
+    if attached:
+        reason = "REPORT_MISSING" if stored is None else "VERSION_DIFFERS"
+    elif reason == "GENERATED":
+        reason = "STORED_MATCH"
+    try:
+        cloud_obs.safe_observe("sync", lambda: cloud_obs.note_energy_delivery(
+            device_id, society_id, trace.get("desired_version"), stored, attached, reason, trace.get("version_changed"),
+        ))
+    except Exception:
+        cloud_obs.note_observation_error("sync")
+
+
+def config_reply(cur, device_id, energy, now=None, society_id=None):
     """Include energy_config in the sync reply only when the Pi runs a different version (or none)."""
     now = utc_now(now)
     reported = energy.get("config_version") if isinstance(energy, dict) else None
-    cfg = build_energy_config(cur, device_id, now, reported_version=reported)
-    reported = record_report(cur, device_id, energy, now)
+    trace = {}
+    cfg = build_energy_config(cur, device_id, now, reported_version=reported, trace=trace)
+    stored = record_report(cur, device_id, energy, now, society_id=society_id)
+    attached = cfg is not None and stored != cfg["version"]
+    _observe_delivery(device_id, society_id, trace, stored, attached)
     if cfg is None:
         return None
-    return cfg if reported != cfg["version"] else None
+    return cfg if stored != cfg["version"] else None

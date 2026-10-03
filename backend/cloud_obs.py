@@ -262,6 +262,56 @@ def note_software_recovery(fields):
         return
 
 
+_DELIVERY_REASONS = frozenset({
+    "DEVICE_MISSING", "OPERATING_DAY", "TARGET_INVALID", "ALREADY_REPORTED",
+    "REPORT_MISSING", "VERSION_DIFFERS", "STORED_MATCH",
+})
+_REPORT_REASONS = frozenset({"ACCEPTED", "NON_INTEGER_OR_MISSING"})
+_VERSION_CATEGORIES = frozenset({"int", "none", "missing", "bool", "str", "float", "other"})
+
+
+def note_energy_delivery(device_id, society_id, desired_version, reported_version, attached, reason, version_changed):
+    """One bounded sync-delivery trace. Never raises."""
+    try:
+        code = reason if reason in _DELIVERY_REASONS else "OTHER"
+        _inc("energy_config_delivery_total")
+        _inc("energy_config_attached_total" if attached else "energy_config_withheld_total")
+        _dim("energy_config_delivery_by_reason", code)
+        _event("energy_config_delivery", {
+            "device_id": device_id,
+            "society_id": society_id,
+            "desired_version": desired_version if type(desired_version) is int else None,
+            "reported_version": reported_version if type(reported_version) is int else None,
+            "attached": bool(attached),
+            "reason": code,
+            "version_changed": bool(version_changed),
+            "config_hash": None,
+        })
+    except Exception:
+        return
+
+
+def note_energy_report_stored(device_id, society_id, category, accepted, previous_version, resulting_version, reason):
+    """What record_report stored. Never raises and does not write SQL."""
+    try:
+        kind = category if category in _VERSION_CATEGORIES else "other"
+        code = reason if reason in _REPORT_REASONS else "NON_INTEGER_OR_MISSING"
+        _inc("energy_config_report_total")
+        _inc("energy_config_report_accepted_total" if accepted else "energy_config_report_rejected_total")
+        _dim("energy_config_report_by_category", kind)
+        _event("energy_config_report_stored", {
+            "device_id": device_id,
+            "society_id": society_id,
+            "received_category": kind,
+            "accepted": bool(accepted),
+            "previous_reported_version": previous_version if type(previous_version) is int else None,
+            "resulting_reported_version": resulting_version if type(resulting_version) is int else None,
+            "reason": code,
+        })
+    except Exception:
+        return
+
+
 def note_allocation(kind, http_status, duration_s, body, idempotency_hash_value=None):
     _inc("allocation_calculate_total" if kind == "calculate" else "allocation_apply_total")
     commands = (body or {}).get("commands") or []

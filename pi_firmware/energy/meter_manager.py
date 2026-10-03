@@ -77,6 +77,7 @@ class EnergyEngine:
     def apply_config(self, cfg, persist=True):
         """cfg = {"version": n, "bus": {"port", "serial"}, "meters": {"M1": {...}, ...}}. Invalid -> keep previous."""
         if not isinstance(cfg, dict):
+            _trace_energy_config(None, "rejected", False, False, "NOT_OBJECT")
             return False, "energy config must be an object"
         with self._lock:
             try:
@@ -84,6 +85,7 @@ class EnergyEngine:
             except RegistryError as exc:
                 self.config_error = str(exc)
                 self.log.error("Energy config rejected: %s", exc)
+                _trace_energy_config(cfg.get("version"), "rejected", False, False, "REGISTRY_REJECTED")
                 return False, str(exc)
             bus_cfg = cfg.get("bus") or {}
             if bus_cfg != (self.config.get("bus") or {}) or self.bus is None:
@@ -109,11 +111,16 @@ class EnergyEngine:
             self.targets = cfg.get("targets") if isinstance(cfg.get("targets"), dict) else {}
             self.config_version = cfg.get("version")
             self.config_error = None
+            persisted = False
             if persist and self._writes_ok():
                 try:
                     atomic_write_json(os.path.join(self.dir, "config.json"), cfg)
+                    persisted = True
                 except OSError as exc:
                     self.log.warning("Energy config not persisted: %s", exc)
+            elif not persist:
+                persisted = False
+            _trace_energy_config(cfg.get("version"), "accepted", persisted, True, None)
             return True, None
 
     def _close_bus(self):
@@ -215,7 +222,7 @@ class EnergyEngine:
             days = self.ledger.pending_days()[:MAX_CLOSED_DAYS_PER_SYNC]
             self._days_in_flight = [d["operating_date"] for d in days]
             self._events_in_flight = len(self._events)
-            return {
+            payload = {
                 "schema": 1,
                 "config_version": self.config_version,
                 "config_error": self.config_error,
@@ -227,6 +234,8 @@ class EnergyEngine:
                 "events": list(self._events),
                 "allocation": self.allocation.view(),
             }
+            _trace_energy_report(payload.get("config_version"))
+            return payload
 
     def sync_succeeded(self):
         with self._lock:
@@ -288,6 +297,25 @@ class EnergyEngine:
         """Tiny read-only view for the LCD/diagnostics (no I/O)."""
         with self._lock:
             return {"attribution": dict(self.attribution), "online": [mid for mid, h in self.health.items() if h["comm_status"] == ONLINE]}
+
+
+def _trace_energy_config(version, validation, persisted, applied, reason):
+    try:
+        import device_obs
+        device_obs.safe_observe(
+            "sync",
+            lambda: device_obs.note_energy_config_received(version, validation, persisted, applied, reason),
+        )
+    except Exception:
+        return
+
+
+def _trace_energy_report(config_version):
+    try:
+        import device_obs
+        device_obs.safe_observe("sync", lambda: device_obs.note_energy_config_report(config_version))
+    except Exception:
+        return
 
 
 __all__ = ["ATTRIBUTED", "FAULT", "UNATTRIBUTED", "EnergyEngine"]

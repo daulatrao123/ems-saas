@@ -140,7 +140,7 @@ class CloudLimitsTests(unittest.TestCase):
             self.assertTrue(conn.closed)
             counts = {op: sum(q.startswith(op) for q, _ in conn.trace) for op in ("select", "insert", "update", "delete", "savepoint", "release")}
             counts["total"] = len(conn.trace)
-            self.assertEqual(counts["total"], 37 if active else 32)
+            self.assertEqual(counts["total"], 38 if active else 33)
             self.assertEqual(counts["delete"], 0)
             self.assertEqual(sum(q.startswith("insert into energy_meter_readings") for q, _ in conn.trace), 5 if active else 0)
             self.assertNotIn("energy_config", result, "an unchanged reported version needs no Pi config write")
