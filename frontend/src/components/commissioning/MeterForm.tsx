@@ -28,6 +28,7 @@ export function MeterForm({ setup, save, disabled, mark }: { setup: Setup; save:
       <label className="flex items-start gap-3 text-sm text-gray-300"><input data-testid="m1-verified" className="mt-1" type="checkbox" checked={v.verified} onChange={e => change("verified", e.target.checked)} />Register addresses, units, scaling and word order checked against this meter’s datasheet</label>
       <label className="flex items-center gap-3 text-sm text-gray-300"><input data-testid="m1-enabled" type="checkbox" checked={v.enabled} onChange={e => d.change({ ...v, enabled: e.target.checked })} />Enable physical M1 readings</label></fieldset>
       {!setup.bus.port && <Alert id="m1-bus-required">Save the adapter path before enabling M1.</Alert>}
+      {m.hardware_installed === false && <Alert id="m1-not-installed">Meter is not marked as installed. Super Admin must configure hardware capabilities first.</Alert>}
       <p data-testid="m1-authority" className="mt-4 text-xs text-gray-500">M1 remains physical in both calculation modes. Datasheet confirmation is not hardware verification.</p>
       <Actions id="m1" dirty={d.dirty} disabled={disabled || !valid} reset={d.reset} label="Save M1 configuration" />
     </form></Section>;

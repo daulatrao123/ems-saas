@@ -667,19 +667,27 @@ class GPIOManager:
                 )
 
                 # The earlier OFF result predates deadtime. Qualify again under
-                # the same transition lock, immediately before MAKE; no retries
-                # or further deadtime after this final veto.
+                # the same transition lock, immediately before MAKE. A conclusive
+                # ON vetoes on that sample, with no extra deadtime. PENDING is an
+                # inconclusive sample (observation gap or a changing input), not
+                # proof the contactor reclosed, so it is qualified again only
+                # until the existing feedback budget expires.
                 if self._is_feedback_enabled(current_active):
-                    result = self.verify_slot(current_active, CommandedState.OFF)
-                    if result != VerificationState.VERIFIED_OFF:
-                        logger.critical("Pre-MAKE veto: slot %s feedback=%s.", current_active, result.value)
-                        self.relays[target_slot].off()
-                        self.state_manager.set_gpio_output(target_slot, GpioOutputState.OFF)
-                        self.state_manager.set_commanded(target_slot, CommandedState.OFF)
-                        self.state_manager.set_verification(current_active, result, immediate=True)
-                        self._deenergize_all()
-                        self.state_manager.system_state = SystemState.FAULT
-                        return False
+                    qualify_started = time.monotonic()
+                    while True:
+                        result = self.verify_slot(current_active, CommandedState.OFF)
+                        if result == VerificationState.VERIFIED_OFF:
+                            break
+                        if result != VerificationState.PENDING or (time.monotonic() - qualify_started) * 1000 > FEEDBACK_TIMEOUT_MS:
+                            logger.critical("Pre-MAKE veto: slot %s feedback=%s.", current_active, result.value)
+                            self.relays[target_slot].off()
+                            self.state_manager.set_gpio_output(target_slot, GpioOutputState.OFF)
+                            self.state_manager.set_commanded(target_slot, CommandedState.OFF)
+                            self.state_manager.set_verification(current_active, result, immediate=True)
+                            self._deenergize_all()
+                            self.state_manager.system_state = SystemState.FAULT
+                            return False
+                        time.sleep(0.05)
 
             # ----------------------------------------------------
             # MAKE
@@ -924,6 +932,16 @@ class GPIOManager:
                                 slot,
                                 expected,
                             )
+
+                            # One inconclusive sample is not a contactor fault.
+                            # Re-qualify only until the existing feedback budget
+                            # expires. A conclusive mismatch still faults below
+                            # on the first stable reading.
+                            if result == VerificationState.PENDING:
+                                qualify_started = time.monotonic()
+                                while result == VerificationState.PENDING and (time.monotonic() - qualify_started) * 1000 <= FEEDBACK_TIMEOUT_MS:
+                                    time.sleep(0.05)
+                                    result = self.verify_slot(slot, expected)
 
                             if result == VerificationState.PENDING:
                                 logger.critical("Slot %s feedback cannot be qualified.", slot)

@@ -29,6 +29,7 @@ from state import (
 )
 from storage_manager import StorageManager
 from lcd_display import LcdDisplay, message_is_live
+import hardware_capabilities as device_capabilities
 from storage_health import (
     collect_storage_health,
     SECONDARY_HEALTHY,
@@ -138,6 +139,9 @@ class EMSController:
         self._applied_hash = None
         self._applied_at = None
         self._config_error = None
+        self._capabilities = None
+        self._capability_hash = None
+        self._capability_error = None
         self._restore_applied_config()
         self.health = HealthTelemetry(self.state, SYNC_INTERVAL_S) if HealthTelemetry else None
 
@@ -165,6 +169,7 @@ class EMSController:
         self.lcd = LcdDisplay(self.lcd_view, logger,
                               rotation_interval_s=float(os.environ.get("LCD_ROTATION_INTERVAL_S", "5")),
                               enabled=os.environ.get("EMS_LCD_ENABLED", "1") != "0")
+        self._restore_capabilities()
         self.lcd.start()
         # Energy metering (E1): isolated engine, background RS485 polling, ledger under DATA_DIR/energy.
         # Reads verified contactor feedback only; never drives GPIO, never enqueues commands.
@@ -386,24 +391,174 @@ class EMSController:
             logger.error("Cloud configuration hashing failed: %s", exc)
             return False
 
-        if new_hash == self._applied_hash and version == self._applied_version:
+        cap_doc = None
+        cap_digest = None
+        cap_changed = False
+        cap_error = None
+        if "hardware_capabilities" in response:
+            try:
+                cap_doc, cap_digest, cap_changed, cap_error = device_capabilities.commit_capabilities(
+                    self._capabilities, response.get("hardware_capabilities")
+                )
+            except Exception:
+                cap_error = "INVALID_CAPABILITY"
+            if cap_error:
+                self._capability_error = cap_error
+                logger.error("Hardware capabilities rejected: %s", cap_error)
+                cap_doc = None
+                cap_changed = False
+
+        config_same = new_hash == self._applied_hash and version == self._applied_version
+        if config_same and not cap_changed:
             self._config_error = None
-            return True  # steady state: zero writes
+            return True  # steady state: zero writes, including a repeated capability document
 
         applied_at = datetime.now(timezone.utc).isoformat()
-        if not self.queue.persist_applied_config(
-            canonical_json(canonical), version, new_hash, applied_at
-        ):
+        if cap_changed:
+            persisted = self.queue.persist_config_bundle(
+                canonical_json(canonical),
+                version,
+                new_hash,
+                applied_at,
+                device_capabilities.capability_json(cap_doc),
+                cap_digest,
+                include_config=not config_same,
+            )
+        else:
+            persisted = self.queue.persist_applied_config(
+                canonical_json(canonical), version, new_hash, applied_at
+            )
+        if not persisted:
             self._config_error = "CONFIG_PERSIST_FAILED"
             return False  # not durable -> not applied -> keep running old config
 
-        self._install_effective_config(canonical)
-        self._applied_version = version
-        self._applied_hash = new_hash
-        self._applied_at = applied_at
+        if not config_same:
+            self._install_effective_config(canonical)
+            self._applied_version = version
+            self._applied_hash = new_hash
+            self._applied_at = applied_at
+        if cap_changed:
+            self._capabilities = cap_doc
+            self._capability_hash = cap_digest
+            self._capability_error = None
+            self._apply_lcd_capability(cap_doc)
+        self._clamp_installed_feedback()
         self._config_error = None
         logger.info("Configuration applied version=%s hash=%s", version, new_hash[:12])
         return True
+
+    def _restore_capabilities(self):
+        """Load the last valid capability document.
+
+        A missing document is legacy and keeps the canonical feedback flag.
+        A corrupt document does not. Optional hardware stays unavailable and
+        the canonical feedback flag is not used to revive it.
+        """
+        stored = self.queue.get_applied_capabilities()
+        if not stored:
+            self._clamp_installed_feedback()
+            return
+        doc, digest, error = device_capabilities.recover_stored_capabilities(
+            stored["json"], stored.get("hash")
+        )
+        if error:
+            self._capabilities = device_capabilities.default_capabilities()
+            self._capability_hash = None
+            self._capability_error = "CAPABILITY_STATE_INVALID"
+            logger.critical(
+                "Stored hardware capabilities are unreadable. Optional hardware is unavailable. CAPABILITY_STATE_INVALID"
+            )
+            self._clamp_installed_feedback()
+            self.lcd.enabled = False
+            return
+        self._capabilities = doc
+        self._capability_hash = digest
+        self._capability_error = None
+        self._clamp_installed_feedback()
+        self._apply_lcd_capability(doc)
+
+    def _consume_capabilities(self, incoming):
+        """VALIDATE then persist. A bad document does not replace a valid one and does not energize a relay."""
+        try:
+            doc, digest, changed, error = device_capabilities.commit_capabilities(self._capabilities, incoming)
+        except Exception:
+            self._capability_error = "INVALID_CAPABILITY"
+            return
+        if error:
+            self._capability_error = error
+            logger.error("Hardware capabilities rejected: %s", error)
+            return
+        if doc is None:
+            return
+        if not changed and digest == self._capability_hash:
+            self._capability_error = None
+            self._clamp_installed_feedback()
+            return
+        if not self.queue.persist_applied_capabilities(device_capabilities.capability_json(doc), digest):
+            self._capability_error = "CONFIG_PERSIST_FAILED"
+            return
+        self._capabilities = doc
+        self._capability_hash = digest
+        self._capability_error = None
+        self._clamp_installed_feedback()
+        self._apply_lcd_capability(doc)
+
+    def _clamp_installed_feedback(self):
+        installed, channels = device_capabilities.clamp_feedback(
+            self.device_config.get("feedback_hardware_installed"),
+            {slot: self.device_config["slots"][slot].get("feedback_enabled") for slot in SUPPORTED_SLOTS},
+            self._capabilities,
+        )
+        self.device_config["feedback_hardware_installed"] = installed
+        for slot in SUPPORTED_SLOTS:
+            self.device_config["slots"][slot]["feedback_enabled"] = channels[slot]
+
+    def _apply_lcd_capability(self, doc):
+        installed = (doc or {}).get("lcd", {}).get("installed")
+        self.lcd.enabled = device_capabilities.lcd_runtime_enabled(
+            installed,
+            os.environ.get("EMS_LCD_ENABLED", "1") != "0",
+            self.lcd.enabled,
+        )
+
+    def _hardware_report(self):
+        doc = self._capabilities
+        if doc is None:
+            return {
+                "capability_version": None,
+                "legacy": True,
+                "applied_capability_hash": None,
+                "capability_apply_error": self._capability_error,
+                "firmware_version": self.firmware_version,
+                "gpio_profile": self.device_config.get("hardware_profile"),
+                "contactor_feedback": device_capabilities.classify_feedback(
+                    bool(self.device_config.get("feedback_hardware_installed")), self.gpio.hardware_fault),
+            }
+        feedback = device_capabilities.classify_feedback(
+            bool(doc["contactor_feedback"]["installed"]),
+            self.gpio.hardware_fault if self.device_config.get("feedback_hardware_installed") else None,
+        )
+        meters = {}
+        health = {}
+        try:
+            health = (self.energy.snapshot() or {}).get("meters") or {}
+        except Exception:
+            health = {}
+        for meter_id in ("M1", "M2", "M3", "M4", "M5"):
+            component = device_capabilities.meter_component(doc, meter_id)
+            comm = (health.get(meter_id) or {}).get("comm_status")
+            meters[meter_id] = device_capabilities.classify_meter(component["installed"], component["enabled"], comm)
+        return {
+            "capability_version": doc["capability_version"],
+            "legacy": False,
+            "applied_capability_hash": self._capability_hash,
+            "capability_apply_error": self._capability_error,
+            "firmware_version": self.firmware_version,
+            "gpio_profile": self.device_config.get("hardware_profile"),
+            "contactor_feedback": feedback,
+            "meters": meters,
+            "lcd": device_capabilities.classify_lcd(doc["lcd"]["installed"], self.lcd.available if doc["lcd"]["installed"] else None),
+        }
 
     # ============================================================
     # SNAPSHOT
@@ -532,6 +687,8 @@ class EMSController:
             "applied_config_hash": self._applied_hash,
             "applied_config_at": self._applied_at,
             "config_apply_error": self._config_error,
+            "hardware_report": self._hardware_report(),
+            "applied_capability_hash": self._capability_hash,
             # T6 execution identity: lets the cloud reconcile instead of re-delivering.
             "last_executed_sequence": self.queue.get_last_executed_sequence(),
             "executed_command_ids": self.queue.get_executed_command_ids(),
@@ -1004,6 +1161,11 @@ class EMSController:
             self.queue.update_status(command_id, "FAILED", "FAULT", "hardware FAULT; command refused")
             return True
 
+        if action == "ACTIVATE" and self._capability_error == "CAPABILITY_STATE_INVALID":
+            logger.critical("Refusing command %s: CAPABILITY_STATE_INVALID. No relay will be energized.", command_id)
+            self.queue.update_status(command_id, "FAILED", "CAPABILITY_STATE_INVALID", "capability state invalid; command refused")
+            return True
+
         logger.info(
             "Executing command %s action=%s slot=%s",
             command_id,
@@ -1250,6 +1412,9 @@ class EMSController:
         Returns (success, rejection_reason); rejection_reason is None when the hardware path actually ran."""
         if origin == "TOGGLE":
             return False, "PHYSICAL_TOGGLES_DISABLED"
+        if on and self._capability_error == "CAPABILITY_STATE_INVALID":
+            logger.critical("Refusing local ACTIVATE: CAPABILITY_STATE_INVALID. No relay will be energized.")
+            return False, "CAPABILITY_STATE_INVALID"
         if self.state.system_state not in (SystemState.READY, SystemState.CLOUD_OFFLINE):
             return False, f"SYSTEM_{self.state.system_state.value}"
         prior_state = self.state.system_state

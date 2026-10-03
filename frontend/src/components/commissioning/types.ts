@@ -1,6 +1,6 @@
 export type Register = { address: number | null; function: number; type: string; word_order: string; scale: number; unit: string };
 export type RegisterMap = { name?: string; verified: boolean; registers: { energy_total_kwh: Register; power_kw?: Register } };
-export type Meter = { meter_id: string; enabled: boolean; serial: string | null; model: string | null; modbus_address: number | null; phases: number; ct_ratio: number | null; max_kw: number | null; register_map: RegisterMap | null; comm_status: string; last_seen: string | null };
+export type Meter = { meter_id: string; enabled: boolean; serial: string | null; model: string | null; modbus_address: number | null; phases: number; ct_ratio: number | null; max_kw: number | null; register_map: RegisterMap | null; comm_status: string; last_seen: string | null; hardware_installed?: boolean };
 export type Bus = { port?: string | null; serial?: { baudrate?: number; bytesize?: number; parity?: string; stopbits?: number; timeout_s?: number } };
 export type Delivery = { desired_version: number; reported_version: number | null; reported_at: string | null; status: string };
 export type Setup = { device_id: string; config_version: number; bus: Bus; meters: Record<string, Meter>; mode: { mode: "AUTO" | "MANUAL"; version: number }; delivery: Delivery; allocation_enabled: boolean };

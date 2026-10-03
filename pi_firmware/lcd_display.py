@@ -175,7 +175,11 @@ class LcdDisplay:
 
     def stop(self):
         self._running = False
+        self.enabled = False
         self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(2)
         if self.lcd is not None:
             try:
                 self.lcd.clear()
@@ -219,6 +223,9 @@ class LcdDisplay:
         index = 0
         next_rotate = time.monotonic() + self.rotation_interval_s
         while self._running:
+            if not self.enabled:
+                self._stop.wait(1.0)
+                continue
             # Re-render every second: identical frames are skipped, so only the clock line costs I2C writes.
             n = self.render_once(index)
             self._stop.wait(1.0)  # Event.wait: independent of time.sleep, never blocks the controller

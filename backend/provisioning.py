@@ -31,11 +31,19 @@ FORBIDDEN_SERVICE_PREFIXES = ("DeviceAllow=",)
 # IMPORTANT:
 # Keep this list synchronized with all local runtime imports/exec dependencies.
 # A missing file here creates an incomplete provisioning package.
+#
+# hardware_capabilities.py is imported by ems_controller.py. The current OTA
+# stages only ems_controller.py and cannot deploy this module, offline_queue.py,
+# or lcd_display.py. New hardware-capability firmware requires a compatible
+# provisioning package, or a future multi-file release OTA. Do not activate
+# that controller through the current single-file OTA unless every file in
+# this list is already present under /opt/ems/pi_firmware.
 FIRMWARE_FILES = (
     "ems_controller.py",
     "api_client.py",
     "config.py",
     "config_hash.py",
+    "hardware_capabilities.py",
     "gpio_manager.py",
     "gpio_input_diag.py",
     "lcd_display.py",
@@ -153,6 +161,7 @@ REQUIRED_FILES=(
   "firmware/api_client.py"
   "firmware/config.py"
   "firmware/config_hash.py"
+  "firmware/hardware_capabilities.py"
   "firmware/gpio_manager.py"
   "firmware/logger.py"
   "firmware/memory_manager.py"
@@ -621,6 +630,7 @@ firmware/
   api_client.py
   config.py
   config_hash.py
+  hardware_capabilities.py
   gpio_manager.py
   logger.py
   memory_manager.py

@@ -26,20 +26,23 @@ def default_config():
 
 
 def verified_active(feedback, wings=None):
-    """Exactly one verified ON -> wing; none -> None; several -> 'MULTIPLE'; any UNKNOWN with none ON -> 'UNKNOWN'.
+    """One verified ON with every other required wing OFF -> that wing.
+    None ON and all OFF -> None. Two or more ON -> 'MULTIPLE'.
+    Any required wing that is not ON or OFF -> 'UNKNOWN', even if another wing is ON.
 
     The default sequence is every wing. AllocationPolicy keeps that default.
     The calendar strategy passes only logically enabled wings, so a disabled wing whose feedback
     is UNKNOWN cannot block the enabled wings. An enabled wing that is UNKNOWN still blocks.
     """
     sequence = DEFAULT_SEQUENCE if wings is None else tuple(wings)
-    on = [w for w in sequence if str((feedback or {}).get(w, "UNKNOWN")).upper() == "ON"]
+    states = [str((feedback or {}).get(wing, "UNKNOWN")).upper() for wing in sequence]
+    on = [wing for wing, state in zip(sequence, states) if state == "ON"]
     if len(on) > 1:
         return "MULTIPLE"
+    if any(state not in ("ON", "OFF") for state in states):
+        return "UNKNOWN"
     if len(on) == 1:
         return on[0]
-    if any(str((feedback or {}).get(w, "UNKNOWN")).upper() not in ("ON", "OFF") for w in sequence):
-        return "UNKNOWN"
     return None
 
 

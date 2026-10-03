@@ -829,6 +829,122 @@ class OfflineQueue:
             "at": meta.get("applied_config_at"),
         }
 
+    CAPABILITY_KEYS = ("applied_capability_json", "applied_capability_hash")
+
+    def get_applied_capabilities(self):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT key, value FROM execution_meta WHERE key IN (?,?)",
+                self.CAPABILITY_KEYS,
+            ).fetchall()
+        meta = {k: v for k, v in rows}
+        if "applied_capability_json" not in meta:
+            return None
+        return {"json": meta["applied_capability_json"], "hash": meta.get("applied_capability_hash")}
+
+    def persist_applied_capabilities(self, canonical_json, capability_hash):
+        """On-change only. A matching hash does not rewrite flash."""
+        with self.lock:
+            current = self.conn.execute(
+                "SELECT value FROM execution_meta WHERE key='applied_capability_hash'"
+            ).fetchone()
+            if current and current[0] == str(capability_hash):
+                return True
+            if not self.storage.is_write_allowed("queue_db"):
+                return False
+            try:
+                self.conn.execute("BEGIN IMMEDIATE;")
+                for key, value in (
+                    ("applied_capability_json", str(canonical_json)),
+                    ("applied_capability_hash", str(capability_hash)),
+                ):
+                    self.conn.execute(
+                        "INSERT INTO execution_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, value),
+                    )
+                self.conn.commit()
+                return True
+            except sqlite3.Error as exc:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                logger.critical("Applied-capability persistence failed: %s", exc)
+                return False
+
+    def persist_config_bundle(
+        self,
+        canonical_json,
+        version,
+        config_hash,
+        applied_at,
+        capability_json=None,
+        capability_hash=None,
+        include_config=True,
+    ):
+        """Write canonical config and capabilities in one SQLite transaction.
+
+        synchronous=FULL is already set on this connection. A power loss before
+        commit keeps the previous pair. A commit replaces only the keys that
+        changed, together. An identical pair does not rewrite flash.
+        """
+        with self.lock:
+            if self._bundle_matches(config_hash, version, capability_hash, include_config):
+                return True
+            if not self.storage.is_write_allowed("queue_db"):
+                return False
+            pairs = []
+            if include_config:
+                pairs.extend((
+                    ("applied_config_json", str(canonical_json)),
+                    ("applied_config_version", str(int(version))),
+                    ("applied_config_hash", str(config_hash)),
+                    ("applied_config_at", str(applied_at)),
+                ))
+            if capability_json is not None and capability_hash is not None:
+                pairs.extend((
+                    ("applied_capability_json", str(capability_json)),
+                    ("applied_capability_hash", str(capability_hash)),
+                ))
+            if not pairs:
+                return True
+            try:
+                self.conn.execute("BEGIN IMMEDIATE;")
+                for key, value in pairs:
+                    self.conn.execute(
+                        "INSERT INTO execution_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, value),
+                    )
+                self.conn.commit()
+                return True
+            except sqlite3.Error as exc:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                logger.critical("Configuration bundle persistence failed: %s", exc)
+                return False
+
+    def _bundle_matches(self, config_hash, version, capability_hash, include_config):
+        if include_config:
+            row = self.conn.execute(
+                "SELECT value FROM execution_meta WHERE key='applied_config_hash'"
+            ).fetchone()
+            ver = self.conn.execute(
+                "SELECT value FROM execution_meta WHERE key='applied_config_version'"
+            ).fetchone()
+            if not row or row[0] != str(config_hash) or not ver or ver[0] != str(int(version)):
+                return False
+        if capability_hash is not None:
+            current = self.conn.execute(
+                "SELECT value FROM execution_meta WHERE key='applied_capability_hash'"
+            ).fetchone()
+            if not current or current[0] != str(capability_hash):
+                return False
+        return include_config or capability_hash is not None
+
     def persist_applied_config(self, canonical_json, version, config_hash, applied_at):
         """Single transaction: effective configuration + its identity land together
         (synchronous=FULL), so a power cut can never leave hash without config."""

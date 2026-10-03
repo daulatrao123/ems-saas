@@ -6,6 +6,7 @@ import { Confirm, ConfirmDialog } from "@/components/ops/ConfirmDialog";
 import { Dot, btn, input, label, panel, tone } from "@/components/ops/DashboardHeader";
 import { ago, fmtDateTime, errorText } from "@/components/ops/types";
 import { useProvisioningDevices } from "./useProvisioningDevices";
+import { HardwareCapabilities } from "./HardwareCapabilities";
 
 type Issued = { key_id: string; api_key: string };   // React state only; never persisted
 
@@ -29,7 +30,6 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
     setIssued(null); setReveal(false); notify("Provisioning package downloaded successfully. The previous API key is now invalid.", true); onChanged();
   });
   const revoke = () => run("revoke", async () => { await api.post(`/api/super-admin/devices/${d.id}/credentials/revoke`, { reason: "super_admin_revoke" }); setIssued(null); notify("Device credential revoked — the Pi can no longer authenticate.", true); onChanged(); });
-  const setFeedback = (installed: boolean) => run("feedback", async () => { await api.post(`/api/super-admin/devices/${d.id}/feedback-hardware`, { installed }); notify(`Feedback hardware ${installed ? "ON" : "OFF"}`, true); onChanged(); window.dispatchEvent(new CustomEvent("ems-device-metadata-changed", { detail: { societyId: sid } })); });
   const cred = d.credential_state === "active" ? "ACTIVE" : "NONE / REVOKED";
   return (
     <article data-testid={`prov-device-${d.id}`} className={`${panel} p-4 min-w-0 [overflow-wrap:anywhere]`}>
@@ -56,9 +56,10 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
         <dt className="text-gray-500">FEEDBACK HW</dt>
         <dd className="flex flex-wrap items-center gap-2">
           <span data-testid={`prov-feedback-${d.id}`} className={d.feedback_hardware_installed ? "text-emerald-300" : "text-gray-400"}>{d.feedback_hardware_installed ? "ON — physically installed" : "OFF — not installed"}</span>
-          <button data-testid={`prov-feedback-toggle-${d.id}`} disabled={busy !== null} onClick={() => setFeedback(!d.feedback_hardware_installed)} className={`${btn} ${d.feedback_hardware_installed ? tone.gray : tone.cyan} py-0.5`}>{d.feedback_hardware_installed ? "SET OFF" : "SET ON"}</button>
+          <span className="text-gray-500">Read-only. Edit in Hardware Configuration below.</span>
         </dd>
       </dl>
+      <HardwareCapabilities deviceId={d.id} ask={ask} />
       <div className="mt-4 flex flex-wrap gap-2">
         <button data-testid={`prov-download-${d.id}`} disabled={busy !== null || d.status === "RETIRED"} className={`${btn} ${tone.cyan} py-2.5`}
           onClick={() => ask({ title: "Generate New Provisioning Package?", body: "To keep provisioning secure, this package will contain a newly rotated API key. The previous key will stop working.\n\nAny Pi currently using the previous key must be reprovisioned with this package.", action: "GENERATE & DOWNLOAD", danger: true, onConfirm: download })}>

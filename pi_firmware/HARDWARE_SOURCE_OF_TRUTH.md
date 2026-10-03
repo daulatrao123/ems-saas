@@ -464,6 +464,81 @@ Such a signal must be added to this document first, then to the firmware.
 
 ---
 
+# 18. DEVICE HARDWARE CAPABILITIES
+
+`hardware_profile` remains the firmware GPIO map name `EMS-4CH-v1`.
+It is not editable from the website and it does not change per installation.
+
+`hardware_capabilities` is a separate versioned document (`capability_version` 1).
+It records which optional hardware is physically installed. It does not select
+AUTO, MANUAL, or DAY_BASED, and it does not carry GPIO numbers.
+
+States:
+
+- NOT_INSTALLED: the part is absent. This is not a fault.
+- INSTALLED_DISABLED: the part is present and turned off in configuration.
+- INSTALLED_ENABLED: the part is present and allowed to run.
+
+Runtime health is separate: HEALTHY, OFFLINE, FAULT, UNKNOWN, NOT_APPLICABLE.
+
+Contactor feedback not installed: physical verification is unavailable.
+The UI must not show VERIFIED from the commanded relay. Installed feedback
+that stays unreadable until the existing feedback budget expires is still a
+fail-safe fault. One inconclusive sample is qualified again inside that
+budget. A stable mismatch faults on that reading. Relay GPIO, polarity, and
+break-before-make deadtime are unchanged.
+
+Meters stay M1 generation and M2–M5 consumption for wings A–D.
+A meter that is not installed does not produce a communication fault and
+does not supply another wing's reading. DAY_BASED allocation does not
+require meters.
+
+Migration: existing `feedback_hardware_installed` is copied. A meter is installed
+only when `energy_meters.enabled` is true. A serial number is not installation.
+`enabled=false` stays not installed even when a serial exists. Serial values
+are not deleted. LCD starts unspecified (`installed` null), so the controller
+keeps its current display until an administrator sets it. `installed` false
+stops display writes. `installed` true follows the existing LCD enable switch.
+
+A missing capability document is legacy: the controller keeps the canonical
+feedback flag. A stored document that cannot be read is not legacy. The
+controller reports `CAPABILITY_STATE_INVALID`, treats optional hardware as
+unavailable, and does not turn feedback or meters back on from the old flag.
+
+`hardware_capabilities.contactor_feedback` is the only authoritative record
+of physical feedback installation. `pi_devices.feedback_hardware_installed`
+and `slot_configs.feedback_enabled` are compatibility fields derived from
+that document. Registration, society assignment, `POST /feedback-hardware`,
+and `PUT /hardware-capabilities` all update the document through one helper.
+
+The Pi stores the canonical config and the capability document in one SQLite
+transaction (`synchronous=FULL`). A power loss keeps the previous pair or
+commits the new pair. It does not commit one without the other. A repeated
+sync of the same documents does not rewrite flash. A capability-only change
+applies without bumping the canonical config version.
+
+Expected state is `NOT_INSTALLED` or `INSTALLED`. Runtime state is
+`NOT_APPLICABLE`, `HEALTHY`, `OFFLINE`, `FAULT`, or `UNKNOWN`.
+`NOT_INSTALLED` is not `FAULT` and is not `VERIFIED`.
+
+New hardware-capability firmware requires a compatible provisioning package
+or a future multi-file/release OTA. The current OTA stages only
+`ems_controller.py`. It cannot deploy `hardware_capabilities.py`,
+`offline_queue.py`, or `lcd_display.py`. Do not activate this controller
+through the current single-file OTA unless those files are already present
+under `/opt/ems/pi_firmware`.
+
+The cloud stores the document on `pi_devices.hardware_capabilities`.
+Super Admin is the only role that can change it (`PUT` requires confirmation
+when contactor feedback installation changes). The change is written to
+`audit_log` as `HARDWARE_CAPABILITIES_SET`. The Pi receives it on the
+existing `POST /api/pi/sync` reply. An invalid document is rejected and the
+previous valid document stays in force. An unchanged hash is not rewritten.
+
+Unknown JSON keys are ignored. A different `capability_version` is rejected.
+
+---
+
 # FINAL HARDWARE DEFINITION
 
 4 CHANNELS:

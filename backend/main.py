@@ -20,6 +20,8 @@ from provisioning import build_provisioning_zip, service_unit_sha256
 from energy_api import ingest as energy_ingest
 import health_read_model
 from energy_api.routes import create_router as create_energy_router
+import hardware_capabilities as hwcap
+import capability_service
 from energy_api.day_allocation import publish_completed_batch
 import logging
 _seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
@@ -702,8 +704,12 @@ def bootstrap(request: Request):
 
             device_id = str(uuid.uuid4())
             raw_api_key = str(uuid.uuid4())
-            cur.execute("INSERT INTO pi_devices (id, society_id, name, api_key_hash, status, feedback_hardware_installed) VALUES (%s, %s, %s, %s, %s, %s)",
-                        (device_id, sid, "Main Controller", hash_api_key(raw_api_key), "ASSIGNED", True))
+            boot_capabilities = capability_service.document_for_feedback(
+                None, True, {"A": True, "B": True, "C": False, "D": False}
+            )
+            cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status, feedback_hardware_installed, hardware_capabilities)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                        (device_id, sid, "Main Controller", hash_api_key(raw_api_key), "ASSIGNED", True, Json(boot_capabilities)))
             issue_device_credential(cur, device_id, None, "bootstrap", secret=raw_api_key)
 
             cur.execute("INSERT INTO users (email, name, password, role, society_id) VALUES (%s, %s, %s, %s, %s)",
@@ -942,16 +948,27 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                 dev_id = dev["device_id"]
                 if not dev_id: continue
 
-                cur.execute("SELECT status FROM pi_devices WHERE id=%s FOR UPDATE", (dev_id,))
+                cur.execute("SELECT status, hardware_capabilities FROM pi_devices WHERE id=%s FOR UPDATE", (dev_id,))
                 device_row = cur.fetchone()
                 if not device_row:
                     raise HTTPException(404, f"Device not found: {dev_id}")
                 if str(device_row["status"]).upper() == "RETIRED":
                     raise HTTPException(409, f"Retired device cannot be reassigned: {dev_id}")
 
+                installed_flag = bool(dev.get("feedback_hardware_installed", False))
+                requested_channels = {
+                    slot_code: bool((dev.get("slots") or {}).get(slot_code, {}).get("feedback_enabled", False))
+                    for slot_code in SLOTS
+                }
+                capability_doc = capability_service.document_for_feedback(
+                    device_row.get("hardware_capabilities"), installed_flag, requested_channels
+                )
                 cur.execute(
-                    "UPDATE pi_devices SET society_id=%s, status='ASSIGNED', hardware_profile=%s, feedback_hardware_installed=%s WHERE id=%s",
-                    (new_sid, dev.get("hardware_profile", "EMS-4CH-v1"), bool(dev.get("feedback_hardware_installed", False)), dev_id)
+                    "UPDATE pi_devices SET society_id=%s, status='ASSIGNED', hardware_profile=%s WHERE id=%s",
+                    (new_sid, dev.get("hardware_profile", "EMS-4CH-v1"), dev_id)
+                )
+                capability_service.persist_capabilities(
+                    cur, dev_id, new_sid, capability_doc, bump_config=False
                 )
 
                 slots = dev.get("slots", {})
@@ -960,11 +977,7 @@ def save_society(data: dict, user: dict = Depends(require_role("super_admin"))):
                     s_name = slot_data.get("display_name", f"Slot {slot_code}")
                     s_disabled = bool(slot_data.get("disabled", True))
                     s_target = int(slot_data.get("target_days", 0))
-
-                    # RED 12 Fix: Enforce hardware consistency
-                    dev_has_feedback_hw = bool(dev.get("feedback_hardware_installed", False))
-                    s_feedback_requested = bool(slot_data.get("feedback_enabled", False))
-                    s_feedback = s_feedback_requested and dev_has_feedback_hw
+                    s_feedback = capability_doc["contactor_feedback"]["channels"][slot_code]["enabled"]
 
                     cur.execute("""INSERT INTO slot_configs (device_id, slot, display_name, target_days, disabled, feedback_enabled)
                                    VALUES (%s, %s, %s, %s, %s, %s)
@@ -1097,26 +1110,105 @@ def provisioning_package(device_id: str, request: Request, user: dict = Depends(
 
 @app.post("/api/super-admin/devices/{device_id}/feedback-hardware")
 def set_feedback_hardware(device_id: str, data: dict, user: dict = Depends(require_role("super_admin"))):
-    """Device-level 'feedback hardware physically installed' flag. Bumps the society config_version so the
-    canonical config (effective feedback = installed AND slot.feedback_enabled) re-converges (T7)."""
+    """Compatibility facade. Updates the canonical capability document, then derives the legacy flag."""
     device_id = require_uuid(device_id, "device_id")
     installed = (data or {}).get("installed") is True
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("UPDATE pi_devices SET feedback_hardware_installed=%s WHERE id=%s RETURNING society_id", (installed, device_id))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Device not found")
-            if row["society_id"]:
-                cur.execute("UPDATE societies SET config_version = config_version + 1 WHERE id=%s", (row["society_id"],))
-            log_audit(cur, user, row["society_id"] or 0, "FEEDBACK_HARDWARE_SET", {"device_id": device_id, "installed": installed})
+            row, current = _load_capabilities(cur, device_id)
+            cur.execute("SELECT slot, feedback_enabled FROM slot_configs WHERE device_id=%s", (device_id,))
+            existing = {item["slot"]: bool(item["feedback_enabled"]) for item in cur.fetchall()}
+            channels = existing if installed else {wing: False for wing in hwcap.WINGS}
+            proposed = capability_service.document_for_feedback(current, installed, channels)
+            capability_service.persist_capabilities(cur, device_id, row["society_id"], proposed)
+            log_audit(cur, user, row["society_id"] or 0, "FEEDBACK_HARDWARE_SET", {
+                "device_id": device_id,
+                "installed": proposed["contactor_feedback"]["installed"],
+                "capability_hash": hwcap.capability_hash(proposed),
+            })
         conn.commit()
-        return {"device_id": device_id, "feedback_hardware_installed": installed}
+        return {"device_id": device_id, "feedback_hardware_installed": proposed["contactor_feedback"]["installed"]}
     except Exception as e:
         conn.rollback(); raise e
     finally:
         conn.close()
+
+
+def _load_capabilities(cur, device_id):
+    cur.execute("SELECT hardware_capabilities, feedback_hardware_installed, society_id FROM pi_devices WHERE id=%s", (device_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Device not found")
+    raw = row["hardware_capabilities"]
+    try:
+        current = hwcap.canonical_capabilities(raw) if isinstance(raw, dict) else hwcap.default_capabilities()
+    except hwcap.CapabilityError:
+        current = hwcap.default_capabilities()
+    return row, current
+
+
+@app.get("/api/super-admin/devices/{device_id}/hardware-capabilities")
+def get_hardware_capabilities(device_id: str, user: dict = Depends(require_role("super_admin"))):
+    device_id = require_uuid(device_id, "device_id")
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            row, current = _load_capabilities(cur, device_id)
+            cur.execute("SELECT reported_hardware FROM pi_state WHERE device_id=%s", (device_id,))
+            reported = cur.fetchone()
+        return {
+            "device_id": device_id,
+            "gpio_profile": "EMS-4CH-v1",
+            "capabilities": current,
+            "capability_hash": hwcap.capability_hash(current),
+            "reported": (reported or {}).get("reported_hardware"),
+            "feedback_hardware_installed": bool(row["feedback_hardware_installed"]),
+        }
+    finally:
+        conn.close()
+
+
+@app.put("/api/super-admin/devices/{device_id}/hardware-capabilities")
+def put_hardware_capabilities(device_id: str, data: dict, user: dict = Depends(require_role("super_admin"))):
+    """Authoritative installed/enabled profile. Does not change GPIO numbers or allocation mode."""
+    device_id = require_uuid(device_id, "device_id")
+    payload = (data or {}).get("capabilities", data or {})
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            row, current = _load_capabilities(cur, device_id)
+            try:
+                proposed = hwcap.canonical_capabilities(payload, require_explicit_lcd=True)
+            except hwcap.CapabilityError as exc:
+                raise HTTPException(400, exc.code)
+            feedback_changed = proposed["contactor_feedback"]["installed"] != current["contactor_feedback"]["installed"]
+            if feedback_changed and (data or {}).get("confirm") is not True:
+                raise HTTPException(409, "CONFIRMATION_REQUIRED")
+            new_hash = hwcap.capability_hash(proposed)
+            if new_hash == hwcap.capability_hash(current):
+                return {"device_id": device_id, "changed": False, "capability_hash": new_hash, "capabilities": current}
+            try:
+                capability_service.sync_meter_enables(cur, device_id, proposed)
+            except capability_service.CapabilityWriteError as exc:
+                raise HTTPException(exc.status, exc.detail)
+            capability_service.persist_capabilities(cur, device_id, row["society_id"], proposed)
+            log_audit(cur, user, row["society_id"] or 0, "HARDWARE_CAPABILITIES_SET", {
+                "device_id": device_id,
+                "capability_version": proposed["capability_version"],
+                "capability_hash": new_hash,
+                "previous": current,
+                "new": proposed,
+            })
+        conn.commit()
+        return {"device_id": device_id, "changed": True, "capability_hash": new_hash, "capabilities": proposed}
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as e:
+        conn.rollback(); raise e
+    finally:
+        conn.close()
+
 
 @app.get("/api/super-admin/devices/{device_id}/credentials")
 def list_device_credentials(device_id: str, user: dict = Depends(require_role("super_admin"))):
@@ -1243,8 +1335,10 @@ def register_device(data: dict, user: dict = Depends(get_current_user)):
             cur.execute("SELECT id FROM societies WHERE id=%s AND status='active'", (sid,))
             if not cur.fetchone(): raise HTTPException(404, "Society not found")
             device_id = str(uuid.uuid4()); secret = new_device_secret()
-            cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status, hardware_profile, feedback_hardware_installed)
-                           VALUES (%s, %s, %s, %s, 'ASSIGNED', %s, %s)""", (device_id, sid, name, hash_api_key(secret), profile, feedback))
+            registered = capability_service.document_for_registration(feedback)
+            cur.execute("""INSERT INTO pi_devices (id, society_id, name, api_key_hash, status, hardware_profile, feedback_hardware_installed, hardware_capabilities)
+                           VALUES (%s, %s, %s, %s, 'ASSIGNED', %s, %s, %s)""",
+                        (device_id, sid, name, hash_api_key(secret), profile, registered["contactor_feedback"]["installed"], Json(registered)))
             issued = issue_device_credential(cur, device_id, user, "register", secret=secret)
             log_audit(cur, user, sid, "DEVICE_REGISTERED", {"device_id": device_id, "name": name, "hardware_profile": profile,
                                                             "feedback_hardware_installed": feedback, "key_id": issued["key_id"]})
@@ -1624,7 +1718,7 @@ def pi_sync(
             cloud_config_version = soc["config_version"] if soc else 0
             canonical_reset_day = int((soc or {}).get("reset_day") or DEFAULT_RESET_DAY)
 
-            cur.execute("SELECT hardware_profile, feedback_hardware_installed FROM pi_devices WHERE id = %s", (device_id,))
+            cur.execute("SELECT hardware_profile, feedback_hardware_installed, hardware_capabilities FROM pi_devices WHERE id = %s", (device_id,))
             dev_info = cur.fetchone()
 
             cur.execute("SELECT slot, target_days, disabled, display_name, feedback_enabled FROM slot_configs WHERE device_id = %s", (device_id,))
@@ -1712,6 +1806,11 @@ def pi_sync(
                          payload.get("lastRebootReason", ""), cloud_config_version,
                          desired_hash, eff_av, eff_ah, eff_at, config_state, raw_err,
                          ota_desired, eff_ota_state, eff_ota_version, eff_ota_attempts, eff_ota_error, eff_ota_updated, eff_last_good, hardware_fault, storage_health))
+            report = payload.get("hardware_report")
+            if isinstance(report, dict) and len(_json.dumps(report, default=str)) <= 4000:
+                cur.execute("""UPDATE pi_state SET reported_hardware=%s
+                               WHERE device_id=%s AND reported_hardware IS DISTINCT FROM %s::jsonb""",
+                            (Json(report), device_id, _json.dumps(report)))
 
             # Energy (E2): meter health, latest cumulative readings, OPEN/CLOSED daily ledger rows (idempotent upsert).
             energy_result = energy_ingest.ingest(cur, device_id, payload.get("energy"), now)
@@ -1789,6 +1888,7 @@ def pi_sync(
                 "device_id": device_id,
                 "hardware_profile": dev_info["hardware_profile"],
                 "feedback_hardware_installed": dev_info["feedback_hardware_installed"],
+                "hardware_capabilities": dev_info.get("hardware_capabilities") or hwcap.default_capabilities(),
                 "slots": slot_configs,
                 "resetDay": canonical_reset_day,
                 "reconciled_commands": reconciled,

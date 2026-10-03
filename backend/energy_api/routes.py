@@ -17,6 +17,7 @@ from .target_delivery import reconcile_targets, delivery_view
 from .commissioning import check_expected, basis_hash, register_problems
 from .ingest import DEFAULT_ALLOCATION, METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
 from . import day_allocation as DA
+import hardware_capabilities as hwcap
 
 VALUE_TYPES = {"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64"}
 KINDS = {"MANUAL_GENERATION", "MANUAL_CONSUMPTION", "ACCOUNTING"}
@@ -85,6 +86,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                               d.energy_calculation_mode, d.energy_calculation_version,
                               d.allocation_mode, d.allocation_mode_version, d.day_allocation,
                               d.grid_export_enabled, d.grid_export_limit_kwh, d.grid_reference_version,
+                              d.hardware_capabilities,
                               COALESCE(s.reset_day, 15) AS reset_day
                        FROM pi_devices d JOIN societies s ON s.id=d.society_id WHERE d.id=%s AND d.society_id=%s""" + (" FOR UPDATE OF d" if lock else ""), (did, sid))
         row = cur.fetchone()
@@ -120,6 +122,17 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             out[r["meter_id"]] = r
         return out
 
+    def _annotate_meter_installation(dev, meters):
+        raw = dev.get("hardware_capabilities")
+        if not isinstance(raw, dict):
+            return
+        try:
+            doc = hwcap.canonical_capabilities(raw)
+        except hwcap.CapabilityError:
+            return
+        for meter_id, meter in meters.items():
+            meter["hardware_installed"] = bool(hwcap.meter_component(doc, meter_id)["installed"])
+
     # ---------------------------------------------------------------- meters / bus
     @router.get("/commissioning")
     def get_commissioning(society_id: str, device_id: str, user: dict = Depends(get_current_user)):
@@ -130,6 +143,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             meters = {mid: stored.get(mid, {"meter_id": mid, "enabled": False, "comm_status": "DISABLED",
                 "serial": None, "model": None, "modbus_address": None, "register_map": None,
                 "phases": 1, "ct_ratio": 1, "max_kw": None, "last_seen": None}) for mid in METER_IDS}
+            _annotate_meter_installation(dev, meters)
             cur.execute("SELECT energy_allocation FROM pi_devices WHERE id=%s", (did,))
             allocation = cur.fetchone()["energy_allocation"] or DEFAULT_ALLOCATION
             return {"device_id": did, "config_version": dev["energy_config_version"], "bus": dev["energy_bus"] or {},
@@ -178,6 +192,14 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             if not fields: raise HTTPException(400, "No fields to update")
             merged = {**cur_row, **{k: (v.obj if isinstance(v, Json) else v) for k, v in fields.items()}}
             if merged["enabled"]:
+                caps = dev.get("hardware_capabilities")
+                if isinstance(caps, dict):
+                    try:
+                        component = hwcap.meter_component(hwcap.canonical_capabilities(caps), meter_id)
+                    except hwcap.CapabilityError:
+                        component = None
+                    if component is not None and component["installed"] is False:
+                        raise HTTPException(409, "Meter is not marked as installed. Super Admin must configure hardware capabilities first.")
                 missing = [k for k in ("serial", "modbus_address", "register_map") if not merged.get(k)]
                 if missing: raise HTTPException(409, f"Cannot enable {meter_id}: missing {', '.join(missing)}")
                 if validate_register_map(merged["register_map"]): raise HTTPException(409, f"Cannot enable {meter_id}: register map not verified")
