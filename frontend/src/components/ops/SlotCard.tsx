@@ -37,8 +37,7 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
         <dt className="text-gray-500">CONTACTOR</dt><dd data-testid={`slot-physical-${code}`} className={contactor === "ON" ? "text-emerald-300" : "text-gray-400"}>{contactor}</dd>
       </dl>
       {slot?.disabled && <div data-testid={`slot-exclusion-${code}`} className="text-xs leading-relaxed text-gray-400 border-t border-dashed border-gray-700 pt-3">Disabled logical wing · excluded from society consumption</div>}
-      {meterDisabled ? <div data-testid={`energy-meter-disabled-${code}`} className="text-xs text-gray-500 border-t border-dashed border-gray-700 pt-3">Physical consumption meter disabled</div>
-        : slot?.disabled ? <details data-testid={`slot-disabled-data-${code}`} className="ops-disclosure"><summary data-testid={`slot-disabled-data-toggle-${code}`} className="text-xs">Energy data & bill history</summary>{energyCard}</details>
+      {slot?.disabled ? <details data-testid={`slot-disabled-data-${code}`} className="ops-disclosure"><summary data-testid={`slot-disabled-data-toggle-${code}`} className="text-xs">Energy data & bill history</summary>{energyCard}</details>
         : energyCard}
       {!readOnly && slot && !slot.disabled && (
         <div data-testid={`manual-control-${code}`} className="grid grid-cols-2 gap-2">

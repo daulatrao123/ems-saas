@@ -105,7 +105,7 @@ test("DAY_BASED inputs follow logical enablement and do not send disabled wings"
   assert.equal(Object.hasOwn(posts[0].body.wings, "D"), false);
 });
 
-test("a disabled physical meter is not a normal energy card, independent of the logical slot", () => {
+test("a disabled physical meter still renders its energy card, independent of the logical slot", () => {
   const SlotCard = slotCard();
   const base = { device: device({ A: false, B: false, C: false, D: true }), queue: () => {}, setSlotConfig: async () => true, isPending: () => false, readOnly: true, allocation: null, allocationMode: "AUTO", manualControlLabel: "Manual override", excessEnabled: false };
   const enabledMeter = testIds(SlotCard({ ...base, code: "A", slot: base.device.slots.A, wing: wing("A", true) }));
@@ -113,11 +113,13 @@ test("a disabled physical meter is not a normal energy card, independent of the 
   const disabledLogical = testIds(SlotCard({ ...base, code: "D", slot: base.device.slots.D, wing: wing("D", true) }));
   assert.equal(enabledMeter.includes("energy-wing-card-A"), true);
   assert.equal(enabledMeter.includes("slot-enabled-A"), true);
-  assert.equal(disabledMeter.includes("energy-wing-card-B"), false);
-  assert.equal(disabledMeter.includes("energy-meter-disabled-B"), true);
+  assert.equal(enabledMeter.includes("energy-meter-disabled-A"), false);
+  assert.equal(disabledMeter.includes("energy-wing-card-B"), true);
+  assert.equal(disabledMeter.includes("energy-meter-disabled-B"), false);
   assert.equal(disabledMeter.includes("slot-enabled-B"), true);
   assert.equal(disabledLogical.includes("slot-enabled-D"), true);
   assert.equal(disabledLogical.includes("energy-wing-card-D"), true);
   assert.equal(disabledLogical.includes("slot-disabled-data-D"), true);
+  assert.equal(disabledLogical.includes("slot-exclusion-D"), true);
   assert.equal(disabledLogical.includes("energy-meter-disabled-D"), false);
 });

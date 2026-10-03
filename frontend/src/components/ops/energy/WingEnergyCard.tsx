@@ -6,13 +6,15 @@ import { EnergyComparisonChart, signedKwh } from "./EnergyComparisonChart";
 import { CalendarComparisonContext } from "./CalendarComparisonContext";
 import { missingReason, monthLabel } from "./comparisonLabels";
 import { AllocationMode, showGenerationTarget } from "../allocationMode";
-import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary, WING_METERS, fmtKwh, fmtPct, sourceLabel, sourceTone, todayKwh } from "./types";
+import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary, WING_METERS, fmtKwh, fmtKw, fmtPct, sourceLabel, sourceTone, todayKwh } from "./types";
 
 type Props = { code: WingCode; wing?: WingSummary; comparison?: ComparisonSeries; mode?: CalculationMode; allocationMode: AllocationMode; allocation: AllocationConfig | null; activeGenerationWing?: string; excessEnabled: boolean };
 
 export function WingEnergyCard({ code: w, wing: candidate, comparison, mode, allocationMode, allocation, activeGenerationWing, excessEnabled }: Props) {
   const wing = candidate?.wing === w ? candidate : undefined;
   const meter = wing?.consumption_meter?.meter_id === WING_METERS[w] ? wing.consumption_meter : undefined;
+  const serial = meter?.serial?.trim() ? meter.serial.trim() : "";
+  const power = meter?.enabled && meter.comm_status === "ONLINE" && meter.power_kw != null && Number.isFinite(meter.power_kw) ? meter.power_kw : null;
   const gen = todayKwh(wing?.generation), source = gen === null ? "UNAVAILABLE" : "PHYSICAL";
   const data = comparison?.today;
   const calendar = useContext(CalendarComparisonContext);
@@ -46,7 +48,7 @@ export function WingEnergyCard({ code: w, wing: candidate, comparison, mode, all
     {data && data.consumed_kwh === null && <div data-testid={`energy-wing-operating-consumption-reason-${w}`} className="text-[10px] text-gray-400">Pi-day consumption: {missingReason(data, "consumption")}</div>}
     {mode && rows && <EnergyComparisonChart scope={w} rows={rows} mode={mode} excessEnabled={excessEnabled} compact />}
     {calendar?.month && !rows && <div data-testid={`energy-wing-month-state-${w}`} className="text-xs text-gray-500">{calendar.loading ? `Loading ${calendar.month}…` : `Daily values unavailable for ${calendar.month}`}</div>}
-    <div data-testid={`energy-wing-owner-${w}`} className="text-[10px] text-gray-500">{meter ? `Consumption meter · ${meter.meter_id}` : "Consumption meter · UNAVAILABLE"}<span data-testid={`energy-wing-health-${w}`} className="block">{meter ? meter.enabled ? meter.comm_status : "DISABLED" : "UNAVAILABLE"}</span></div>
+    <div data-testid={`energy-wing-owner-${w}`} className="text-[10px] text-gray-500">{meter ? `Consumption meter · ${meter.meter_id}` : "Consumption meter · UNAVAILABLE"}<span data-testid={`energy-wing-serial-${w}`} className="block">Physical Meter No. · {meter ? serial || "Not configured" : "UNAVAILABLE"}</span><span data-testid={`energy-wing-enabled-${w}`} className="block">{meter ? meter.enabled ? "ENABLED" : "DISABLED" : "UNAVAILABLE"}</span><span data-testid={`energy-wing-health-${w}`} className="block">{meter ? meter.comm_status : "UNAVAILABLE"}</span>{power != null && <span data-testid={`energy-wing-power-${w}`} className="block">{fmtKw(power)}</span>}</div>
     {mode === "MANUAL" && <BillHistoryButton wing={w} />}
   </div>;
 }
