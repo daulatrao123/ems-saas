@@ -2,6 +2,7 @@
 RBAC: super_admin (any society) / society_admin (own society) write; member read-only (own society)."""
 import math
 import calendar
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
@@ -17,6 +18,7 @@ from .target_delivery import reconcile_targets, delivery_view
 from .commissioning import check_expected, basis_hash, register_problems
 from .ingest import DEFAULT_ALLOCATION, METER_IDS, METER_ROLE, METER_WING, WINGS, ensure_meter_rows
 from . import day_allocation as DA
+import cloud_obs
 import hardware_capabilities as hwcap
 
 VALUE_TYPES = {"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64"}
@@ -354,7 +356,14 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
             except ValueError as exc:
                 raise HTTPException(400, str(exc))
             return {"device_id": did, "type": data.get("type"), "cycle_days": length, "reset_day": dev["reset_day"], "days": days, "enabled_wings": enabled}
-        return run(fn)
+        started = time.perf_counter()
+        try:
+            out = run(fn)
+        except HTTPException as exc:
+            cloud_obs.safe_observe("batch", lambda: cloud_obs.note_allocation("calculate", exc.status_code, time.perf_counter() - started, None))
+            raise
+        cloud_obs.safe_observe("batch", lambda: cloud_obs.note_allocation("calculate", 200, time.perf_counter() - started, out))
+        return out
 
     @router.post("/day-allocation/apply")
     def apply_day_allocation(data: dict, user: dict = Depends(get_current_user)):
@@ -363,6 +372,7 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
         if not isinstance(idem, str) or not idem.strip():
             raise HTTPException(400, "idempotency_key is required")
         idem = idem.strip()[:100]
+        traced = {}
         def fn(cur):
             dev = device(cur, sid, data.get("device_id"), ensure_meters=False, lock=True)
             did = str(dev["id"])
@@ -388,8 +398,17 @@ def create_router(get_db, get_current_user, log_audit, require_uuid):
                        "batch_id": batch_id, "idempotency_key": idem}
             cur.execute("UPDATE pi_devices SET day_allocation=%s WHERE id=%s", (Json(desired), did))
             log_audit(cur, user, sid, "DAY_ALLOCATION_APPLY", {"device_id": did, "batch_id": batch_id, "days": days, "cycle_days": length})
+            traced.update({"days": days, "cycle_days": length, "reset_day": dev["reset_day"], "enabled_wings": enabled})
             return {"success": True, "status": "APPLYING", "duplicate": False, "batch_id": batch_id, "device_id": did, "commands": commands, "days": days}
-        return run(fn, write=True)
+        started = time.perf_counter()
+        key_hash = cloud_obs.safe_observe("batch", lambda: cloud_obs.idempotency_hash(idem))
+        try:
+            out = run(fn, write=True)
+        except HTTPException as exc:
+            cloud_obs.safe_observe("batch", lambda: cloud_obs.note_allocation("apply", exc.status_code, time.perf_counter() - started, {"device_id": data.get("device_id")}, key_hash))
+            raise
+        cloud_obs.safe_observe("batch", lambda: cloud_obs.note_allocation("apply", 200, time.perf_counter() - started, {**out, **traced}, key_hash))
+        return out
 
     # ---------------------------------------------------------------- summary
     @router.get("/summary")

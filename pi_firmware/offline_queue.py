@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 from config import (
@@ -10,6 +11,7 @@ from config import (
 )
 
 from logger import logger
+import device_obs
 
 
 VALID_TRANSITIONS = {
@@ -112,6 +114,15 @@ class OfflineQueue:
 
         self._create_schema()
         self._integrity_check()
+        try:
+            mode = self.conn.execute("PRAGMA journal_mode;").fetchone()
+            sync = self.conn.execute("PRAGMA synchronous;").fetchone()
+            device_obs.safe_observe("queue", lambda: device_obs.note_sqlite_settings(
+                mode[0] if mode else None,
+                sync[0] if sync else None,
+            ))
+        except Exception:
+            device_obs.safe_observe("queue", lambda: device_obs.note_sqlite_settings("UNKNOWN", "UNKNOWN"))
 
     # ============================================================
     # DATABASE INTEGRITY
@@ -370,9 +381,12 @@ class OfflineQueue:
         returned to the controller.
         """
 
+        device_obs.safe_observe("queue", device_obs.claim_called)
         if not self.storage.is_write_allowed("queue_db"):
+            device_obs.safe_observe("queue", lambda: device_obs.claim_empty(False))
             return None
 
+        started = time.perf_counter()
         now = datetime.now(
             timezone.utc
         )
@@ -384,6 +398,7 @@ class OfflineQueue:
                 self.conn.execute(
                     "BEGIN IMMEDIATE;"
                 )
+                device_obs.safe_observe("queue", device_obs.claim_tx_started)
 
                 # Expire old commands first.
                 self.conn.execute(
@@ -426,6 +441,7 @@ class OfflineQueue:
 
                 if not row:
                     self.conn.commit()
+                    device_obs.safe_observe("queue", lambda: device_obs.claim_empty(True))
                     return None
 
                 cmd_id, slot, action = row
@@ -455,6 +471,7 @@ class OfflineQueue:
 
                 if updated != 1:
                     self.conn.rollback()
+                    device_obs.safe_observe("queue", device_obs.claim_rollback)
                     return None
 
                 # T6: durable "I executed up to sequence N" written atomically with the claim.
@@ -475,6 +492,9 @@ class OfflineQueue:
                     )
 
                 self.conn.commit()
+                device_obs.safe_observe("queue", lambda: device_obs.claim_command(
+                    cmd_id, action, slot, time.perf_counter() - started,
+                ))
 
                 return (
                     cmd_id,
@@ -487,6 +507,7 @@ class OfflineQueue:
                     self.conn.rollback()
                 except Exception:
                     pass
+                device_obs.safe_observe("queue", device_obs.claim_rollback)
 
                 logger.critical(
                     "Atomic command claim failed: %s",

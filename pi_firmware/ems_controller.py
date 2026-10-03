@@ -41,6 +41,7 @@ from gpio_manager import GPIOManager
 from api_client import ApiClient
 import ota_manager
 import firmware_release
+import device_obs
 import config as _cfg
 from smart_health import SmartHealthMonitor
 from energy import EnergyEngine
@@ -370,6 +371,16 @@ class EMSController:
         """Returns True when the effective configuration is durably applied
         (or already was). Any rejection leaves the running configuration and
         the applied identity untouched and sets a bounded error code."""
+        started = time.perf_counter()
+        previous_version = self._applied_version
+        previous_hash = self._applied_hash
+
+        def observe(outcome, reason=None, persisted=False, incoming_version=None, incoming_hash=None):
+            device_obs.safe_observe("sync", lambda: device_obs.config_apply(
+                DEVICE_ID, incoming_version, previous_version, incoming_hash, previous_hash,
+                outcome, reason, persisted, time.perf_counter() - started,
+            ))
+
         try:
             version = response.get("config_version")
             if isinstance(version, bool) or not isinstance(version, int) or version < 0:
@@ -387,10 +398,12 @@ class EMSController:
         except ConfigError as exc:
             self._config_error = exc.code
             logger.error("Cloud configuration rejected: %s", exc.code)
+            observe("rejected", exc.code, False, response.get("config_version"))
             return False
         except Exception as exc:  # canonicaliser/hash must never take the controller down
             self._config_error = "CONFIG_HASH_FAILED"
             logger.error("Cloud configuration hashing failed: %s", exc)
+            observe("rejected", "CONFIG_HASH_FAILED", False, response.get("config_version"))
             return False
 
         cap_doc = None
@@ -413,6 +426,7 @@ class EMSController:
         config_same = new_hash == self._applied_hash and version == self._applied_version
         if config_same and not cap_changed:
             self._config_error = None
+            observe("unchanged", None, False, version, new_hash)
             return True  # steady state: zero writes, including a repeated capability document
 
         applied_at = datetime.now(timezone.utc).isoformat()
@@ -432,6 +446,7 @@ class EMSController:
             )
         if not persisted:
             self._config_error = "CONFIG_PERSIST_FAILED"
+            observe("rejected", "CONFIG_PERSIST_FAILED", False, version, new_hash)
             return False  # not durable -> not applied -> keep running old config
 
         if not config_same:
@@ -447,6 +462,7 @@ class EMSController:
         self._clamp_installed_feedback()
         self._config_error = None
         logger.info("Configuration applied version=%s hash=%s", version, new_hash[:12])
+        observe("changed" if not config_same else "unchanged", None, True, version, new_hash)
         return True
 
     def _restore_capabilities(self):
@@ -696,6 +712,12 @@ class EMSController:
             # T6 execution identity: lets the cloud reconcile instead of re-delivering.
             "last_executed_sequence": self.queue.get_last_executed_sequence(),
             "executed_command_ids": self.queue.get_executed_command_ids(),
+            "obs": device_obs.safe_observe("sync", lambda: device_obs.snapshot(
+                db_file=_cfg.DB_FILE,
+                state_file=_cfg.STATE_FILE,
+                telemetry_dir=TELEMETRY_DIR,
+                day_based_path=getattr(getattr(self.energy, "day_strategy", None), "path", None),
+            )),
         }
 
     # ============================================================

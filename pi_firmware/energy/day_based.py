@@ -3,9 +3,11 @@
 AllocationPolicy is not used here. A verified wing that this strategy did not apply pauses the
 operating day instead of being forced back to the schedule.
 """
+import time
 from datetime import date
 
 from .energy_state import atomic_write_json, load_json
+import device_obs
 
 WINGS = ("A", "B", "C", "D")
 
@@ -54,6 +56,7 @@ class DayBasedStrategy:
         stored = load_json(path, {})
         self.state = stored if stored.get("version") == 1 else {
             "version": 1, "operating_date": None, "paused": False, "last_applied": None, "scheduled": None}
+        self._persisted_snapshot = dict(self.state)
         self.dirty = False
 
     def _save_state(self, **updates):
@@ -61,13 +64,24 @@ class DayBasedStrategy:
         self.dirty = True
 
     def persist(self):
+        started = time.perf_counter()
+        previous = dict(self._persisted_snapshot) if isinstance(self._persisted_snapshot, dict) else None
+        changed = self.state != self._persisted_snapshot
+        scheduled = self.state.get("scheduled")
         if not self.dirty or not self.write_allowed():
+            device_obs.safe_observe("day_based", lambda: device_obs.note_persist(
+                False, False, scheduled, self.path, time.perf_counter() - started, previous))
             return False
         try:
             atomic_write_json(self.path, self.state)
         except OSError:
+            device_obs.safe_observe("day_based", lambda: device_obs.note_persist(
+                False, False, scheduled, self.path, time.perf_counter() - started, previous))
             return False
         self.dirty = False
+        self._persisted_snapshot = dict(self.state)
+        device_obs.safe_observe("day_based", lambda: device_obs.note_persist(
+            changed, True, scheduled, self.path, time.perf_counter() - started, previous))
         return True
 
     def evaluate(self, ctx):

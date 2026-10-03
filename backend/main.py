@@ -23,6 +23,7 @@ from energy_api.routes import create_router as create_energy_router
 import hardware_capabilities as hwcap
 import firmware_ota
 import capability_service
+import cloud_obs
 from energy_api.day_allocation import publish_completed_batch
 import logging
 _seclog = logging.getLogger("ems.security")  # device-identified security events (never secrets)
@@ -1233,7 +1234,22 @@ def resource_metrics(user: dict = Depends(require_role("super_admin"))):
     today = datetime.now(timezone.utc).date().isoformat()
     with METRICS_LOCK:
         rows = [{"day": k[0], "device_id": k[1], "metric": k[2], "value": v} for k, v in METRICS.items() if k[0] >= today]
-    return {"day": today, "counters": sorted(rows, key=lambda r: (r["device_id"], r["metric"]))}
+    return {"day": today, "scope": cloud_obs.SCOPE, "durable": False,
+            "counters": sorted(rows, key=lambda r: (r["device_id"], r["metric"])),
+            "instrumentation": cloud_obs.snapshot()}
+
+
+@app.get("/api/admin/instrumentation")
+def admin_instrumentation(request: Request, user: dict = Depends(get_current_user)):
+    """Process-local trace. Super admin sees fleet counters. Society admin sees only its own events."""
+    if user.get("role") not in ("super_admin", "society_admin"):
+        raise HTTPException(403, "Insufficient permissions")
+    device_id = request.query_params.get("device_id")
+    if device_id:
+        device_id = require_uuid(device_id, "device_id")
+    if user.get("role") == "super_admin":
+        return cloud_obs.snapshot(device_id=device_id, include_fleet=True)
+    return cloud_obs.snapshot(society_id=user.get("society_id"), device_id=device_id, include_fleet=False)
 
 @app.post("/api/super-admin/maintenance/archive-commands")
 def maintenance_archive_commands(data: dict | None = None, user: dict = Depends(require_role("super_admin"))):
@@ -1687,8 +1703,15 @@ def pi_sync(
             METRICS[(now.date().isoformat(), str(device_id), "pi_flash_bytes_today")] = int(fb)
 
     conn = get_db()
+    obs_started = time.perf_counter()
+    obs_stats = {"statements": 0, "rows": {}}
+    obs_committed = False
+    obs_http = 200
+    obs_command = None
+    reply = None
     try:
         with conn.cursor(row_factory=dict_row) as cur:
+            obs_stats = cloud_obs.attach_statement_counter(cur, "sync")
             cur.execute("UPDATE pi_devices SET last_seen = %s, firmware_version = %s WHERE id = %s",
                         (now, payload.get("firmwareVersion", "unknown"), device_id))
 
@@ -1827,6 +1850,8 @@ def pi_sync(
                 # ACK and do not lease commands or send config in a failed reply.
                 # Events remain on the Pi for its existing 60-second retry.
                 conn.commit()
+                obs_committed = True
+                obs_http = 503
                 return JSONResponse(status_code=503, content={
                     "success": False, "device_id": str(device_id),
                     "error": energy_result.get("error", "ENERGY_STORAGE_FAILED"),
@@ -1919,16 +1944,46 @@ def pi_sync(
                     reply["command"] = cmd["command"]
                     reply["command_id"] = str(cmd["id"])
                     reply["sequence_no"] = cmd.get("sequence_no")
+                    obs_command = {
+                        "command_id": str(cmd["id"]),
+                        "command": cmd["command"],
+                        "slot": cmd.get("slot"),
+                        "allocation_batch_id": str(cmd["allocation_batch_id"]) if cmd.get("allocation_batch_id") else None,
+                        "sequence_no": cmd.get("sequence_no"),
+                    }
                     reply["attempt"] = delivered["attempt_count"]
                     reply["expires_at"] = cmd["expires_at"].isoformat() if cmd.get("expires_at") else None
                     if cmd.get("slot"): reply["slot"] = cmd["slot"]
                     reply["params"] = cmd.get("params", {})
 
         conn.commit()
+        obs_committed = True
     except Exception as e:
         conn.rollback()
+        try:
+            obs_http = int(getattr(e, "status_code", 500) or 500)
+        except Exception:
+            cloud_obs.note_observation_error("sync")
         raise e
     finally:
+        try:
+            delivery = obs_command if obs_committed else None
+            config_ids = None
+            if isinstance(reply, dict):
+                config_ids = {
+                    "config_version": reply.get("config_version"),
+                    "config_hash": reply.get("config_hash"),
+                    "applied_config_version": payload.get("applied_config_version") if isinstance(payload, dict) else None,
+                    "applied_config_hash": payload.get("applied_config_hash") if isinstance(payload, dict) else None,
+                }
+            cloud_obs.safe_observe("sync", lambda: cloud_obs.finish_sync(
+                device_id, society_id, obs_http, time.perf_counter() - obs_started,
+                obs_committed, obs_stats, delivery, config_ids,
+            ))
+            if isinstance(payload, dict):
+                cloud_obs.safe_observe("pi_report", lambda: cloud_obs.note_pi_report(device_id, society_id, payload.get("obs")))
+        except Exception:
+            cloud_obs.note_observation_error("sync")
         conn.close()
     return reply
 
@@ -1960,26 +2015,51 @@ def pi_command_ack(
     if status not in allowed:
         raise HTTPException(400, f"Invalid command status: {status}")
 
+    obs_started = time.perf_counter()
+    obs_committed = False
+    obs_http = 200
+    obs_idempotent = False
+    obs_rejected = False
+    obs_fields = {
+        "device_id": str(device_id),
+        "society_id": society_id,
+        "command_id": str(command_id),
+        "incoming_status": status,
+        "verification_state": verification,
+        "result_token": verification,
+    }
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
+            cloud_obs.attach_statement_counter(cur, "ack")
             cur.execute(
                 "SELECT id, command, slot, params, status, attempt_count, allocation_batch_id FROM pi_commands WHERE id = %s AND device_id = %s FOR UPDATE",
                 (command_id, device_id),
             )
             cmd = cur.fetchone()
             if not cmd:
+                obs_fields["resulting_status"] = "unknown"
                 return {"success": True, "status": "unknown"}
 
             current = str(cmd["status"] or "queued").lower()
+            obs_fields.update({
+                "command": cmd.get("command"),
+                "slot": cmd.get("slot"),
+                "allocation_batch_id": str(cmd["allocation_batch_id"]) if cmd.get("allocation_batch_id") else None,
+                "previous_status": current,
+            })
             if status == current:
                 # Idempotent repeat of an already-applied status is harmless.
+                obs_idempotent = True
+                obs_fields["resulting_status"] = current
                 return {"success": True, "status": current, "idempotent": True}
             # REPLAY: the Pi repeats an OLDER hop (typically COMPLETED after the ACKED response was
             # lost) or anything after `acked`. Nothing can change -> 200, no mutation, no retry storm.
             # A DIFFERENT terminal outcome than the stored one is not a replay (409 CONFLICTING_TERMINAL).
             cur_rank, new_rank = ACK_STATUS_RANK[current], ACK_STATUS_RANK[status]
             if current == "acked" or new_rank < cur_rank:
+                obs_idempotent = True
+                obs_fields["resulting_status"] = current
                 return {"success": True, "status": current, "idempotent": True, "replay": True}
             if new_rank == cur_rank == 4:
                 raise HTTPException(409, f"Conflicting terminal outcome {current} vs {status}",
@@ -2046,12 +2126,30 @@ def pi_command_ack(
                                     headers={"X-EMS-Ack-Code": "CONCURRENT_CHANGE"})
             if cmd.get("allocation_batch_id") and status in ("completed", "acked"):
                 publish_completed_batch(cur, device_id, society_id, cmd["allocation_batch_id"])
+            obs_fields["resulting_status"] = status
 
         conn.commit()
-    except Exception:
+        obs_committed = True
+    except Exception as exc:
         conn.rollback()
+        try:
+            obs_http = int(getattr(exc, "status_code", 500) or 500)
+            obs_rejected = obs_http >= 400
+            if "resulting_status" not in obs_fields:
+                obs_fields["resulting_status"] = status
+        except Exception:
+            cloud_obs.note_observation_error("ack")
         raise
     finally:
+        try:
+            if "resulting_status" not in obs_fields:
+                obs_fields["resulting_status"] = status
+            cloud_obs.safe_observe("ack", lambda: cloud_obs.record_ack(
+                obs_fields, obs_committed, obs_http, time.perf_counter() - obs_started,
+                idempotent=obs_idempotent, rejected=obs_rejected,
+            ))
+        except Exception:
+            cloud_obs.note_observation_error("ack")
         conn.close()
     return {"success": True, "status": status}
 

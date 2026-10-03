@@ -9,6 +9,8 @@ from datetime import date, timedelta
 
 from psycopg.types.json import Json
 
+import cloud_obs
+
 WINGS = ("A", "B", "C", "D")
 ALLOCATION_MODES = ("AUTO", "MANUAL", "DAY_BASED")
 DAY_MODE = "DAY_BASED"
@@ -157,6 +159,7 @@ def publish_completed_batch(cur, device_id, society_id, batch_id):
     )
     rows = list(cur.fetchall())
     if not rows or any(str(row["status"]) not in APPLIED for row in rows):
+        cloud_obs.safe_observe("batch", lambda: cloud_obs.note_batch(device_id, society_id, batch_id, rows, False, []))
         return False
     this_max = max(int(row["sequence_no"] or 0) for row in rows)
     cur.execute(
@@ -168,8 +171,10 @@ def publish_completed_batch(cur, device_id, society_id, batch_id):
         (device_id, batch_id, this_max),
     )
     if cur.fetchone():
+        cloud_obs.safe_observe("batch", lambda: cloud_obs.note_batch(device_id, society_id, batch_id, rows, False, [], superseded=True))
         return False
     changed = False
+    targets = []
     for row in rows:
         params = row["params"] or {}
         days = params.get("days", 0)
@@ -181,7 +186,9 @@ def publish_completed_batch(cur, device_id, society_id, batch_id):
             (device_id, row["slot"]),
         )
         current = cur.fetchone()
-        if current is None or int(current["target_days"]) != days:
+        old_days = None if current is None else int(current["target_days"])
+        targets.append({"slot": row["slot"], "old_target_days": old_days, "new_target_days": days})
+        if current is None or old_days != days:
             cur.execute(
                 "UPDATE slot_configs SET target_days = %s WHERE device_id = %s AND slot = %s",
                 (days, device_id, row["slot"]),
@@ -189,6 +196,7 @@ def publish_completed_batch(cur, device_id, society_id, batch_id):
             changed = True
     if changed:
         cur.execute("UPDATE societies SET config_version = config_version + 1 WHERE id = %s", (society_id,))
+    cloud_obs.safe_observe("batch", lambda: cloud_obs.note_batch(device_id, society_id, batch_id, rows, changed, targets))
     return changed
 
 
