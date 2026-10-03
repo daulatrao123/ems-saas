@@ -6,9 +6,10 @@ import { BillHistory, EnergyReferenceData } from "./referenceTypes";
 import { BillMonthEditor } from "./BillMonthEditor";
 import { BillSaveConfirmation } from "./BillSaveConfirmation";
 import { monthLabel } from "./comparisonLabels";
+import type { Confirm } from "../ConfirmDialog";
 
-export function BillHistoryDialog({ societyId, societyName, controllerName, operatingDate, deviceId, initialWing, data, readOnly, onClose, onSavedMonth }: {
-  societyId: string; societyName: string; controllerName: string; operatingDate: string; deviceId: string; initialWing: WingCode; data: EnergyReferenceData; readOnly: boolean; onClose: () => void; onSavedMonth: (month: string) => void;
+export function BillHistoryDialog({ societyId, societyName, controllerName, operatingDate, deviceId, initialWing, data, readOnly, onClose, onSavedMonth, ask }: {
+  societyId: string; societyName: string; controllerName: string; operatingDate: string; deviceId: string; initialWing: WingCode; data: EnergyReferenceData; readOnly: boolean; onClose: () => void; onSavedMonth: (month: string) => void; ask?: (c: Confirm) => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [wing, setWing] = useState(initialWing);
@@ -25,7 +26,7 @@ export function BillHistoryDialog({ societyId, societyName, controllerName, oper
         <label className="text-xs text-gray-400">12 months ending<input data-testid="bills-end-month" aria-label="12 months ending" type="month" min="1971-01" max={new Date().toISOString().slice(0, 7)} value={end} onChange={(e) => setEnd(e.target.value)} className={`${input} block mt-1`} /></label>
       </div>
       <div data-testid="bills-known-months" className="mb-3 text-xs text-gray-500">Wing {wing} · {data.wings[wing].history.valid_months} months in its last saved history window</div>
-      {end && <BillMonthEditor key={`${wing}:${end}`} societyId={societyId} deviceId={deviceId} wing={wing} endMonth={end} readOnly={readOnly} onSaved={(history, changedMonths) => { setSaved({ history, months: changedMonths }); const latest = [...changedMonths].sort().pop(); if (latest) onSavedMonth(latest); }} />}
+      {end && <BillMonthEditor key={`${wing}:${end}`} societyId={societyId} deviceId={deviceId} wing={wing} endMonth={end} readOnly={readOnly} onSaved={(history, changedMonths) => { setSaved({ history, months: changedMonths }); const latest = [...changedMonths].sort().pop(); if (latest) onSavedMonth(latest); }} confirmSave={ask ? () => new Promise((resolve) => { ask({ title: "Confirm configuration change", body: `You are about to save monthly consumption for Wing ${wing} on ${controllerName}.\nDevice ID: ${deviceId}`, consequence: "The stored bill history for this wing changes after the save succeeds. This does not switch a contactor.", action: "Confirm Changes", severity: "WARNING", failure: "Consumption was not saved.", onConfirm: () => resolve(true), onCancel: () => resolve(false) }); }) : undefined} />}
     </>}
   </dialog>;
 }

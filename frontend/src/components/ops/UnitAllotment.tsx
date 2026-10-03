@@ -25,6 +25,7 @@ export function UnitAllotment({ device, queue, isPending, ask, children }: { dev
     setSending(true); let ok = 0;
     for (const [slot, d] of sendable) if (await queue(device.id, "set_days", slot, { days: d })) ok += 1;
     setReport(`${ok}/${sendable.length} set_days commands queued`); setSending(false);
+    return ok === sendable.length && sendable.length > 0;
   };
   const inputs = Object.fromEntries(slots.map((s) => [s,
     <label key={s} className="border-t border-[#1e2a3a] pt-3 text-[10px] text-gray-400">
@@ -50,7 +51,7 @@ export function UnitAllotment({ device, queue, isPending, ask, children }: { dev
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <button data-testid="allot-calculate" onClick={calculate} disabled={slots.length === 0} className={`${btn} ${tone.gray}`}>CALCULATE</button>
         <button data-testid="allot-send-all" disabled={sending || sendable.length === 0 || isPending(device.id, "set_days", sendable[0]?.[0] || "")} className={`${btn} ${tone.amber}`}
-          onClick={() => ask({ title: `Send ${sendable.length} set_days commands`, body: sendable.map(([s, d]) => `Slot ${s} → ${d} days`).join("\n") + "\n\nOne independent command per slot; the Pi validates each (CONFIG_ACCEPTED).", action: "SEND ALL DAYS", onConfirm: sendAll })}>
+          onClick={() => ask({ title: "Apply DAY_BASED schedule?", body: `${device.name}\n${sendable.map(([s, d]) => `${s}: ${d} days`).join("\n")}`, consequence: "One set_days command is queued per wing. The controller replaces its previous targets only after a successful sync.", action: "Apply Schedule", severity: "WARNING", failure: "One or more day commands were not queued.", onConfirm: () => sendAll() })}>
           {sending ? "SENDING…" : `SEND ALL DAYS (${sendable.length})`}
         </button>
         {report && <span data-testid="allot-report" className="font-mono text-[11px] text-emerald-400">{report}</span>}

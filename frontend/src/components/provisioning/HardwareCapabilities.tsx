@@ -35,7 +35,7 @@ function Toggle({ testId, on, onChange }: { testId: string; on: boolean; onChang
   );
 }
 
-export function HardwareCapabilities({ deviceId, ask }: { deviceId: string; ask: (c: { title: string; body: string; action: string; danger?: boolean; onConfirm: () => void }) => void }) {
+export function HardwareCapabilities({ deviceId, ask }: { deviceId: string; ask: (c: { title: string; body: string; action: string; consequence?: string; severity?: "INFO" | "WARNING" | "DANGER" | "CRITICAL"; danger?: boolean; failure?: string; typed?: string; onConfirm: () => void | Promise<void | boolean> }) => void }) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [reported, setReported] = useState<Record<string, Runtime | undefined> | null>(null);
   const [error, setError] = useState("");
@@ -50,18 +50,26 @@ export function HardwareCapabilities({ deviceId, ask }: { deviceId: string; ask:
 
   if (!profile) return <p data-testid={`hw-cap-status-${deviceId}`} className="mt-3 text-xs text-gray-500">{error || "Loading hardware configuration…"}</p>;
 
-  const save = (confirm: boolean) => {
+  const save = async (confirm: boolean) => {
     setBusy(true); setError("");
-    api.put(`/api/super-admin/devices/${deviceId}/hardware-capabilities`, { confirm, capabilities: profile })
-      .then((res) => { setProfile(res.data.capabilities); setError(res.data.changed ? "" : "Already applied"); })
-      .catch((e) => setError(typeof e?.response?.data?.detail === "string" ? e.response.data.detail : "Save failed"))
-      .finally(() => setBusy(false));
+    try {
+      const res = await api.put(`/api/super-admin/devices/${deviceId}/hardware-capabilities`, { confirm, capabilities: profile });
+      setProfile(res.data.capabilities);
+      setError(res.data.changed ? "" : "Already applied");
+      return true;
+    } catch (e) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setError(typeof detail === "string" ? detail : "Save failed");
+      return false;
+    } finally { setBusy(false); }
   };
   const requestSave = () => ask({
-    title: "Apply hardware configuration?",
-    body: "This records which optional hardware is physically installed. It does not change relay GPIO pins or allocation mode. Contactor feedback that is not installed is not a fault and is never shown as verified.",
-    action: "APPLY HARDWARE CONFIGURATION",
-    danger: true,
+    title: "Confirm contactor feedback configuration",
+    body: "You are changing the declared physical hardware for this device, including contactor feedback, meters, and the LCD.",
+    consequence: "The EMS will use this capability information when determining whether physical feedback verification is available. Incorrect configuration can affect safety validation.",
+    action: "Confirm Hardware Configuration",
+    severity: "DANGER",
+    failure: "Hardware configuration was not saved.",
     onConfirm: () => save(true),
   });
   const feedbackRuntime = (reported?.contactor_feedback as Runtime | undefined)?.runtime;

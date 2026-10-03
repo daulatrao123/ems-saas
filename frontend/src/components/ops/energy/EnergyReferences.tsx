@@ -7,9 +7,10 @@ import { EnergySummary, WingCode, WINGS } from "./types";
 import { dailyRate, referenceSource } from "./referenceTypes";
 import { ConsumptionScopeLabel } from "./ConsumptionScopeLabel";
 import { SectionHeading } from "../DashboardSections";
+import type { Confirm } from "../ConfirmDialog";
 
-export function EnergyReferences({ societyId, societyName, controllerName, summary, readOnly, refresh, onSavedMonth, excessEnabled, children }: {
-  societyId: string; societyName: string; controllerName: string; summary: EnergySummary; readOnly: boolean; refresh: () => void; onSavedMonth: (month: string) => void; excessEnabled: boolean; children: ReactNode;
+export function EnergyReferences({ societyId, societyName, controllerName, summary, readOnly, refresh, onSavedMonth, excessEnabled, ask, children }: {
+  societyId: string; societyName: string; controllerName: string; summary: EnergySummary; readOnly: boolean; refresh: () => void; onSavedMonth: (month: string) => void; excessEnabled: boolean; ask?: (c: Confirm) => void; children: ReactNode;
 }) {
   const [editor, setEditor] = useState<WingCode | null>(null);
   const data = summary.references;
@@ -36,8 +37,8 @@ export function EnergyReferences({ societyId, societyName, controllerName, summa
       </div>
     </details>
     <div data-testid="allocation-reference-operating-date" className="text-xs text-gray-400">Allocation / Grid reference date: {summary.as_of_operating_date} · Pi operating day</div>
-    <GridReferencePanel key={`${summary.device_id}:${data.grid.version}`} societyId={societyId} deviceId={summary.device_id} grid={data.grid} allocation={data.allocation} readOnly={readOnly} onSaved={refresh} excessEnabled={excessEnabled} />
+    <GridReferencePanel key={`${summary.device_id}:${data.grid.version}`} societyId={societyId} deviceId={summary.device_id} controllerName={controllerName} grid={data.grid} allocation={data.allocation} readOnly={readOnly} onSaved={refresh} excessEnabled={excessEnabled} ask={ask} />
     </section>
-    {editor && <BillHistoryDialog societyId={societyId} societyName={societyName} controllerName={controllerName} operatingDate={summary.as_of_operating_date} deviceId={summary.device_id} initialWing={editor} data={data} readOnly={readOnly} onClose={() => setEditor(null)} onSavedMonth={onSavedMonth} />}
+    {editor && <BillHistoryDialog societyId={societyId} societyName={societyName} controllerName={controllerName} operatingDate={summary.as_of_operating_date} deviceId={summary.device_id} initialWing={editor} data={data} readOnly={readOnly} onClose={() => setEditor(null)} onSavedMonth={onSavedMonth} ask={ask} />}
   </BillHistoryContext.Provider>;
 }

@@ -4,6 +4,7 @@ import api from "@/lib/api";
 import { OneTimeSecret } from "./OneTimeSecret";
 import { DeviceStateBadges } from "../StateBadges";
 import { field, primaryBtn, errorText } from "./SuperAdminForms";
+import { Confirm, ConfirmDialog, runConfirmed } from "@/components/ops/ConfirmDialog";
 
 export type SocietyDevice = {
   id: string; name: string; status: string; hardware_profile: string; feedback_hardware_installed: boolean;
@@ -16,14 +17,29 @@ type Issued = { device_id: string; key_id: string; api_key: string; name: string
 export function RegisterPiForm({ onRegistered }: { onRegistered: () => void }) {
   const [name, setName] = useState(""); const [feedback, setFeedback] = useState(false);
   const [busy, setBusy] = useState(false); const [err, setErr] = useState(""); const [issued, setIssued] = useState<Issued | null>(null);
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault(); setBusy(true); setErr(""); setIssued(null);
-    try {
-      // society_id is intentionally NOT sent: the backend binds the device to the session's society.
-      const res = await api.post("/api/admin/devices/register", { name, hardware_profile: "EMS-4CH-v1", feedback_hardware_installed: feedback });
-      setIssued(res.data); setName(""); setFeedback(false); onRegistered();
-    } catch (e2) { setErr(errorText(e2)); }
-    setBusy(false);
+  const [confirm, setConfirm] = useState<Confirm | null>(null);
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (busy || !name.trim()) return;
+    void runConfirmed(setConfirm, {
+      title: feedback ? "Confirm contactor feedback configuration" : "Register this device?",
+      body: `Device name: ${name.trim()}\nHardware profile: EMS-4CH-v1\nContactor feedback declared installed: ${feedback ? "YES" : "NO"}`,
+      consequence: feedback
+        ? "The EMS will use this capability information when determining whether physical feedback verification is available. Incorrect configuration can affect safety validation."
+        : "A new controller record and a one-time credential will be created for this society.",
+      action: "Register Device",
+      severity: feedback ? "DANGER" : "WARNING",
+      failure: "The device was not registered.",
+    }, async () => {
+      setBusy(true); setErr(""); setIssued(null);
+      try {
+        // society_id is intentionally NOT sent: the backend binds the device to the session's society.
+        const res = await api.post("/api/admin/devices/register", { name, hardware_profile: "EMS-4CH-v1", feedback_hardware_installed: feedback });
+        setIssued(res.data); setName(""); setFeedback(false); onRegistered();
+        return true;
+      } catch (e2) { setErr(errorText(e2)); return false; }
+      finally { setBusy(false); }
+    });
   };
   return (
     <form onSubmit={submit} data-testid="register-pi-form" className="rounded-xl border border-gray-800 bg-gray-900/80 p-5 mb-6">
@@ -42,6 +58,7 @@ export function RegisterPiForm({ onRegistered }: { onRegistered: () => void }) {
         <OneTimeSecret testId="pi-credential" title={`Credential for "${issued.name}"`} onDismiss={() => setIssued(null)}
           rows={[{ label: "Device ID", value: issued.device_id }, { label: "Key ID", value: issued.key_id }, { label: "API Key", value: issued.api_key, secret: true }]} />
       )}
+      <ConfirmDialog c={confirm} onClose={() => setConfirm(null)} />
     </form>
   );
 }

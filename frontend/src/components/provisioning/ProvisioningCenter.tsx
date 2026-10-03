@@ -2,7 +2,7 @@
 import { useState } from "react";
 import api from "@/lib/api";
 import { SocietyDevice } from "./AdminDevices";
-import { Confirm, ConfirmDialog } from "@/components/ops/ConfirmDialog";
+import { Confirm, ConfirmDialog, runConfirmed } from "@/components/ops/ConfirmDialog";
 import { Dot, btn, input, label, panel, tone } from "@/components/ops/DashboardHeader";
 import { ago, fmtDateTime, errorText } from "@/components/ops/types";
 import { useProvisioningDevices } from "./useProvisioningDevices";
@@ -19,7 +19,7 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
   const [reveal, setReveal] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const copy = (v: string) => navigator.clipboard.writeText(v).then(() => notify("Copied", true)).catch(() => notify("Clipboard unavailable", false));
-  const run = async (name: string, fn: () => Promise<void>) => { setBusy(name); try { await fn(); } catch (e) { notify(errorText(e).detail, false); } finally { setBusy(null); } };
+  const run = async (name: string, fn: () => Promise<void>) => { setBusy(name); try { await fn(); return true; } catch (e) { notify(errorText(e).detail, false); return false; } finally { setBusy(null); } };
   const rotate = () => run("rotate", async () => {
     const r = await api.post(`/api/super-admin/devices/${d.id}/credentials/rotate`, {});
     setIssued({ key_id: r.data.key_id, api_key: r.data.api_key }); setReveal(false); notify(`Key rotated → ${r.data.key_id}. Previous key is now invalid.`, true); onChanged();
@@ -46,7 +46,7 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
           <button data-testid={`prov-reveal-${d.id}`} disabled={!issued} onClick={() => setReveal(!reveal)} className={`${btn} ${tone.gray} py-0.5`}>{reveal ? "HIDE" : "REVEAL"}</button>
           <button data-testid={`prov-copy-key-${d.id}`} disabled={!issued} onClick={() => issued && copy(issued.api_key)} className={`${btn} ${tone.gray} py-0.5`}>COPY</button>
           <button data-testid={`prov-rotate-${d.id}`} disabled={busy !== null} className={`${btn} ${tone.amber} py-0.5`}
-            onClick={() => ask({ title: "Rotate API key", body: "The current key stops working immediately. The new key is shown once here and must be provisioned onto the Pi.", action: "ROTATE KEY", danger: true, onConfirm: rotate })}>ROTATE</button>
+            onClick={() => ask({ title: "Rotate device credentials?", body: `Device: ${d.name}\nDevice ID: ${d.id}`, consequence: "A new device credential will be generated. The existing credential will stop working. This cannot be reversed; the previous key is not recoverable.", action: "Rotate Credentials", severity: "DANGER", failure: "Credentials were not rotated. The existing credential is still in effect.", onConfirm: rotate })}>ROTATE</button>
         </dd>
         <Field k="KEY ID" v={issued?.key_id || d.key_id || "—"} testId={`prov-key-id-${d.id}`} />
         <Field k="CREDENTIAL" v={cred} tone={cred === "ACTIVE" ? "text-emerald-300" : "text-red-400"} testId={`prov-cred-${d.id}`} />
@@ -62,11 +62,11 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
       <HardwareCapabilities deviceId={d.id} ask={ask} />
       <div className="mt-4 flex flex-wrap gap-2">
         <button data-testid={`prov-download-${d.id}`} disabled={busy !== null || d.status === "RETIRED"} className={`${btn} ${tone.cyan} py-2.5`}
-          onClick={() => ask({ title: "Generate New Provisioning Package?", body: "To keep provisioning secure, this package will contain a newly rotated API key. The previous key will stop working.\n\nAny Pi currently using the previous key must be reprovisioned with this package.", action: "GENERATE & DOWNLOAD", danger: true, onConfirm: download })}>
+          onClick={() => ask({ title: "Rotate device credentials?", body: `Device: ${d.name}\nDevice ID: ${d.id}\n\nThis download builds a provisioning package with a newly rotated API key.`, consequence: "A new device credential will be generated. The existing credential will stop working and cannot be recovered. Any controller still using the previous key must be reprovisioned.", action: "Rotate Credentials", severity: "DANGER", failure: "The provisioning package was not created. The existing credential is still in effect.", onConfirm: download })}>
           {busy === "download" ? "GENERATING…" : "DOWNLOAD PI PROVISIONING ZIP"}
         </button>
         <button data-testid={`prov-revoke-${d.id}`} disabled={busy !== null || d.credential_state !== "active"} className={`${btn} ${tone.red} py-2.5`}
-          onClick={() => ask({ title: "Revoke device credential", body: "The Pi will be rejected on its next sync and go OFFLINE. The device stays registered (audit history preserved); download a new package to reprovision.", action: "REVOKE DEVICE", danger: true, onConfirm: revoke })}>REVOKE DEVICE</button>
+          onClick={() => ask({ title: "Revoke this device?", body: `Device:\n${d.name}\n\nDevice ID:\n${d.id}`, consequence: "Authentication for this device will be revoked. The device will no longer be authorized to communicate with the EMS cloud.", action: "Revoke Device", severity: "CRITICAL", typed: "REVOKE DEVICE", failure: "This device was not revoked. Its credential is still active.", onConfirm: revoke })}>REVOKE DEVICE</button>
       </div>
     </article>
   );
@@ -76,11 +76,18 @@ export function ProvisioningCenter({ societyId }: { societyId: string }) {
   const { devices, error, loading, load } = useProvisioningDevices(societyId); const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [msg, setMsg] = useState<{ t: string; ok: boolean } | null>(null); const [name, setName] = useState(""); const [busy, setBusy] = useState(false);
   const notify = (t: string, ok: boolean) => { setMsg({ t, ok }); setTimeout(() => setMsg(null), 5000); };
-  const register = async () => {   // new device: register + credential issued once -> then DOWNLOAD builds the package (rotates)
+  const register = () => runConfirmed(setConfirm, {
+    title: "Register this device?",
+    body: `Device name: ${name.trim()}\nSociety: ${societyId}`,
+    consequence: "A new controller record and a one-time credential will be created. The credential is shown only through a later provisioning download.",
+    action: "Register Device",
+    severity: "WARNING",
+    failure: "The device was not registered.",
+  }, async () => {
     setBusy(true);
-    try { const r = await api.post("/api/admin/devices/register", { name, society_id: Number(societyId) }); notify(`Registered ${r.data.name} (${r.data.key_id}). Use DOWNLOAD PI PROVISIONING ZIP to get its installer.`, true); setName(""); await load(); }
-    catch (e) { notify(errorText(e).detail, false); } finally { setBusy(false); }
-  };
+    try { const r = await api.post("/api/admin/devices/register", { name, society_id: Number(societyId) }); notify(`Registered ${r.data.name} (${r.data.key_id}). Use DOWNLOAD PI PROVISIONING ZIP to get its installer.`, true); setName(""); await load(); return true; }
+    catch (e) { notify(errorText(e).detail, false); return false; } finally { setBusy(false); }
+  });
   return (
     <section data-testid="provisioning-center" className={`${panel} p-4 space-y-3`}>
       <div className="flex flex-wrap items-center justify-between gap-2">

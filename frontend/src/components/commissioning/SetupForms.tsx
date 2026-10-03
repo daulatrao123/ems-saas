@@ -1,6 +1,6 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
-import { Setup, setupValid } from "./types";
+import { Save, Setup, setupValid } from "./types";
 import { useRead, useSave } from "./hooks";
 import { Alert } from "./controls";
 import { BusForm } from "./BusForm";
@@ -8,11 +8,31 @@ import { MeterForm } from "./MeterForm";
 import { ModeForm } from "./ModeForm";
 import { TargetForm } from "./TargetForm";
 import { btn, tone } from "../ops/DashboardHeader";
+import { Confirm, ConfirmDialog } from "../ops/ConfirmDialog";
 
 export function SetupForms({ sid, did, onLocked }: { sid: string; did: string; onLocked: (v: boolean) => void }) {
   const read = useRead<Setup>(`/api/energy/commissioning?society_id=${encodeURIComponent(sid)}&device_id=${encodeURIComponent(did)}`, setupValid);
   const action = useSave(sid, did, read.refresh);
+  const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [dirty, setDirty] = useState<string[]>([]), [wing, setWing] = useState("A");
+  const save: Save = (method, path, body, label) => new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => { if (!settled) { settled = true; resolve(ok); } };
+    setConfirm({
+      title: "Confirm configuration change",
+      body: `You are about to save ${label} for this controller.`,
+      consequence: "The stored commissioning configuration changes after the request succeeds. This does not energize a relay by itself.",
+      action: "Confirm Changes",
+      severity: "WARNING",
+      failure: `${label} was not saved.`,
+      onCancel: () => finish(false),
+      onConfirm: async () => {
+        const ok = await action.save(method, path, body, label);
+        if (ok) finish(true);
+        return ok;
+      },
+    });
+  });
   const mark = useCallback((name: string, value: boolean) => setDirty(old => value ? old.includes(name) ? old : [...old, name] : old.includes(name) ? old.filter(x => x !== name) : old), []);
   const locked = action.busy || dirty.length > 0;
   useEffect(() => { onLocked(locked); return () => onLocked(false); }, [locked, onLocked]);
@@ -36,8 +56,9 @@ export function SetupForms({ sid, did, onLocked }: { sid: string; did: string; o
       <p data-testid="setup-evidence-note" className="text-xs text-gray-500 sm:col-span-3">Snapshot evidence only · version agreement is not physical hardware verification.</p></div>
       <p data-testid="setup-allocation-state" className="my-4 text-xs text-gray-400">Automatic allocation: {data.allocation_enabled ? "ENABLED · setup writes locked" : "DISABLED · unchanged by commissioning"}</p>
       {data.allocation_enabled && <Alert id="setup-allocation-block">Pause automatic allocation through the approved operating procedure before changing hardware settings.</Alert>}
-      <div className="grid min-w-0 grid-cols-1 items-start gap-x-10 xl:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]"><div className="min-w-0"><BusForm setup={data} save={action.save} disabled={disabled("bus")} mark={mark} /><MeterForm setup={data} save={action.save} disabled={disabled("m1")} mark={mark} /></div><div className="min-w-0"><ModeForm setup={data} save={action.save} disabled={disabled("mode")} mark={mark} /><TargetForm sid={sid} did={did} wing={wing} setWing={setWing} save={action.save} disabled={disabled("target")} dirty={dirty.includes("target")} mark={mark} operationsHref={`/society/${sid}`} version={data.config_version} /></div></div>
+      <div className="grid min-w-0 grid-cols-1 items-start gap-x-10 xl:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]"><div className="min-w-0"><BusForm setup={data} save={save} disabled={disabled("bus")} mark={mark} /><MeterForm setup={data} save={save} disabled={disabled("m1")} mark={mark} /></div><div className="min-w-0"><ModeForm setup={data} save={save} disabled={disabled("mode")} mark={mark} /><TargetForm sid={sid} did={did} wing={wing} setWing={setWing} save={save} disabled={disabled("target")} dirty={dirty.includes("target")} mark={mark} operationsHref={`/society/${sid}`} version={data.config_version} /></div></div>
     </>}
     {!read.loading && !read.error && !data && <Alert id="setup-identity-error">The configuration response does not match this controller.</Alert>}
+    <ConfirmDialog c={confirm} onClose={() => setConfirm(null)} />
   </div>;
 }

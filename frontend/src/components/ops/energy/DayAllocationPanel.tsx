@@ -3,9 +3,10 @@ import { useState } from "react";
 import api from "@/lib/api";
 import { btn, input, panel, tone } from "../DashboardHeader";
 import { EnergySummary } from "./types";
+import type { Confirm } from "../ConfirmDialog";
 
-export function DayAllocationPanel({ societyId, deviceId, summary, readOnly, refresh, wings }: {
-  societyId: string; deviceId: string; summary: EnergySummary | null; readOnly: boolean; refresh: () => Promise<void>; wings: readonly string[];
+export function DayAllocationPanel({ societyId, deviceId, deviceName, summary, readOnly, refresh, wings, ask }: {
+  societyId: string; deviceId: string; deviceName?: string; summary: EnergySummary | null; readOnly: boolean; refresh: () => Promise<void>; wings: readonly string[]; ask?: (c: Confirm) => void;
 }) {
   const cycle = summary?.day_allocation?.cycle_days ?? 0;
   const [kind, setKind] = useState<"DAYS" | "UNITS">("DAYS");
@@ -27,10 +28,11 @@ export function DayAllocationPanel({ societyId, deviceId, summary, readOnly, ref
     setBusy(true); setError("");
     try {
       const result = await api.post("/api/energy/day-allocation/apply", { ...body, idempotency_key: crypto.randomUUID() });
-      if (result.data.status !== "APPLYING") setError("Allocation was not queued");
-      else await refresh();
-    } catch (e) { setError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "Apply failed"); }
-    setBusy(false);
+      if (result.data.status !== "APPLYING") { setError("Allocation was not queued"); return false; }
+      await refresh();
+      return true;
+    } catch (e) { setError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "Apply failed"); return false; }
+    finally { setBusy(false); }
   };
   return <section data-testid="day-allocation-panel" className={panel}>
     <div className="text-xs text-slate-500">CYCLE LENGTH</div>
@@ -51,7 +53,19 @@ export function DayAllocationPanel({ societyId, deviceId, summary, readOnly, ref
     {error && <div role="alert" className="mt-3 text-sm text-rose-700">{error}</div>}
     {!readOnly && <div className="flex gap-2 mt-3">
       <button type="button" data-testid="day-calculate" disabled={busy} onClick={() => void calculate()} className={`${btn} ${tone.gray}`}>CALCULATE</button>
-      <button type="button" data-testid="day-apply" disabled={busy || !days} onClick={() => void apply()} className={`${btn} ${tone.cyan}`}>SEND ALLOCATION</button>
+      <button type="button" data-testid="day-apply" disabled={busy || !days} onClick={() => {
+        if (!days) return;
+        const listed = ["A", "B", "C", "D"].map((wing) => wings.includes(wing) ? `${wing}: ${days[wing] ?? "—"} days` : `${wing}: Disabled`).join("\n");
+        ask?.({
+          title: "Apply DAY_BASED schedule?",
+          body: `${deviceName || deviceId}\n${listed}\nCycle: ${cycle || "—"} days\nReset day: ${summary?.day_allocation?.reset_day ?? "—"}`,
+          consequence: "The new schedule will become the canonical device configuration after successful synchronization.",
+          action: "Apply Schedule",
+          severity: "WARNING",
+          failure: "The schedule was not queued. The stored day allocation is unchanged.",
+          onConfirm: () => apply(),
+        });
+      }} className={`${btn} ${tone.cyan}`}>SEND ALLOCATION</button>
     </div>}
   </section>;
 }

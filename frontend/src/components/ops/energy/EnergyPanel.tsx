@@ -4,6 +4,7 @@ import { btn, input, label, panel, tone } from "../DashboardHeader";
 import { AllocationTimeline } from "./AllocationTimeline";
 import { GenerationCard } from "./GenerationCard";
 import { AllocationMode, isAllocationMode } from "../allocationMode";
+import type { Confirm } from "../ConfirmDialog";
 import { CalculationMode } from "./types";
 import { useEnergy } from "./useEnergy";
 import { EnergyReferences } from "./EnergyReferences";
@@ -16,9 +17,9 @@ import { ClockQualificationNotice } from "./ClockQualificationNotice";
 import { TargetDeliveryStatus } from "./TargetDeliveryStatus";
 import { SectionHeading } from "../DashboardSections";
 
-export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, children, societyId, societyName, controllerName, allocationMode, onAllocationMode, excessEnabled }: {
+export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, children, societyId, societyName, controllerName, allocationMode, onAllocationMode, excessEnabled, ask }: {
   energy: ReturnType<typeof useEnergy>; readOnly: boolean; activeGenerationWing?: string; children: ReactNode; societyId: string; societyName?: string; controllerName?: string;
-  allocationMode: AllocationMode; onAllocationMode: (mode: AllocationMode) => Promise<boolean> | void; excessEnabled: boolean;
+  allocationMode: AllocationMode; onAllocationMode: (mode: AllocationMode) => Promise<boolean> | void; excessEnabled: boolean; ask?: (c: Confirm) => void;
 }) {
   const mode = en.summary?.calculation?.mode;
   const key = `${societyId}:${en.summary?.device_id}:${mode}`;
@@ -34,14 +35,24 @@ export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, childr
       <div className="flex flex-wrap items-end justify-between gap-3">
         <label className="block text-xs text-gray-400">Energy Calculation Mode
           <select data-testid="energy-calculation-mode" aria-label="Energy Calculation Mode" value={mode || ""} disabled={readOnly || en.loading || en.saving || !mode}
-            onChange={(e) => en.setMode(e.target.value as CalculationMode)} className={`${input} block mt-1 min-w-44`}>
+            onChange={(e) => {
+              const next = e.target.value as CalculationMode;
+              if (!mode || next === mode) return;
+              if (!ask) { void en.setMode(next); return; }
+              ask({ title: "Change energy calculation mode?", body: `Controller: ${controllerLabel}\nCurrent calculation mode: ${mode}\nNew calculation mode: ${next}\n\nThis is Energy Calculation Mode. It does not change Allocation Mode.`, consequence: "Stored consumption calculation for this device will use the selected mode after the save succeeds.", action: "Change Calculation Mode", severity: "WARNING", failure: "Calculation mode was not saved.", onConfirm: () => en.setMode(next) });
+            }} className={`${input} block mt-1 min-w-44`}>
             {!mode && <option value="">{en.loading ? "LOADING…" : "UNAVAILABLE"}</option>}
             <option value="AUTO">AUTO MODE</option><option value="MANUAL">MANUAL MODE</option>
           </select>
         </label>
         <label className="block text-xs text-gray-400">Allocation mode
           <select data-testid="allocation-mode" aria-label="Allocation mode" value={allocationMode} disabled={readOnly || en.loading || en.saving}
-            onChange={(e) => { if (isAllocationMode(e.target.value)) void onAllocationMode(e.target.value); }} className={`${input} block mt-1 min-w-44`}>
+            onChange={(e) => {
+              const next = e.target.value;
+              if (!isAllocationMode(next) || next === allocationMode) return;
+              if (!ask) { void onAllocationMode(next); return; }
+              ask({ title: "Change allocation mode?", body: `Controller: ${controllerLabel}\nCurrent mode: ${allocationMode}\nNew mode: ${next}\n\nThis is Allocation Mode. It does not change Energy Calculation Mode.`, consequence: "This changes how automatic allocation decisions are handled by the EMS.", action: "Change Mode", severity: "WARNING", failure: "Allocation mode was not changed.", onConfirm: () => onAllocationMode(next) });
+            }} className={`${input} block mt-1 min-w-44`}>
             <option value="AUTO">AUTO</option><option value="MANUAL">MANUAL</option><option value="DAY_BASED">DAY BASED</option>
           </select>
         </label>
@@ -66,6 +77,6 @@ export function EnergyPanel({ energy: en, readOnly, activeGenerationWing, childr
     </section>
   );
   return <CalendarComparisonContext.Provider value={{ month, ...calendar, operatingDate: en.summary?.as_of_operating_date }}>
-    {en.summary?.references ? <EnergyReferences key={`${en.summary.device_id}:${mode}`} societyId={societyId} societyName={societyLabel} controllerName={controllerLabel} summary={en.summary} readOnly={readOnly} refresh={en.refresh} onSavedMonth={savedMonth} excessEnabled={excessEnabled}>{content}</EnergyReferences> : <>{content}<section id="ops-references" data-testid="references-unavailable" className="ops-section"><SectionHeading id="references" number="03" title="Baselines & calculation references" context="UNAVAILABLE" /></section></>}
+    {en.summary?.references ? <EnergyReferences key={`${en.summary.device_id}:${mode}`} societyId={societyId} societyName={societyLabel} controllerName={controllerLabel} summary={en.summary} readOnly={readOnly} refresh={en.refresh} onSavedMonth={savedMonth} excessEnabled={excessEnabled} ask={ask}>{content}</EnergyReferences> : <>{content}<section id="ops-references" data-testid="references-unavailable" className="ops-section"><SectionHeading id="references" number="03" title="Baselines & calculation references" context="UNAVAILABLE" /></section></>}
   </CalendarComparisonContext.Provider>;
 }

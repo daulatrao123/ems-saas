@@ -6,15 +6,16 @@ import { btn, input, label, panel, tone } from "./DashboardHeader";
 import { LastResponse } from "./LastResponse";
 import { WingEnergyCard } from "./energy/WingEnergyCard";
 import { AllocationMode } from "./allocationMode";
+import type { Confirm } from "./ConfirmDialog";
 import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary } from "./energy/types";
 
-type Props = { device: Device; code: WingCode; slot?: Slot; queue: QueueFn; setSlotConfig: SlotConfigFn; isPending: (d: string, c: string, s?: string) => boolean; readOnly: boolean;
+type Props = { device: Device; code: WingCode; slot?: Slot; queue: QueueFn; setSlotConfig: SlotConfigFn; isPending: (d: string, c: string, s?: string) => boolean; readOnly: boolean; ask?: (c: Confirm) => void;
   lastCmd?: CommandRow; lastResponse?: Response | null; wing?: WingSummary; allocation: AllocationConfig | null; activeGenerationWing?: string; allotmentInput?: ReactNode;
   mode?: CalculationMode; allocationMode: AllocationMode; manualControlLabel: string; comparison?: ComparisonSeries; excessEnabled?: boolean };
 const telemetry = (v: string | undefined, offline: boolean) => offline ? "UNKNOWN (offline)" : v === "ON" || v === "OFF" ? v : "UNKNOWN";
 const numberOrNull = (v: number | undefined) => v != null && Number.isFinite(v) ? v : null;
 
-export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, readOnly, wing, allocation, activeGenerationWing, mode, allocationMode, manualControlLabel, comparison, excessEnabled = false }: Props) {
+export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, readOnly, ask, wing, allocation, activeGenerationWing, mode, allocationMode, manualControlLabel, comparison, excessEnabled = false }: Props) {
   const active = device.active_slot === code;
   const state = !slot || typeof slot.disabled !== "boolean" ? "UNAVAILABLE" : slot.disabled ? "DISABLED" : active ? "ACTIVE" : "INACTIVE";
   const stateTone = slot?.disabled ? "text-gray-500 border-gray-700" : active ? "text-emerald-300 border-emerald-500/50 bg-emerald-500/10" : "text-gray-300 border-[#2a3646]";
@@ -43,14 +44,14 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
       {!readOnly && slot && !slot.disabled && (
         <div data-testid={`manual-control-${code}`} className="grid grid-cols-2 gap-2">
           <span data-testid={`manual-control-label-${code}`} className={`${label} col-span-2`}>{manualControlLabel}</span>
-          <button data-testid={`cmd-set_active_slot-${device.id}-${code}`} disabled={active || busyAct} onClick={() => queue(device.id, "set_active_slot", code)} className={`${btn} ${tone.cyan}`}>{busyAct ? "EXECUTING…" : "ACTIVATE"}</button>
-          <button data-testid={`cmd-off_slot-${device.id}-${code}`} disabled={!active || busyOff} onClick={() => queue(device.id, "off_slot", code)} className={`${btn} ${tone.red}`}>{busyOff ? "EXECUTING…" : "DEACTIVATE"}</button>
+          <button data-testid={`cmd-set_active_slot-${device.id}-${code}`} disabled={active || busyAct} onClick={() => ask?.({ title: `Confirm Wing ${code} activation`, body: `You are requesting activation of Wing ${code} on ${device.name}.`, consequence: "This command will be sent to the EMS controller and may change the physical contactor state.", action: `Activate Wing ${code}`, severity: "DANGER", failure: `Wing ${code} activation was not queued. No command was sent.`, onConfirm: () => queue(device.id, "set_active_slot", code) })} className={`${btn} ${tone.cyan}`}>{busyAct ? "EXECUTING…" : "ACTIVATE"}</button>
+          <button data-testid={`cmd-off_slot-${device.id}-${code}`} disabled={!active || busyOff} onClick={() => ask?.({ title: `Deactivate Wing ${code}?`, body: `You are requesting deactivation of Wing ${code} on ${device.name}.`, consequence: "This command will be sent to the EMS controller and may change the physical contactor state.", action: `Deactivate Wing ${code}`, severity: "DANGER", failure: `Wing ${code} deactivation was not queued. No command was sent.`, onConfirm: () => queue(device.id, "off_slot", code) })} className={`${btn} ${tone.red}`}>{busyOff ? "EXECUTING…" : "DEACTIVATE"}</button>
         </div>
       )}
       {!readOnly && slot && (
         <div className="flex items-center justify-between gap-2 border-t border-[#1e2a3a] pt-3">
           <span className={label}>Logical slot control</span>
-          <button data-testid={`slot-${slot.disabled ? "enable" : "disable"}-${code}`} disabled={busyCfg} onClick={() => setSlotConfig(device.id, code, { disabled: !slot.disabled })} className={`${btn} ${slot.disabled ? tone.cyan : tone.gray}`}>{busyCfg ? "SAVING…" : slot.disabled ? "ENABLE" : "DISABLE"}</button>
+          <button data-testid={`slot-${slot.disabled ? "enable" : "disable"}-${code}`} disabled={busyCfg} onClick={() => ask?.({ title: slot.disabled ? `Enable Wing ${code}?` : `Disable Wing ${code}?`, body: `${slot.disabled ? "Enable" : "Disable"} the logical slot for Wing ${code} on ${device.name}.`, consequence: slot.disabled ? "The wing becomes eligible for allocation and manual control after the configuration is saved." : "The wing is excluded from allocation and manual control after the configuration is saved. This does not by itself change GPIO polarity.", action: slot.disabled ? `Enable Wing ${code}` : `Disable Wing ${code}`, severity: "WARNING", failure: "Logical slot configuration was not saved.", onConfirm: () => setSlotConfig(device.id, code, { disabled: !slot.disabled }) })} className={`${btn} ${slot.disabled ? tone.cyan : tone.gray}`}>{busyCfg ? "SAVING…" : slot.disabled ? "ENABLE" : "DISABLE"}</button>
         </div>
       )}
     </section>
@@ -58,7 +59,7 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
 }
 
 // Existing days editing and command evidence remain available, outside energy cards.
-export function SlotOperations({ device, code, slot, queue, isPending, readOnly, lastCmd, lastResponse, allotmentInput }: Pick<Props, "device" | "code" | "slot" | "queue" | "isPending" | "readOnly" | "lastCmd" | "lastResponse" | "allotmentInput">) {
+export function SlotOperations({ device, code, slot, queue, isPending, readOnly, ask, lastCmd, lastResponse, allotmentInput }: Pick<Props, "device" | "code" | "slot" | "queue" | "isPending" | "readOnly" | "ask" | "lastCmd" | "lastResponse" | "allotmentInput">) {
   const [days, setDays] = useState(String(slot?.target_days ?? ""));
   const [seenTarget, setSeenTarget] = useState(slot?.target_days);
   if (seenTarget !== slot?.target_days) { setSeenTarget(slot?.target_days); setDays(String(slot?.target_days ?? "")); }
@@ -80,7 +81,7 @@ export function SlotOperations({ device, code, slot, queue, isPending, readOnly,
         <div className="flex items-center gap-2 border-t border-[#1e2a3a] pt-3">
           <span className={label}>Days</span>
           <input data-testid={`slot-days-input-${code}`} type="number" min={0} max={31} value={days} onChange={(e) => setDays(e.target.value)} className={`${input} w-16 text-center`} />
-          <button data-testid={`slot-days-submit-${code}`} disabled={busyDays || !validDays || n === target} onClick={() => queue(device.id, "set_days", code, { days: n })} className={`${btn} ${tone.amber} flex-1`}>{busyDays ? "SENDING…" : "SET DAYS"}</button>
+          <button data-testid={`slot-days-submit-${code}`} disabled={busyDays || !validDays || n === target} onClick={() => ask?.({ title: `Change Wing ${code} day allocation?`, body: `Wing ${code} on ${device.name}\nCurrent target: ${target == null ? "UNAVAILABLE" : `${target} days`}\nNew target: ${n} days`, consequence: "The new day target is queued for this wing. The controller replaces its previous target only after a successful sync.", action: `Set Wing ${code} Days`, severity: "WARNING", failure: "The day target was not queued. The stored target is unchanged.", onConfirm: () => queue(device.id, "set_days", code, { days: n }) })} className={`${btn} ${tone.amber} flex-1`}>{busyDays ? "SENDING…" : "SET DAYS"}</button>
         </div>
       )}
       {!readOnly && allotmentInput}

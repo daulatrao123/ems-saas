@@ -2,6 +2,7 @@
 import { useState } from "react";
 import api from "@/lib/api";
 import { OneTimeSecret } from "./OneTimeSecret";
+import { Confirm, ConfirmDialog, runConfirmed } from "@/components/ops/ConfirmDialog";
 
 export const field = "w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 placeholder:text-gray-600 focus:border-cyan-500 focus:outline-none";
 export const primaryBtn = "rounded-md bg-cyan-500/20 border border-cyan-500/40 px-4 py-2 text-xs font-bold text-cyan-300 hover:bg-cyan-500/30 disabled:opacity-50";
@@ -16,15 +17,28 @@ export type SocietyOption = { id: number; name: string };
 export function CreateSocietyForm({ onCreated }: { onCreated: (s: SocietyOption) => void }) {
   const [name, setName] = useState(""); const [location, setLocation] = useState(""); const [resetDay, setResetDay] = useState("1");
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault(); setBusy(true); setMsg(null);
-    try {
-      const res = await api.post("/api/super-admin/societies", { name, location, reset_day: Number(resetDay) });
-      setMsg({ ok: true, text: `Society #${res.data.society_id} "${res.data.name}" created` });
-      onCreated({ id: res.data.society_id, name: res.data.name });
-      setName(""); setLocation("");
-    } catch (err) { setMsg({ ok: false, text: errorText(err) }); }
-    setBusy(false);
+  const [confirm, setConfirm] = useState<Confirm | null>(null);
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (busy || !name.trim()) return;
+    void runConfirmed(setConfirm, {
+      title: "Create this society?",
+      body: `Name: ${name.trim()}\nLocation: ${location.trim() || "—"}\nReset day: ${resetDay}`,
+      consequence: "A new tenant is created. Devices and users linked afterwards belong to this society.",
+      action: "Create Society",
+      severity: "WARNING",
+      failure: "The society was not created.",
+    }, async () => {
+      setBusy(true); setMsg(null);
+      try {
+        const res = await api.post("/api/super-admin/societies", { name, location, reset_day: Number(resetDay) });
+        setMsg({ ok: true, text: `Society #${res.data.society_id} "${res.data.name}" created` });
+        onCreated({ id: res.data.society_id, name: res.data.name });
+        setName(""); setLocation("");
+        return true;
+      } catch (err) { setMsg({ ok: false, text: errorText(err) }); return false; }
+      finally { setBusy(false); }
+    });
   };
   return (
     <form onSubmit={submit} data-testid="create-society-form" className="rounded-xl border border-gray-800 bg-gray-900/80 p-5">
@@ -39,6 +53,7 @@ export function CreateSocietyForm({ onCreated }: { onCreated: (s: SocietyOption)
         <button data-testid="create-society-submit" className={primaryBtn} disabled={busy || !name.trim()}>{busy ? "CREATING…" : "CREATE SOCIETY"}</button>
         {msg && <span data-testid="create-society-message" className={`text-xs ${msg.ok ? "text-emerald-400" : "text-red-400"}`}>{msg.text}</span>}
       </div>
+      <ConfirmDialog c={confirm} onClose={() => setConfirm(null)} />
     </form>
   );
 }
@@ -48,14 +63,28 @@ export function CreateUserForm({ societies }: { societies: SocietyOption[] }) {
   const [email, setEmail] = useState(""); const [name, setName] = useState("");
   const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
   const [issued, setIssued] = useState<{ email: string; password: string; role: string } | null>(null);
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault(); setBusy(true); setErr(""); setIssued(null);
-    try {
-      const res = await api.post("/api/super-admin/users", { society_id: Number(societyId), role, email, name });
-      setIssued({ email: res.data.email, password: res.data.temporary_password, role: res.data.role });
-      setEmail(""); setName("");
-    } catch (e2) { setErr(errorText(e2)); }
-    setBusy(false);
+  const [confirm, setConfirm] = useState<Confirm | null>(null);
+  const society = societies.find((s) => String(s.id) === societyId);
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (busy || !societyId || !email || !name) return;
+    void runConfirmed(setConfirm, {
+      title: "Create user with this role?",
+      body: `User: ${name.trim()} (${email.trim()})\nRole: ${role}\nSociety: ${society ? `#${society.id} ${society.name}` : societyId}`,
+      consequence: "This creates the user with the permissions available to that role in the selected society.",
+      action: "Apply Role Change",
+      severity: "WARNING",
+      failure: "The user was not created. No role was granted.",
+    }, async () => {
+      setBusy(true); setErr(""); setIssued(null);
+      try {
+        const res = await api.post("/api/super-admin/users", { society_id: Number(societyId), role, email, name });
+        setIssued({ email: res.data.email, password: res.data.temporary_password, role: res.data.role });
+        setEmail(""); setName("");
+        return true;
+      } catch (e2) { setErr(errorText(e2)); return false; }
+      finally { setBusy(false); }
+    });
   };
   return (
     <form onSubmit={submit} data-testid="create-user-form" className="rounded-xl border border-gray-800 bg-gray-900/80 p-5">
@@ -81,6 +110,7 @@ export function CreateUserForm({ societies }: { societies: SocietyOption[] }) {
         <OneTimeSecret testId="user-temp-password" title={`Temporary password for ${issued.email} (${issued.role})`} onDismiss={() => setIssued(null)}
           rows={[{ label: "Email", value: issued.email }, { label: "Password", value: issued.password, secret: true }]} />
       )}
+      <ConfirmDialog c={confirm} onClose={() => setConfirm(null)} />
     </form>
   );
 }

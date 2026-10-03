@@ -6,8 +6,8 @@ import { errorText } from "../types";
 import { WingCode } from "./types";
 import { BillHistory, dailyRate } from "./referenceTypes";
 
-export function BillMonthEditor({ societyId, deviceId, wing, endMonth, readOnly, onSaved }: {
-  societyId: string; deviceId: string; wing: WingCode; endMonth: string; readOnly: boolean; onSaved: (history: BillHistory, changedMonths: string[]) => void;
+export function BillMonthEditor({ societyId, deviceId, wing, endMonth, readOnly, onSaved, confirmSave }: {
+  societyId: string; deviceId: string; wing: WingCode; endMonth: string; readOnly: boolean; onSaved: (history: BillHistory, changedMonths: string[]) => void; confirmSave?: () => Promise<boolean>;
 }) {
   const [history, setHistory] = useState<BillHistory | null>(null);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -31,6 +31,7 @@ export function BillMonthEditor({ societyId, deviceId, wing, endMonth, readOnly,
     if (!history || history.device_id !== deviceId || history.wing !== wing || history.end_month !== endMonth || invalid || readOnly || submitting.current) return;
     submitting.current = true; setBusy(true); setError("");
     try {
+      if (confirmSave && !(await confirmSave())) return;
       const months = history.months.filter((m) => {
         const entered = values[m.month]?.trim();
         return entered !== undefined && entered !== "" && Number(entered) !== m.consumption_kwh;

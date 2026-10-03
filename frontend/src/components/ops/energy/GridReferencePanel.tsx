@@ -5,9 +5,10 @@ import { btn, input, tone } from "../DashboardHeader";
 import { errorText } from "../types";
 import { AllocationReference, GridReference, dailyRate } from "./referenceTypes";
 import { fmtKwh } from "./types";
+import type { Confirm } from "../ConfirmDialog";
 
-export function GridReferencePanel({ societyId, deviceId, grid, allocation: a, readOnly, onSaved, excessEnabled }: {
-  societyId: string; deviceId: string; grid: GridReference; allocation: AllocationReference; readOnly: boolean; onSaved: () => void; excessEnabled: boolean;
+export function GridReferencePanel({ societyId, deviceId, controllerName, grid, allocation: a, readOnly, onSaved, excessEnabled, ask }: {
+  societyId: string; deviceId: string; controllerName?: string; grid: GridReference; allocation: AllocationReference; readOnly: boolean; onSaved: () => void; excessEnabled: boolean; ask?: (c: Confirm) => void;
 }) {
   const [enabled, setEnabled] = useState(grid.enabled), [limit, setLimit] = useState(grid.limit_kwh_day === null ? "" : String(grid.limit_kwh_day));
   const [busy, setBusy] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState("");
@@ -18,12 +19,17 @@ export function GridReferencePanel({ societyId, deviceId, grid, allocation: a, r
     <div className="flex flex-wrap items-center justify-between gap-3"><h2 data-testid="grid-reference-title" className="text-base font-bold text-white">Allocation / Grid reference</h2><span data-testid="grid-reference-context" className="ops-category">CALCULATION ONLY · NOT LIVE DISPATCH</span></div>
     <form data-testid="grid-reference-form" className="flex flex-wrap items-end gap-3" onSubmit={async (event) => {
       event.preventDefault(); if (readOnly || !valid || pending.current) return;
-      pending.current = true; setBusy(true); setError(""); setNotice("");
-      try {
-        await api.put("/api/energy/grid-reference", { society_id: societyId, device_id: deviceId, enabled, limit_kwh_day: limit.trim() === "" ? null : Number(limit), expected_version: grid.version });
-        if (alive.current) { setNotice("Grid reference saved"); onSaved(); }
-      } catch (e) { if (alive.current) setError(errorText(e).detail); }
-      finally { pending.current = false; if (alive.current) setBusy(false); }
+      const write = async () => {
+        pending.current = true; setBusy(true); setError(""); setNotice("");
+        try {
+          await api.put("/api/energy/grid-reference", { society_id: societyId, device_id: deviceId, enabled, limit_kwh_day: limit.trim() === "" ? null : Number(limit), expected_version: grid.version });
+          if (alive.current) { setNotice("Grid reference saved"); onSaved(); }
+          return true;
+        } catch (e) { if (alive.current) setError(errorText(e).detail); return false; }
+        finally { pending.current = false; if (alive.current) setBusy(false); }
+      };
+      if (!ask) { await write(); return; }
+      ask({ title: "Confirm configuration change", body: `You are about to save the grid reference for ${controllerName || deviceId}.\nFeed excess to grid: ${enabled ? "YES" : "NO"}${enabled ? `\nLimit: ${limit} kWh/day` : ""}`, consequence: "The stored calculation reference changes after the save succeeds. This is not a live dispatch command.", action: "Confirm Changes", severity: "WARNING", failure: "Grid reference was not saved.", onConfirm: write });
     }}>
       <label className="text-xs text-gray-400">Feed excess generation to Grid<select data-testid="grid-enabled" aria-label="Feed excess generation to Grid" value={enabled ? "YES" : "NO"} disabled={readOnly || busy} onChange={(e) => setEnabled(e.target.value === "YES")} className={`${input} block mt-1`}><option value="YES">YES</option><option value="NO">NO</option></select></label>
       {enabled && <label className="text-xs text-gray-400">Grid export reference/limit (kWh/day)<input data-testid="grid-limit" aria-label="Grid export reference limit kWh per day" type="number" min="0" max="10000000" step="0.0001" value={limit} disabled={readOnly || busy} required onChange={(e) => setLimit(e.target.value)} className={`${input} block mt-1 w-full`} /></label>}

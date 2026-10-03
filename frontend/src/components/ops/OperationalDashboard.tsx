@@ -48,7 +48,7 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
   const lastFor = (code: string) => cmds.find((c) => c.slot === code) || undefined;
   const renderWings = () => device && (
     <div data-testid="slot-grid" className="grid items-start gap-4 md:grid-cols-2 xl:grid-cols-4">
-      {WINGS.map((c) => <SlotCard key={`${device.id}:${c}:${mode}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={async (...args) => { const saved = await ops.setSlotConfig(...args); if (saved) void energy.refresh(); return saved; }} isPending={ops.isPending} readOnly={readOnly}
+      {WINGS.map((c) => <SlotCard key={`${device.id}:${c}:${mode}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={async (...args) => { const saved = await ops.setSlotConfig(...args); if (saved) void energy.refresh(); return saved; }} isPending={ops.isPending} readOnly={readOnly} ask={setConfirm}
         lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} wing={energy.summary?.wings?.[c]} allocation={energy.allocation}
         mode={mode} allocationMode={allocationMode} manualControlLabel={visibility.manualControlLabel} comparison={energy.comparison?.wings[c]?.wing === c ? energy.comparison.wings[c] : undefined} activeGenerationWing={activeGenerationWing}
         excessEnabled={excessEnabled} />)}
@@ -57,7 +57,7 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
   const logicalWings = device ? WINGS.filter((c) => device.slots[c]?.disabled === false) : [];
   const renderDayControls = (inputs: Record<string, ReactNode> = {}, hideSenders = false) => device && (
     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-      {logicalWings.map((c) => <SlotOperations key={`${device.id}:${c}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} isPending={ops.isPending} readOnly={readOnly || hideSenders}
+      {logicalWings.map((c) => <SlotOperations key={`${device.id}:${c}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} isPending={ops.isPending} readOnly={readOnly || hideSenders} ask={setConfirm}
         lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} allotmentInput={inputs[c]} />)}
     </div>
   );
@@ -87,19 +87,19 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
           </summary>
           <div className={`grid gap-5 pb-5 ${readOnly ? "" : "lg:grid-cols-2"}`}>
             <StoragePanel device={device} />
-            {societyId && <LcdMessagePanel key={`${societyId}:${device.id}`} societyId={societyId} device={device} readOnly={readOnly} />}
+            {societyId && <LcdMessagePanel key={`${societyId}:${device.id}`} societyId={societyId} device={device} readOnly={readOnly} ask={setConfirm} />}
           </div>
         </details>}
       </section>
       {!device ? <div className={`${panel} p-8 text-center text-gray-500 font-mono text-sm`}>NO PI DEVICE REGISTERED FOR THIS SOCIETY</div> : (
         <>
           <div data-testid="ops-device-identity" className="mt-5 text-xs text-gray-400 break-words">{device.name} · <span className="font-mono">{device.id}</span></div>
-          {societyId && <EnergyPanel societyId={societyId} societyName={ops.dash.society.name} controllerName={device.name} energy={energy} readOnly={readOnly} activeGenerationWing={activeGenerationWing} allocationMode={allocationMode} onAllocationMode={energy.setAllocationMode} excessEnabled={excessEnabled}>{renderWings()}</EnergyPanel>}
+          {societyId && <EnergyPanel societyId={societyId} societyName={ops.dash.society.name} controllerName={device.name} energy={energy} readOnly={readOnly} activeGenerationWing={activeGenerationWing} allocationMode={allocationMode} onAllocationMode={energy.setAllocationMode} excessEnabled={excessEnabled} ask={setConfirm}>{renderWings()}</EnergyPanel>}
           <section id="ops-controls" data-testid="dashboard-controls" className="ops-section space-y-5">
             <SectionHeading id="controls" number="04" title={readOnly ? "Days & command evidence" : "Controller controls"} context={readOnly ? "Read only" : "Operator actions"} />
           {visibility.dayAllocation && <details data-testid="allocation-day-controls" className="ops-disclosure" open>
             <summary data-testid="days-command-details-toggle" className="text-sm font-medium">Day allocation</summary>
-            {visibility.cycleSettings && societyId && <DayAllocationPanel societyId={societyId} deviceId={device.id} summary={energy.summary} readOnly={readOnly} refresh={energy.refresh} wings={logicalWings} />}
+            {visibility.cycleSettings && societyId && <DayAllocationPanel societyId={societyId} deviceId={device.id} deviceName={device.name} summary={energy.summary} readOnly={readOnly} refresh={energy.refresh} wings={logicalWings} ask={setConfirm} />}
             {renderDayControls({}, true)}
           </details>}
           <div className={`grid gap-3 ${readOnly ? "" : "md:grid-cols-2 xl:grid-cols-3"}`}>
