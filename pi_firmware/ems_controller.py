@@ -1267,6 +1267,9 @@ class EMSController:
                 success = (
                     self._deactivate_all()
                 )
+                if success:
+                    verification = self._aggregate_off_all_verification()
+                    success = verification is not None
 
             else:
                 error = (
@@ -1542,6 +1545,33 @@ class EMSController:
     # ============================================================
     # DEACTIVATE ALL
     # ============================================================
+
+    def _aggregate_off_all_verification(self):
+        """One terminal token for off_all, from required slots only.
+
+        Disabled wings are not required. Every required slot must already
+        carry the same positive OFF result from deactivate_slot. A mix, or
+        any non-positive result, fails closed instead of claiming verification.
+        """
+        required = []
+        for slot in SUPPORTED_SLOTS:
+            cfg = self.device_config.get("slots", {}).get(slot, {})
+            if bool(cfg.get("disabled", False)):
+                continue
+            required.append(slot)
+        if not required:
+            return None
+        states = []
+        for slot in required:
+            slot_obj = self.state.slots.get(slot)
+            if slot_obj is None:
+                return None
+            states.append(slot_obj.verification_state)
+        if all(state == VerificationState.VERIFIED_OFF for state in states):
+            return VerificationState.VERIFIED_OFF.value
+        if all(state == VerificationState.GPIO_CONFIRMED for state in states):
+            return VerificationState.GPIO_CONFIRMED.value
+        return None
 
     def _deactivate_all(self):
         success = True

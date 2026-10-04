@@ -344,6 +344,57 @@ class Phase2ATests(unittest.TestCase):
         self.assertEqual(commands[0]["status"], "expired")
         self.assertGreater(cloud_obs._counts.get("observation_errors_total", 0), 0)
 
+    def test_duplicate_hardware_completed_ack_is_idempotent(self):
+        store = Store()
+        store.commands[A_ID] = _command(A_ID, "off_slot", "A", "executing", 1)
+        first, _conn = self._ack(store, A_ID, "completed", "GPIO_CONFIRMED")
+        self.assertEqual(first["status"], "completed")
+        self.assertNotIn("idempotent", first)
+        again, _conn = self._ack(store, A_ID, "completed", "GPIO_CONFIRMED")
+        self.assertTrue(again["idempotent"])
+        self.assertEqual(again["status"], "completed")
+        self.assertEqual(store.commands[A_ID]["status"], "completed")
+        acked, _conn = self._ack(store, A_ID, "acked", "GPIO_CONFIRMED")
+        self.assertEqual(acked["status"], "acked")
+        repeated, _conn = self._ack(store, A_ID, "acked", "GPIO_CONFIRMED")
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(store.commands[A_ID]["status"], "acked")
+        self.assertEqual(store.slot_writes, 0)
+        self.assertEqual(store.config_version, 4)
+
+    def test_rejected_off_all_is_not_requeued_or_expired(self):
+        past = NOW - timedelta(seconds=5)
+        commands = [{**_command(C_ID, "off_all", "", "executing", 1), "expires_at": past}]
+        recovered = command_reliability.expire_stuck_software_commands(RecoveryCursor(commands), DID, NOW)
+        self.assertEqual(recovered, [])
+        self.assertEqual(commands[0]["status"], "executing")
+        self.assertNotIn("error", commands[0])
+        lease = (ROOT / "backend" / "main.py").read_text(encoding="utf-8")
+        self.assertIn("status = 'queued' ORDER BY sequence_no ASC", lease)
+
+    def test_hardware_completed_verification_contract(self):
+        cases = (
+            ("GPIO_CONFIRMED", "completed", None),
+            ("VERIFIED_OFF", "completed", None),
+            ("PENDING", "executing", "ILLEGAL_TRANSITION"),
+        )
+        for verification, expected, code in cases:
+            with self.subTest(verification=verification):
+                store = Store()
+                store.commands[C_ID] = _command(C_ID, "off_all", "", "executing", 1)
+                if code is None:
+                    result, _conn = self._ack(store, C_ID, "completed", verification)
+                    self.assertEqual(result["status"], expected)
+                    self.assertEqual(store.commands[C_ID]["status"], "completed")
+                else:
+                    with self.assertRaises(HTTPException) as raised:
+                        self._ack(store, C_ID, "completed", verification)
+                    self.assertEqual(raised.exception.status_code, 409)
+                    self.assertEqual(raised.exception.headers.get("X-EMS-Ack-Code"), code)
+                    self.assertEqual(store.commands[C_ID]["status"], expected)
+                self.assertEqual(store.slot_writes, 0)
+                self.assertEqual(store.config_version, 4)
+
 
 if __name__ == "__main__":
     unittest.main()

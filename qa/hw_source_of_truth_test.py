@@ -13,7 +13,9 @@ import os
 import sys
 import threading
 import time
+import unittest
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -262,6 +264,251 @@ def feedback_and_interlock():
 
 
 EXPECTED_CHECKS = 35
+POSITIVE_VERIFICATION = {"GPIO_CONFIRMED", "VERIFIED_OFF", "VERIFIED_ON"}
+
+
+class AckLog:
+    """Records push_ack calls. Terminal statuses can be forced to HTTP 409."""
+
+    def __init__(self):
+        self.calls = []
+        self.last_ack_http = None
+        self.last_ack_code = None
+        self.last_retry_after = None
+        self.terminal_reject = False
+
+    def push_ack(self, command_id, status, verification="UNKNOWN", error=None, attempt=None):
+        status_u = str(status).upper()
+        verification_u = str(verification).upper() if verification else "UNKNOWN"
+        self.calls.append({"id": str(command_id), "status": status_u, "verification": verification_u, "error": error})
+        if self.terminal_reject and status_u in {"COMPLETED", "FAILED", "EXPIRED", "HARDWARE_VERIFIED", "ACKED"}:
+            self.last_ack_http = 409
+            self.last_ack_code = "ILLEGAL_TRANSITION"
+            return False
+        self.last_ack_http = 200
+        self.last_ack_code = None
+        return True
+
+    def sync(self, _snap):
+        return None
+
+    def close(self):
+        return None
+
+
+def enqueue(ctrl, cmd_id, slot, action):
+    now = datetime.now(timezone.utc)
+    assert ctrl.queue.add_command(
+        cmd_id, slot, action, now.isoformat(), (now + timedelta(minutes=5)).isoformat(), sequence_no=1,
+    ), f"queue must accept {action}"
+
+
+def command_row(ctrl, cmd_id):
+    return ctrl.queue.conn.execute(
+        "SELECT status, hardware_verification, ack_status FROM commands WHERE id=?",
+        (str(cmd_id),),
+    ).fetchone()
+
+
+@contextmanager
+def command_controller(conf):
+    with patch.object(gm, "time", GPIO_TIME), patch.object(ec, "ApiClient", Api), \
+            patch.object(ec.EMSController, "_install_signal_handlers", lambda self: None):
+        ctrl = ec.EMSController()
+        try:
+            ctrl.device_config.update(conf)
+            assert ctrl.boot() is True, "clean controller must boot READY"
+            # Directory fsync uses os.O_DIRECTORY, which Windows does not provide.
+            # The write is still attempted; a failed fsync must not skip GPIO execution.
+            original_save = ctrl.state.save_state
+
+            def save_state(immediate=False):
+                original_save(immediate=immediate)
+                return True
+
+            ctrl.state.save_state = save_state
+            ctrl.api = AckLog()
+            yield ctrl
+        finally:
+            try:
+                ctrl.shutdown()
+            finally:
+                stop_gpio(ctrl.gpio)
+
+
+class HardwareCommandVerificationTests(unittest.TestCase):
+    def test_off_all_without_feedback_acks_gpio_confirmed(self):
+        cmd_id = "hw-off-all-gpio"
+        with command_controller(cfg(False)) as ctrl:
+            enqueue(ctrl, cmd_id, "", "DEACTIVATE_ALL")
+            self.assertTrue(ctrl.process_one_command())
+            self.assertTrue(all(not relay.is_active for relay in ctrl.gpio.relays.values()))
+            ctrl.flush_acks()
+            status, verification, _ack = command_row(ctrl, cmd_id)
+            self.assertEqual(status, "COMPLETED")
+            self.assertEqual(verification, "GPIO_CONFIRMED")
+            self.assertNotIn(verification, {"PENDING", "VERIFIED_OFF", "VERIFIED_ON"})
+            self.assertEqual([call["status"] for call in ctrl.api.calls[:2]], ["EXECUTING", "COMPLETED"])
+            self.assertEqual(ctrl.api.calls[1]["verification"], "GPIO_CONFIRMED")
+            self.assertNotIn(ctrl.api.calls[1]["verification"], {"PENDING", "VERIFIED_OFF", "VERIFIED_ON"})
+
+    def test_off_all_with_feedback_acks_verified_off(self):
+        cmd_id = "hw-off-all-verified"
+        with command_controller(cfg(True)) as ctrl:
+            enqueue(ctrl, cmd_id, "", "DEACTIVATE_ALL")
+            with mirror(ctrl.gpio):
+                self.assertTrue(ctrl.process_one_command())
+            for slot in "ABCD":
+                self.assertEqual(ctrl.state.slots[slot].verification_state, VerificationState.VERIFIED_OFF)
+            ctrl.flush_acks()
+            status, verification, _ack = command_row(ctrl, cmd_id)
+            self.assertEqual(status, "COMPLETED")
+            self.assertEqual(verification, "VERIFIED_OFF")
+            self.assertNotEqual(verification, "GPIO_CONFIRMED")
+            self.assertNotEqual(verification, "PENDING")
+            completed = [call for call in ctrl.api.calls if call["status"] == "COMPLETED"]
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0]["verification"], "VERIFIED_OFF")
+            self.assertNotIn(completed[0]["verification"], {"GPIO_CONFIRMED", "PENDING"})
+
+    def test_off_all_pending_channel_does_not_complete_positive(self):
+        cmd_id = "hw-off-all-pending"
+        with command_controller(cfg(True)) as ctrl:
+            original = ctrl.gpio.deactivate_slot
+
+            def hold_pending(slot):
+                if slot == "D":
+                    ctrl.state.set_verification(slot, VerificationState.PENDING, immediate=True)
+                    return False
+                return original(slot)
+
+            ctrl.gpio.deactivate_slot = hold_pending
+            enqueue(ctrl, cmd_id, "", "DEACTIVATE_ALL")
+            with mirror(ctrl.gpio, "ABC"):
+                ctrl.process_one_command()
+            for slot in "ABC":
+                self.assertEqual(ctrl.state.slots[slot].verification_state, VerificationState.VERIFIED_OFF)
+            self.assertEqual(ctrl.state.slots["D"].verification_state, VerificationState.PENDING)
+            status, verification, _ack = command_row(ctrl, cmd_id)
+            self.assertNotEqual(status, "COMPLETED")
+            self.assertIn(status, {"FAILED"})
+            self.assertNotIn(verification, POSITIVE_VERIFICATION)
+            self.assertFalse(any(
+                call["status"] == "COMPLETED" and call["verification"] in POSITIVE_VERIFICATION
+                for call in ctrl.api.calls
+            ))
+
+    def test_off_all_unknown_or_fault_channel_fails_closed(self):
+        cmd_id = "hw-off-all-fault"
+        with command_controller(cfg(True)) as ctrl:
+            energized = []
+            for slot, relay in ctrl.gpio.relays.items():
+                original_on = relay.on
+
+                def record_on(bound_slot=slot, turn_on=original_on):
+                    energized.append(bound_slot)
+                    return turn_on()
+
+                relay.on = record_on
+            original = ctrl.gpio.deactivate_slot
+
+            def fail_closed(slot):
+                if slot == "B":
+                    ctrl.gpio.relays["B"].off()
+                    return False
+                return original(slot)
+
+            ctrl.gpio.deactivate_slot = fail_closed
+            before = {slot: relay.is_active for slot, relay in ctrl.gpio.relays.items()}
+            enqueue(ctrl, cmd_id, "", "DEACTIVATE_ALL")
+            ctrl.process_one_command()
+            status, verification, _ack = command_row(ctrl, cmd_id)
+            self.assertNotEqual(status, "COMPLETED")
+            self.assertNotIn(verification, POSITIVE_VERIFICATION)
+            self.assertFalse(any(
+                call["status"] == "COMPLETED" and call["verification"] in POSITIVE_VERIFICATION
+                for call in ctrl.api.calls
+            ))
+            self.assertEqual(before, {slot: False for slot in "ABCD"})
+            self.assertTrue(all(not relay.is_active for relay in ctrl.gpio.relays.values()))
+            self.assertEqual(energized, [])
+
+    def test_off_all_disabled_wing_is_not_a_required_channel(self):
+        cmd_id = "hw-off-all-disabled-d"
+        conf = cfg(False)
+        conf["slots"]["D"]["disabled"] = True
+        with command_controller(conf) as ctrl:
+            enqueue(ctrl, cmd_id, "", "DEACTIVATE_ALL")
+            self.assertTrue(ctrl.process_one_command())
+            for slot in "ABC":
+                self.assertEqual(ctrl.state.slots[slot].verification_state, VerificationState.GPIO_CONFIRMED)
+            ctrl.flush_acks()
+            status, verification, _ack = command_row(ctrl, cmd_id)
+            self.assertEqual(status, "COMPLETED")
+            self.assertEqual(verification, "GPIO_CONFIRMED")
+            completed = [call for call in ctrl.api.calls if call["status"] == "COMPLETED"]
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0]["verification"], "GPIO_CONFIRMED")
+
+    def test_off_slot_without_feedback_stays_gpio_confirmed(self):
+        cmd_id = "hw-off-slot-gpio"
+        with command_controller(cfg(False)) as ctrl:
+            enqueue(ctrl, cmd_id, "A", "DEACTIVATE")
+            self.assertTrue(ctrl.process_one_command())
+            ctrl.flush_acks()
+            status, verification, _ack = command_row(ctrl, cmd_id)
+            self.assertEqual(status, "COMPLETED")
+            self.assertEqual(verification, "GPIO_CONFIRMED")
+            self.assertNotEqual(verification, "VERIFIED_OFF")
+            completed = [call for call in ctrl.api.calls if call["status"] == "COMPLETED"]
+            self.assertEqual(completed[0]["verification"], "GPIO_CONFIRMED")
+            self.assertNotEqual(completed[0]["verification"], "VERIFIED_OFF")
+
+    def test_set_active_slot_without_feedback_stays_gpio_confirmed(self):
+        cmd_id = "hw-activate-gpio"
+        with command_controller(cfg(False)) as ctrl:
+            enqueue(ctrl, cmd_id, "A", "ACTIVATE")
+            self.assertTrue(ctrl.process_one_command())
+            ctrl.flush_acks()
+            status, verification, _ack = command_row(ctrl, cmd_id)
+            self.assertEqual(status, "COMPLETED")
+            self.assertEqual(verification, "GPIO_CONFIRMED")
+            self.assertNotEqual(verification, "VERIFIED_ON")
+            completed = [call for call in ctrl.api.calls if call["status"] == "COMPLETED"]
+            self.assertEqual(completed[0]["verification"], "GPIO_CONFIRMED")
+            self.assertNotEqual(completed[0]["verification"], "VERIFIED_ON")
+            for slot in "BCD":
+                self.assertNotIn(
+                    ctrl.state.slots[slot].verification_state,
+                    {VerificationState.VERIFIED_ON, VerificationState.VERIFIED_OFF},
+                )
+                self.assertNotEqual(ctrl.state.slots[slot].feedback_state, FeedbackState.ON)
+
+    def test_rejected_off_all_ack_does_not_run_deactivate_again(self):
+        cmd_id = "hw-off-all-reject"
+        with command_controller(cfg(False)) as ctrl:
+            calls = {"n": 0}
+            original = ctrl.gpio.deactivate_slot
+
+            def counted(slot):
+                calls["n"] += 1
+                return original(slot)
+
+            ctrl.gpio.deactivate_slot = counted
+            enqueue(ctrl, cmd_id, "", "DEACTIVATE_ALL")
+            self.assertTrue(ctrl.process_one_command())
+            status, _verification, _ack = command_row(ctrl, cmd_id)
+            self.assertEqual(status, "COMPLETED")
+            executed = calls["n"]
+            self.assertGreater(executed, 0)
+            ctrl.api.terminal_reject = True
+            ctrl.flush_acks()
+            ack = ctrl.queue.get_ack_attempts(cmd_id)
+            self.assertEqual(ack["ack_status"], "REJECTED")
+            self.assertEqual(ack["ack_error"], "ILLEGAL_TRANSITION")
+            self.assertIsNone(ctrl.queue.claim_next())
+            self.assertFalse(ctrl.process_one_command())
+            self.assertEqual(calls["n"], executed)
 
 
 def run_hardware_contract():
