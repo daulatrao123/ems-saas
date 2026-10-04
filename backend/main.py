@@ -17,6 +17,7 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
 from provisioning import build_provisioning_zip, service_unit_sha256, validate_runtime_sources
+from new_pi_preflight import new_pi_preflight_report
 from energy_api import ingest as energy_ingest
 import health_read_model
 from energy_api.routes import create_router as create_energy_router
@@ -1081,6 +1082,11 @@ def get_audit(limit: int = 50, society_id: int | None = None, device_id: str | N
                                 "society_id": r["society_id"], "actor": r["actor"], "details": r["details"]} for r in cur.fetchall()]}
     finally:
         conn.close()
+
+@app.get("/api/super-admin/provisioning-preflight")
+def new_pi_provisioning_preflight(user: dict = Depends(require_role("super_admin"))):
+    """Installer prerequisites for a new Pi. Does not inspect a device or rotate a credential."""
+    return new_pi_preflight_report()
 
 @app.post("/api/super-admin/devices/{device_id}/provisioning-package")
 def provisioning_package(device_id: str, request: Request, user: dict = Depends(require_role("super_admin"))):

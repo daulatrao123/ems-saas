@@ -7,6 +7,7 @@ import { Dot, btn, input, label, panel, tone } from "@/components/ops/DashboardH
 import { ago, fmtDateTime, errorText } from "@/components/ops/types";
 import { useProvisioningDevices } from "./useProvisioningDevices";
 import { HardwareCapabilities } from "./HardwareCapabilities";
+import { NewPiPreflight } from "./NewPiPreflight";
 
 type Issued = { key_id: string; api_key: string };   // React state only; never persisted
 
@@ -37,6 +38,7 @@ function DeviceCard({ d, sid, onChanged, ask, notify }: { d: SocietyDevice; sid:
         <div><div className="text-base font-bold text-white">{d.name}</div><div className="font-mono text-[11px] text-gray-500">{d.hardware_profile} · society #{sid} · {d.status}</div></div>
         <span data-testid={`prov-online-${d.id}`} className={`flex flex-wrap items-center gap-2 font-mono text-xs font-bold ${d.online ? "text-emerald-400" : "text-red-400"}`}><Dot on={d.online} />{d.online ? "ONLINE" : "OFFLINE"} <span data-testid={`prov-last-sync-${d.id}`} title={fmtDateTime(d.last_sync)} className="text-gray-500 font-normal">· last sync {ago(d.last_sync)}</span></span>
       </div>
+      <p data-testid={`prov-preflight-unverified-${d.id}`} className="mt-2 font-mono text-[10px] text-gray-400">New-Pi prerequisites for this device: NOT VERIFIED. Online, storage, and OTA status are not a Pi inspection.</p>
       <dl className="mt-3 grid grid-cols-1 sm:grid-cols-[130px_minmax(0,1fr)] gap-y-1.5 font-mono text-[11px]">
         <dt className="text-gray-500">DEVICE ID</dt>
         <dd className="flex items-center gap-2 min-w-0"><span data-testid={`prov-device-id-${d.id}`} className="truncate text-gray-100">{d.id}</span><button data-testid={`prov-copy-id-${d.id}`} onClick={() => copy(d.id)} className={`${btn} ${tone.gray} py-0.5`}>COPY</button></dd>
@@ -98,6 +100,7 @@ export function ProvisioningCenter({ societyId }: { societyId: string }) {
           <button data-testid="prov-register-submit" disabled={busy || !name.trim()} onClick={register} className={`${btn} ${tone.amber}`}>REGISTER DEVICE</button>
         </div>
       </div>
+      <NewPiPreflight />
       {msg && <div data-testid="prov-message" className={`border px-3 py-2 font-mono text-xs ${msg.ok ? "border-emerald-500/40 text-emerald-300" : "border-red-500/40 text-red-300"}`}>{msg.t}</div>}
       {error && <div data-testid="prov-load-error" role="alert" className="text-xs text-red-300">{error}</div>}
       <div className="grid gap-3 xl:grid-cols-2">{devices.map((d) => <DeviceCard key={d.id} d={d} sid={societyId} onChanged={load} ask={setConfirm} notify={notify} />)}</div>
