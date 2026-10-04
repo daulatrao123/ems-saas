@@ -5,17 +5,18 @@ import { QueueFn, SlotConfigFn } from "./useOperations";
 import { btn, input, label, panel, tone } from "./DashboardHeader";
 import { LastResponse } from "./LastResponse";
 import { WingEnergyCard } from "./energy/WingEnergyCard";
-import { AllocationMode } from "./allocationMode";
+import { AllocationMode, allocationVisibility, dayBasedPresentation } from "./allocationMode";
 import type { Confirm } from "./ConfirmDialog";
-import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary } from "./energy/types";
+import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary, WINGS } from "./energy/types";
 
 type Props = { device: Device; code: WingCode; slot?: Slot; queue: QueueFn; setSlotConfig: SlotConfigFn; isPending: (d: string, c: string, s?: string) => boolean; readOnly: boolean; ask?: (c: Confirm) => void;
   lastCmd?: CommandRow; lastResponse?: Response | null; wing?: WingSummary; allocation: AllocationConfig | null; activeGenerationWing?: string; allotmentInput?: ReactNode;
-  mode?: CalculationMode; allocationMode: AllocationMode; manualControlLabel: string; comparison?: ComparisonSeries; excessEnabled?: boolean };
+  mode?: CalculationMode; allocationMode: AllocationMode; manualControlLabel: string; comparison?: ComparisonSeries; excessEnabled?: boolean;
+  operatingDate?: string | null; resetDay?: number | null };
 const telemetry = (v: string | undefined, offline: boolean) => offline ? "UNKNOWN (offline)" : v === "ON" || v === "OFF" ? v : "UNKNOWN";
 const numberOrNull = (v: number | undefined) => v != null && Number.isFinite(v) ? v : null;
 
-export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, readOnly, ask, wing, allocation, activeGenerationWing, mode, allocationMode, manualControlLabel, comparison, excessEnabled = false }: Props) {
+export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, readOnly, ask, wing, allocation, activeGenerationWing, mode, allocationMode, manualControlLabel, comparison, excessEnabled = false, operatingDate = null, resetDay = null }: Props) {
   const active = device.active_slot === code;
   const state = !slot || typeof slot.disabled !== "boolean" ? "UNAVAILABLE" : slot.disabled ? "DISABLED" : active ? "ACTIVE" : "INACTIVE";
   const stateTone = slot?.disabled ? "text-gray-500 border-gray-700" : active ? "text-emerald-300 border-emerald-500/50 bg-emerald-500/10" : "text-gray-300 border-[#2a3646]";
@@ -26,7 +27,15 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
   const displayName = slot?.display_name?.trim();
   const customName = displayName && ![code, `slot ${code}`, `wing ${code}`].some((v) => v.toLowerCase() === displayName.toLowerCase()) ? displayName : null;
   const meterDisabled = wing?.consumption_meter?.enabled === false;
-  const energyCard = <WingEnergyCard code={code} wing={wing} mode={mode} allocationMode={allocationMode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={meterDisabled || slot?.disabled || device.feedback_hardware_installed !== true || device.hardware_fault || slot?.feedback_enabled === false ? undefined : activeGenerationWing} />;
+  // Calendar progress uses target_days of enabled wings. Contactor feedback stays on physical_toggle above.
+  const dayBased = allocationVisibility(allocationMode).dayAllocation
+    ? dayBasedPresentation({
+        operatingDate,
+        resetDay,
+        wings: WINGS.map((wingCode) => ({ wing: wingCode, enabled: device.slots[wingCode]?.disabled === false, assignedDays: device.slots[wingCode]?.target_days })),
+      }).wings.find((row) => row.wing === code) ?? null
+    : null;
+  const energyCard = <WingEnergyCard code={code} wing={wing} mode={mode} allocationMode={allocationMode} comparison={comparison} excessEnabled={excessEnabled} allocation={allocation} activeGenerationWing={meterDisabled || slot?.disabled || device.feedback_hardware_installed !== true || device.hardware_fault || slot?.feedback_enabled === false ? undefined : activeGenerationWing} dayBased={dayBased} />;
   return (
     <section data-testid={`slot-card-${code}`} data-state={state} className={`ops-wing ${panel} ${active ? "border-emerald-500/40" : ""} p-4 flex flex-col gap-4 min-w-0`}>
       <div className="flex items-start justify-between gap-2">

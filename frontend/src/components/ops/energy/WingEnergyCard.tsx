@@ -5,12 +5,12 @@ import { BillHistoryButton } from "./BillHistoryButton";
 import { EnergyComparisonChart, signedKwh } from "./EnergyComparisonChart";
 import { CalendarComparisonContext } from "./CalendarComparisonContext";
 import { missingReason, monthLabel } from "./comparisonLabels";
-import { AllocationMode, showGenerationTarget } from "../allocationMode";
+import { AllocationMode, DayBasedWingPresentation, allocationVisibility, showGenerationTarget } from "../allocationMode";
 import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary, WING_METERS, fmtKwh, fmtKw, fmtPct, sourceLabel, sourceTone, todayKwh } from "./types";
 
-type Props = { code: WingCode; wing?: WingSummary; comparison?: ComparisonSeries; mode?: CalculationMode; allocationMode: AllocationMode; allocation: AllocationConfig | null; activeGenerationWing?: string; excessEnabled: boolean };
+type Props = { code: WingCode; wing?: WingSummary; comparison?: ComparisonSeries; mode?: CalculationMode; allocationMode: AllocationMode; allocation: AllocationConfig | null; activeGenerationWing?: string; excessEnabled: boolean; dayBased?: DayBasedWingPresentation | null };
 
-export function WingEnergyCard({ code: w, wing: candidate, comparison, mode, allocationMode, allocation, activeGenerationWing, excessEnabled }: Props) {
+export function WingEnergyCard({ code: w, wing: candidate, comparison, mode, allocationMode, allocation, activeGenerationWing, excessEnabled, dayBased = null }: Props) {
   const wing = candidate?.wing === w ? candidate : undefined;
   const meter = wing?.consumption_meter?.meter_id === WING_METERS[w] ? wing.consumption_meter : undefined;
   const serial = meter?.serial?.trim() ? meter.serial.trim() : "";
@@ -25,6 +25,9 @@ export function WingEnergyCard({ code: w, wing: candidate, comparison, mode, all
   const policy = !allocation ? "UNAVAILABLE" : allocation.enabled === false ? "DISABLED" : "ENABLED (CONFIGURATION)";
   const target = wing?.required_generation, progress = target?.achievement_percent;
   const showTarget = showGenerationTarget(allocationMode, target?.target_kwh_per_day);
+  const showDayBased = allocationVisibility(allocationMode).dayAllocation;
+  const dayCount = (value: number | null | undefined) => value == null ? "UNAVAILABLE" : `${value} D`;
+  const todayWing = dayBased?.scheduledWing ? `Wing ${dayBased.scheduledWing}` : "None";
   return <div data-testid={`energy-wing-card-${w}`} className="border-t border-[#1e2a3a] pt-3 space-y-3 min-w-0">
     <div className="flex flex-wrap items-center justify-between gap-2"><h3 data-testid={`energy-wing-meter-identity-${w}`} className={label}>Energy · Wing {w}</h3><span data-testid={`energy-wing-source-${w}`} className={`px-2 py-0.5 text-[10px] font-bold border ${sourceTone(source)}`}>{sourceLabel(source).toUpperCase()}</span></div>
     <dl className="space-y-3 font-mono text-xs [&_dd]:min-w-0 [&_dd]:break-words">
@@ -33,6 +36,21 @@ export function WingEnergyCard({ code: w, wing: candidate, comparison, mode, all
       {(delta === null || delta <= 0 || excessEnabled) && <div className="flex flex-wrap justify-between gap-2"><dt className="text-gray-500">GENERATION − CONSUMPTION</dt><dd data-testid={`energy-wing-balance-${w}`} className={delta === null ? "text-gray-400" : delta < 0 ? "text-red-300" : "text-cyan-300"}>{signedKwh(delta)}</dd></div>}
       {showTarget && <div className="flex flex-wrap justify-between gap-2"><dt className="text-gray-500">DAILY TARGET · REFERENCE</dt><dd data-testid={`energy-wing-target-${w}`} className="text-gray-300">{fmtKwh(target?.target_kwh_per_day)} / day</dd></div>}
     </dl>
+    {showDayBased && <section data-testid={`energy-wing-day-allocation-${w}`} className="border-t border-[#1e2a3a] pt-3 space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h4 data-testid={`energy-wing-day-allocation-title-${w}`} className={label}>DAY-BASED ALLOCATION</h4>
+        {dayBased?.isTodayScheduled && <span data-testid={`energy-wing-day-today-banner-${w}`} className="text-[10px] font-bold text-cyan-200">{`TODAY: WING ${dayBased.scheduledWing}`}</span>}
+      </div>
+      <dl className="grid grid-cols-2 gap-x-3 gap-y-2 font-mono text-[11px] [&_dd]:text-right">
+        <dt className="text-gray-500">Assigned days</dt><dd data-testid={`energy-wing-day-assigned-${w}`}>{dayCount(dayBased?.assignedDays)}</dd>
+        <dt className="text-gray-500">Cycle</dt><dd data-testid={`energy-wing-day-cycle-${w}`}>{dayCount(dayBased?.cycleDays)}</dd>
+        <dt className="text-gray-500">Progress</dt><dd data-testid={`energy-wing-day-progress-${w}`}>{dayBased?.completedDays == null || dayBased.assignedDays == null || dayBased.startDay == null ? "—" : `${dayBased.completedDays} / ${dayBased.assignedDays} D`}</dd>
+        <dt className="text-gray-500">Days remaining</dt><dd data-testid={`energy-wing-day-remaining-${w}`}>{dayBased?.startDay == null ? "—" : dayCount(dayBased.remainingDays)}</dd>
+        <dt className="text-gray-500">Schedule</dt><dd data-testid={`energy-wing-day-status-${w}`}>{dayBased?.scheduleLabel || "UNAVAILABLE"}</dd>
+        <dt className="text-gray-500">Day range</dt><dd data-testid={`energy-wing-day-range-${w}`}>{dayBased?.startDay != null && dayBased.endDay != null ? `${dayBased.startDay}–${dayBased.endDay}` : "—"}</dd>
+        <dt className="text-gray-500">Today&apos;s allocation</dt><dd data-testid={`energy-wing-day-scheduled-${w}`}>{todayWing}</dd>
+      </dl>
+    </section>}
     <details data-testid={`energy-wing-evidence-${w}`} className="ops-disclosure"><summary data-testid={`energy-wing-evidence-toggle-${w}`} className="text-xs text-gray-300">Allocation & evidence</summary>
     <dl className="grid grid-cols-2 gap-x-3 gap-y-3 pb-3 font-mono text-[11px] [&>dd]:min-w-0 [&>dd]:break-words [&>dt]:min-w-0">
       {showTarget && <><dt className="text-gray-500">TARGET / ACHIEVEMENT</dt><dd data-testid={`energy-wing-target-status-${w}`} className="text-gray-300">{target?.status ?? "UNAVAILABLE"} · {fmtPct(progress)}</dd></>}

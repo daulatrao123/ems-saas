@@ -52,7 +52,7 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
       {WINGS.map((c) => <SlotCard key={`${device.id}:${c}:${mode}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} setSlotConfig={async (...args) => { const saved = await ops.setSlotConfig(...args); if (saved) void energy.refresh(); return saved; }} isPending={ops.isPending} readOnly={readOnly} ask={setConfirm}
         lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} wing={energy.summary?.wings?.[c]} allocation={energy.allocation}
         mode={mode} allocationMode={allocationMode} manualControlLabel={visibility.manualControlLabel} comparison={energy.comparison?.wings[c]?.wing === c ? energy.comparison.wings[c] : undefined} activeGenerationWing={activeGenerationWing}
-        excessEnabled={excessEnabled} />)}
+        excessEnabled={excessEnabled} operatingDate={energy.summary?.as_of_operating_date ?? null} resetDay={energy.summary?.reset_day ?? null} />)}
     </div>
   );
   const logicalWings = device ? WINGS.filter((c) => device.slots[c]?.disabled === false) : [];

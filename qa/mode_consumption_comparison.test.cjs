@@ -252,6 +252,69 @@ test("WingEnergyCard keeps physical generation/targets and manual bills button b
   const cardSrc = fs.readFileSync(path.join(__dirname, "..", "frontend", "src", "components", "ops", "energy", "WingEnergyCard.tsx"), "utf8");
   assert.match(cardSrc, /CONSUMPTION · \{mode === "MANUAL" \? "DAILY REFERENCE" : "ACTUAL"\}/);
   assert.doesNotMatch(cardSrc, /manual-entry-|ManualGenerationEntry/);
+  assert.equal(cardSrc.includes("allocationVisibility(allocationMode).dayAllocation"), true);
+  assert.equal(cardSrc.includes("mode === \"DAY_BASED\""), false, "CalculationMode must not select the day-based card");
+
+  const day = (wing, status, extra) => ({ wing, enabled: true, assignedDays: 9, cycleDays: 30, cycleDayIndex: 10, startDay: 1, endDay: 9, completedDays: 9, remainingDays: 0, status, scheduleLabel: status, isTodayScheduled: status === "CURRENT", scheduledWing: "B", ...extra });
+  for (const allocationMode of ["AUTO", "MANUAL"]) {
+    const tree = WingEnergyCard({ code: "A", wing, comparison, mode: "MANUAL", allocationMode, allocation, excessEnabled: true, dayBased: day("A", "COMPLETED") });
+    assert.throws(() => byTestId(tree, "energy-wing-day-allocation-A"), `${allocationMode} hides the day-based summary`);
+    byTestId(tree, "energy-wing-target-A");
+    byTestId(tree, "energy-wing-generation-A");
+    byTestId(tree, "energy-wing-consumption-A");
+  }
+  const current = day("B", "CURRENT", { assignedDays: 12, startDay: 10, endDay: 21, completedDays: 0, remainingDays: 12, scheduleLabel: "CURRENT · TODAY", isTodayScheduled: true });
+  const dayTree = WingEnergyCard({ code: "B", wing: { ...wing, wing: "B", consumption_meter: { ...wing.consumption_meter, meter_id: "M3" }, required_generation: { target_kwh_per_day: 25, achievement_percent: 44, status: "NOT_REACHED" } }, comparison: { ...comparison, today: { ...comparison.today, generation_minus_consumption_kwh: 4 } }, mode: "AUTO", allocationMode: "DAY_BASED", allocation, excessEnabled: false, activeGenerationWing: "A", dayBased: current });
+  assert.equal(byTestId(dayTree, "energy-wing-day-assigned-B").props.children, "12 D");
+  assert.equal(byTestId(dayTree, "energy-wing-day-cycle-B").props.children, "30 D");
+  assert.equal(byTestId(dayTree, "energy-wing-day-progress-B").props.children, "0 / 12 D");
+  assert.equal(byTestId(dayTree, "energy-wing-day-remaining-B").props.children, "12 D");
+  assert.equal(byTestId(dayTree, "energy-wing-day-status-B").props.children, "CURRENT · TODAY");
+  assert.equal(byTestId(dayTree, "energy-wing-day-range-B").props.children, "10–21");
+  assert.equal(byTestId(dayTree, "energy-wing-day-scheduled-B").props.children, "Wing B");
+  assert.equal(byTestId(dayTree, "energy-wing-day-today-banner-B").props.children, "TODAY: WING B");
+  assert.throws(() => byTestId(dayTree, "energy-wing-target-B"), "DAY_BASED hides the generation target");
+  assert.throws(() => byTestId(dayTree, "energy-wing-balance-B"), "DAY_BASED hides positive excess");
+  byTestId(dayTree, "energy-wing-generation-B");
+  byTestId(dayTree, "energy-wing-consumption-B");
+  assert.equal(byTestId(dayTree, "energy-wing-active-B").props.children, "—", "scheduled wing is not physical feedback");
+
+  const completed = day("A", "COMPLETED", { scheduleLabel: "COMPLETED", isTodayScheduled: false });
+  const completedTree = WingEnergyCard({ code: "A", wing, comparison, mode: "MANUAL", allocationMode: "DAY_BASED", allocation, excessEnabled: false, activeGenerationWing: "B", dayBased: completed });
+  assert.equal(byTestId(completedTree, "energy-wing-day-assigned-A").props.children, "9 D");
+  assert.equal(byTestId(completedTree, "energy-wing-day-cycle-A").props.children, "30 D");
+  assert.equal(byTestId(completedTree, "energy-wing-day-progress-A").props.children, "9 / 9 D");
+  assert.equal(byTestId(completedTree, "energy-wing-day-remaining-A").props.children, "0 D");
+  assert.equal(byTestId(completedTree, "energy-wing-day-status-A").props.children, "COMPLETED");
+  assert.equal(byTestId(completedTree, "energy-wing-day-range-A").props.children, "1–9");
+  assert.equal(byTestId(completedTree, "energy-wing-day-scheduled-A").props.children, "Wing B");
+  assert.throws(() => byTestId(completedTree, "energy-wing-day-today-banner-A"));
+  assert.throws(() => byTestId(completedTree, "energy-wing-target-A"), "calculation mode does not restore the generation target");
+  assert.equal(byTestId(completedTree, "energy-wing-balance-A").props.children, "-9.00 kWh", "a deficit stays visible in DAY_BASED");
+  const flat = (node) => {
+    if (node == null || typeof node === "boolean") return "";
+    if (typeof node === "string" || typeof node === "number") return String(node);
+    if (Array.isArray(node)) return node.map(flat).join(" ");
+    if (typeof node === "object") return flat(node.props && node.props.children);
+    return "";
+  };
+  assert.match(flat(completedTree), /CONSUMPTION ·\s+DAILY REFERENCE/, "calculation mode still labels consumption");
+
+  const upcoming = day("C", "UPCOMING", { assignedDays: 9, startDay: 22, endDay: 30, completedDays: 0, remainingDays: 9, scheduleLabel: "UPCOMING", isTodayScheduled: false });
+  const surplus = { ...comparison, today: { ...comparison.today, generation_minus_consumption_kwh: 4 } };
+  const upcomingTree = WingEnergyCard({ code: "C", wing: { ...wing, wing: "C", consumption_meter: { ...wing.consumption_meter, meter_id: "M4" } }, comparison: surplus, mode: "AUTO", allocationMode: "DAY_BASED", allocation, excessEnabled: false, dayBased: upcoming });
+  assert.equal(byTestId(upcomingTree, "energy-wing-day-progress-C").props.children, "0 / 9 D");
+  assert.equal(byTestId(upcomingTree, "energy-wing-day-status-C").props.children, "UPCOMING");
+  assert.equal(byTestId(upcomingTree, "energy-wing-day-range-C").props.children, "22–30");
+  assert.throws(() => byTestId(upcomingTree, "energy-wing-balance-C"), "positive excess stays hidden when the card is told it is off");
+
+  const excluded = day("D", "EXCLUDED", { wing: "D", enabled: false, assignedDays: 0, startDay: null, endDay: null, completedDays: 0, remainingDays: 0, scheduleLabel: "NOT SCHEDULED", isTodayScheduled: false });
+  const excludedTree = WingEnergyCard({ code: "D", wing: { ...wing, wing: "D", consumption_meter: { ...wing.consumption_meter, meter_id: "M5" } }, comparison, mode: "AUTO", allocationMode: "DAY_BASED", allocation, excessEnabled: false, dayBased: excluded });
+  assert.equal(byTestId(excludedTree, "energy-wing-day-assigned-D").props.children, "0 D");
+  assert.equal(byTestId(excludedTree, "energy-wing-day-status-D").props.children, "NOT SCHEDULED");
+  assert.equal(byTestId(excludedTree, "energy-wing-day-range-D").props.children, "—");
+  assert.equal(byTestId(excludedTree, "energy-wing-day-progress-D").props.children, "—");
+  byTestId(excludedTree, "energy-wing-generation-D");
 });
 
 test("Society comparison shows 7/30 selector, labels, and unavailable state", () => {
