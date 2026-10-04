@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 const { execFileSync } = require("node:child_process");
@@ -169,16 +170,26 @@ test("OperationalLogs filters severity, resets limit, and show-more remains boun
 });
 
 test("offline dashboard fixture keeps disclosures, member restrictions, and references truthful", () => {
-  execFileSync("node", ["/app/test_reports/dashboard_layout.cjs"], { stdio: "pipe" });
-  for (const f of ["/tmp/dashboard-layout-MANUAL-false.html", "/tmp/dashboard-layout-MANUAL-true.html", "/tmp/dashboard-layout-AUTO-false.html", "/tmp/dashboard-layout-AUTO-true.html"]) {
-    fs.copyFileSync(f, f.replace(/\.html$/, "-normal.html"));
+  // The producer is the repository harness qa/dashboard_layout.cjs. It renders the
+  // current OperationalDashboard into a temporary directory. /app/test_reports was
+  // a Linux CI path and is not a source of truth on this machine.
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "ems-dashboard-layout-"));
+  const script = path.join(__dirname, "dashboard_layout.cjs");
+  const run = (flag) => execFileSync(process.execPath, flag ? [script, flag] : [script], {
+    stdio: "pipe",
+    env: { ...process.env, DASHBOARD_LAYOUT_OUT: outDir },
+  });
+  const names = ["MANUAL-false", "MANUAL-true", "AUTO-false", "AUTO-true"];
+  run();
+  for (const name of names) {
+    fs.copyFileSync(path.join(outDir, `dashboard-layout-${name}.html`), path.join(outDir, `dashboard-layout-${name}-normal.html`));
   }
-  execFileSync("node", ["/app/test_reports/dashboard_layout.cjs", "--unavailable"], { stdio: "pipe" });
-  for (const f of ["/tmp/dashboard-layout-MANUAL-false.html", "/tmp/dashboard-layout-MANUAL-true.html", "/tmp/dashboard-layout-AUTO-false.html", "/tmp/dashboard-layout-AUTO-true.html"]) {
-    fs.copyFileSync(f, f.replace(/\.html$/, "-unavailable.html"));
+  run("--unavailable");
+  for (const name of names) {
+    fs.copyFileSync(path.join(outDir, `dashboard-layout-${name}.html`), path.join(outDir, `dashboard-layout-${name}-unavailable.html`));
   }
 
-  const opNormal = fs.readFileSync("/tmp/dashboard-layout-MANUAL-false-normal.html", "utf8");
+  const opNormal = fs.readFileSync(path.join(outDir, "dashboard-layout-MANUAL-false-normal.html"), "utf8");
   assert.match(opNormal, /data-testid="dashboard-nav-overview"/);
   assert.match(opNormal, /href="#ops-overview"/);
   assert.match(opNormal, /data-testid="dashboard-nav-energy"/);
@@ -192,11 +203,11 @@ test("offline dashboard fixture keeps disclosures, member restrictions, and refe
   assert.doesNotMatch(opNormal, /cmd-set_active_slot-offline-controller-D/);
   assert.doesNotMatch(opNormal, /cmd-off_slot-offline-controller-D/);
 
-  const member = fs.readFileSync("/tmp/dashboard-layout-MANUAL-true-normal.html", "utf8");
+  const member = fs.readFileSync(path.join(outDir, "dashboard-layout-MANUAL-true-normal.html"), "utf8");
   assert.doesNotMatch(member, /data-testid="lcd-panel"/);
   assert.doesNotMatch(member, /data-testid="grid-save"/);
 
-  const unavailable = fs.readFileSync("/tmp/dashboard-layout-MANUAL-false-unavailable.html", "utf8");
+  const unavailable = fs.readFileSync(path.join(outDir, "dashboard-layout-MANUAL-false-unavailable.html"), "utf8");
   assert.match(unavailable, /data-testid="configuration-gap-generation-value"[^>]*>Meter disabled/);
   assert.match(unavailable, /data-testid="configuration-gap-targets-value"[^>]*>UNAVAILABLE · A, B, C/);
   assert.match(unavailable, /data-testid="configuration-gap-allocation-value"[^>]*>Disabled in configuration/);

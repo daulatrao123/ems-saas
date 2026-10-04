@@ -32,6 +32,19 @@ def check(name, condition, detail=""):
     print(("PASS " if condition else "FAIL ") + name + (f" [{detail}]" if detail else ""), flush=True)
 
 
+def coil_counts(events):
+    """Mock Output records (monotonic, pin, energized, active_count). Failed reconciliation calls off() on all four outputs."""
+    offs = sum(1 for event in events if event[2] is False)
+    ons = sum(1 for event in events if event[2] is True)
+    return offs, ons
+
+
+def fail_closed_deenergized(events):
+    """Safe contract: four OFF events, zero ON events. Do not treat OFF as a missed interlock."""
+    offs, ons = coil_counts(events)
+    return offs == 4 and ons == 0
+
+
 class Clock:
     """One clock for both deadlines and scheduled external feedback changes."""
     def __init__(self):
@@ -316,7 +329,7 @@ def reconciliation_cases():
         elapsed = clock.now - start
         # A modelled scheduler overrun can delay return, never restart the budget.
         check("RECON C: sustained starvation exhausts ONE overall 2000ms budget", not ok and st.system_state == SystemState.FAULT and limit <= elapsed <= limit + 0.022, f"{elapsed:.6f}s")
-        check("RECON C/N: timeout has no positive verification or subsequent MAKE", all(st.slots[s].verification_state == VerificationState.PENDING for s in "ABCD") and not g.transition_slot("B") and not events and not any(r.is_active for r in g.relays.values()))
+        check("RECON C/N: timeout de-energizes, stays PENDING, and refuses MAKE", all(st.slots[s].verification_state == VerificationState.PENDING for s in "ABCD") and not g.transition_slot("B") and fail_closed_deenergized(events) and not any(r.is_active for r in g.relays.values()))
 
     for period, label in ((0.025, "mixed"), (0.005, "noise")):
         for phase in (False, True):
@@ -324,7 +337,7 @@ def reconciliation_cases():
                 start = clock.now
                 g.feedback_inputs["A"].signal = lambda: bool(int((clock.now - start + 1e-9) / period) % 2) != phase
                 ok = g.reconcile_hardware_state()
-                check(f"RECON D/E: repeated {label} phase={int(phase)} cannot verify", not ok and st.system_state == SystemState.FAULT and all(st.slots[s].verification_state not in positive for s in "ABCD") and not events)
+                check(f"RECON D/E: repeated {label} phase={int(phase)} cannot verify", not ok and st.system_state == SystemState.FAULT and all(st.slots[s].verification_state not in positive for s in "ABCD") and fail_closed_deenergized(events))
 
     for scenario in ("agreement", "mismatch", "multiple-relays", "multiple-contactors"):
         with fixture(reconcile=False) as (g, st, clock, events):
@@ -340,9 +353,12 @@ def reconciliation_cases():
             ok = g.reconcile_hardware_state()
             if scenario == "agreement":
                 valid = ok and st.system_state == SystemState.READY and st.active_slot == "A" and st.slots["A"].verification_state == VerificationState.VERIFIED_ON
+                quiet = events == before
             else:
+                # Mismatch and multiple-ON fail closed: four OFF calls, no new ON.
                 valid = not ok and st.system_state == SystemState.FAULT and all(st.slots[s].verification_state not in positive for s in "ABCD")
-            check(f"RECON F/G/H/I: {scenario}, no GPIO writes", valid and events == before)
+                quiet = fail_closed_deenergized(events[len(before):])
+            check(f"RECON F/G/H/I: {scenario}, no ON during reconciliation", valid and quiet)
 
     with fixture(reconcile=False) as (g, st, clock, events):
         first_b = True
@@ -355,11 +371,11 @@ def reconciliation_cases():
                 clock.at(clock.now + 0.010, lambda: level(g, "A", True))
             return False
         g.feedback_inputs["B"].signal = disrupt_b
-        check("RECON: discard earlier A=OFF after incomplete B, never reuse stale evidence", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and st.slots["A"].verification_state == VerificationState.MISMATCH_OFF_ON and not events)
+        check("RECON: discard earlier A=OFF after incomplete B, never reuse stale evidence", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and st.slots["A"].verification_state == VerificationState.MISMATCH_OFF_ON and fail_closed_deenergized(events))
 
     with fixture(reconcile=False) as (g, st, clock, events):
         clock.at(clock.now + 0.075, lambda: level(g, "A", True))
-        check("RECON: veto A feedback reasserted while later channels were sampled", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and st.slots["A"].verification_state == VerificationState.MISMATCH_OFF_ON and not events)
+        check("RECON: veto A feedback reasserted while later channels were sampled", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and st.slots["A"].verification_state == VerificationState.MISMATCH_OFF_ON and fail_closed_deenergized(events))
 
     with fixture(reconcile=False) as (g, st, clock, events):
         # Every complete read is stable, but the bank cannot fit before this
@@ -367,7 +383,7 @@ def reconciliation_cases():
         clock.at(clock.now + limit - 0.025, lambda: setattr(clock, "gap", 0))
         clock.gap = 0.020
         start = clock.now
-        check("RECON: recovery too late for a full fresh pass must not report READY", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and clock.now - start <= limit + 0.022 and all(st.slots[s].verification_state not in positive for s in "ABCD") and not events)
+        check("RECON: recovery too late for a full fresh pass must not report READY", not g.reconcile_hardware_state() and st.system_state == SystemState.FAULT and clock.now - start <= limit + 0.022 and all(st.slots[s].verification_state not in positive for s in "ABCD") and fail_closed_deenergized(events))
 
 
 def reconciliation_lock_case():
@@ -407,7 +423,7 @@ def reconciliation_lock_case():
             reader.join(5)
             if contender.ident is not None:
                 contender.join(5)
-        check("RECON K/N: queued transition refuses MAKE after reconciliation failure", not reader.is_alive() and not contender.is_alive() and results == {"reconcile": False, "transition": False} and st.system_state == SystemState.FAULT and not events and not any(r.is_active for r in g.relays.values()))
+        check("RECON K/N: queued transition refuses MAKE after reconciliation failure", not reader.is_alive() and not contender.is_alive() and results == {"reconcile": False, "transition": False} and st.system_state == SystemState.FAULT and fail_closed_deenergized(events) and not any(r.is_active for r in g.relays.values()))
 
 
 def real_clock_noise():

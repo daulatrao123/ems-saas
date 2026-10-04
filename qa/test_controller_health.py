@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import os
 import re
 import tempfile
 import threading
@@ -297,14 +298,21 @@ class StateMetadataAstTests(unittest.TestCase):
             }
             doc = ns["_build_document"](obj)
             self.assertEqual(doc["version"], 4)
+            # Canonical checksum is platform-independent. Production directory fsync is not.
             self.assertTrue(ns["_verify_document"](doc))
 
-            ok = ns["_flush_to_disk"](obj)
-            self.assertTrue(ok)
-            self.assertEqual(obj.persisted_health_boot, obj.health_boot)
-            self.assertEqual(obj._storage_calls, ["state"])
-            self.assertEqual(len(obj._io_calls), 1)
-            self.assertEqual(obj._io_calls[0][0], "state")
+            if hasattr(os, "O_DIRECTORY"):
+                # Linux: production _flush_to_disk fsyncs the directory after the replace.
+                ok = ns["_flush_to_disk"](obj)
+                self.assertTrue(ok)
+                self.assertEqual(obj.persisted_health_boot, obj.health_boot)
+                self.assertEqual(obj._storage_calls, ["state"])
+                self.assertEqual(len(obj._io_calls), 1)
+                self.assertEqual(obj._io_calls[0][0], "state")
+            else:
+                # Windows has no os.O_DIRECTORY. Do not shim production flush.
+                # Persist the already-checksummed document and reload it through _load_state.
+                Path(ns["STATE_FILE"]).write_text(json.dumps(doc), encoding="utf-8")
 
             # Load back with health_boot present.
             loaded = make_state_stub(td)

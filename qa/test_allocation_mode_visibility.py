@@ -84,8 +84,10 @@ def main():
     policy = read(ROOT / "pi_firmware" / "energy" / "allocation.py")
     check("backend calculation mode still rejects anything except AUTO and MANUAL", 'if mode not in ("AUTO", "MANUAL")' in backend and "DAY_BASED" not in backend)
     check("calculation-mode migration and AllocationPolicy are unchanged by this mode", "DAY_BASED" not in migration and "CHECK (energy_calculation_mode IN ('AUTO', 'MANUAL'))" in migration and "DAY_BASED" not in policy)
+    # DAY_BASED is an allocation-mode UI concept. It must stay out of CalculationMode.
+    # The current surfaces are the helper, the energy selector, the day panel, and the unmounted allotment component.
     frontend_hits = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "frontend").rglob("*.ts*") if "DAY_BASED" in read(p))
-    check("DAY_BASED stays in the allocation helper, its selector, and the summary type", frontend_hits == ["frontend/src/components/ops/allocationMode.ts", "frontend/src/components/ops/energy/EnergyPanel.tsx", "frontend/src/components/ops/energy/types.ts"], ", ".join(frontend_hits))
+    check("DAY_BASED stays in the allocation UI and out of calculation mode", frontend_hits == ["frontend/src/components/ops/UnitAllotment.tsx", "frontend/src/components/ops/allocationMode.ts", "frontend/src/components/ops/energy/DayAllocationPanel.tsx", "frontend/src/components/ops/energy/EnergyPanel.tsx", "frontend/src/components/ops/energy/types.ts"], ", ".join(frontend_hits))
     print("ALLOCATION_MODE_VISIBILITY_OK")
 
 

@@ -1,0 +1,83 @@
+{
+  "commit": "7b36940216234b63fa59109c76ec1a1f33407f55",
+  "commit_subject": "feat: add new-pi provisioning preflight",
+  "branch": "main",
+  "working_tree_before_report": "clean, even with origin/main",
+  "started_at": "2026-10-04T10:42:06Z",
+  "ended_at": "2026-10-04T10:51:25Z",
+  "environment": {
+    "os": "Windows",
+    "python_venv": "3.11.9",
+    "python_system": "3.13.15",
+    "node": "v20.19.4",
+    "npm": "10.8.2",
+    "database": "PostgreSQL via psycopg; DATABASE_URL unset; psql and docker not on PATH",
+    "playwright": false,
+    "cypress": false,
+    "pytest": false,
+    "test_runner": "unittest plus node:test plus script-style qa checks",
+    "production_contacted": false,
+    "production_code_changed": false,
+    "production_pi_contacted": false
+  },
+  "automated_results": {
+    "unittest_before_test_contract_update": {"ran": 185, "pass": 175, "fail": 9, "error": 1},
+    "unittest": {"ran": 185, "pass": 185, "fail": 0, "error": 0},
+    "unittest_before_final_cleanup": {"ran": 185, "pass": 179, "fail": 5, "error": 1},
+    "node_test": {"ran": 57, "pass": 57, "fail": 0},
+    "node_test_before_final_cleanup": {"ran": 57, "pass": 56, "fail": 1},
+    "script_checks": {
+      "hardware_capabilities": {"pass": 65, "fail": 0},
+      "hw_source_of_truth_mocked_gpio": {"pass": 35, "fail": 0, "physical": false},
+      "p3_feedback_hardening_mocked_gpio": {"pass": 68, "fail": 0, "physical": false, "note": "four off events allowed; zero on events required"},
+      "runtime_compatibility": {"pass": 2, "fail": 0},
+      "runtime_6_4_1_ota_source": {"pass": 3, "fail": 0, "physical_ota": false},
+      "feedback_failsafe": {"pass_before_abort": 19, "fail": 1, "aborted": true, "physical": false},
+      "allocation_mode_visibility": {"pass_before_exit": 20, "fail": 1, "stopped_on_first_failure": true},
+      "strict_6_4_1": {"pass_before_exit": 25, "fail": 1, "stopped_on_first_failure": true}
+    }
+  },
+  "summary": {
+    "unittest_pass": 185,
+    "unittest_fail": 0,
+    "unittest_error": 0,
+    "node_pass": 57,
+    "node_fail": 0,
+    "p3_pass": 68,
+    "p3_fail": 0,
+    "note": "Counts are offline automated checks after the test-contract update. They are not end-to-end transactions, not physical HIL, and not storage endurance."
+  },
+  "gates": {
+    "A_unit_contract": "PASS",
+    "B_api_integration": "BLOCKED",
+    "C_browser_e2e": "NOT RUN",
+    "D_rbac_tenant": "NOT RUN",
+    "E_energy_correctness": "CONDITIONAL",
+    "F_pi_simulator": "BLOCKED",
+    "G_failure_injection": "NOT RUN",
+    "H_storage_resource": "NOT RUN",
+    "I_ota_simulation": "PASS",
+    "J_physical_hil": "NOT RUN",
+    "K_endurance": "NOT RUN",
+    "L_production_deployment": "NOT RUN"
+  },
+  "gate_notes": {
+    "A_unit_contract": "185/185 unittest and 57/57 node tests passed after the final QA cleanup. strict_6_4_1 still fails the gpio_manager.py sha256 pin. Three older gates still name missing migration files.",
+    "B_api_integration": "No disposable PostgreSQL. DATABASE_URL unset. energy_e2, energy_e4, energy_mode_test, energy_references_test, and frontend/test_system.py were not started.",
+    "C_browser_e2e": "Playwright and Cypress are not project dependencies. No browser session was opened in this qualification.",
+    "D_rbac_tenant": "Member UI source checks now match the current components and still require backend role rejection. Direct HTTP role matrix was not executed.",
+    "E_energy_correctness": "Operational M1 and operating-day contract tests pass. E1 and E3 still cannot start on Windows. Live energy API tests were not run.",
+    "F_pi_simulator": "phase05_sim_common requires os.statvfs, which Windows Python does not provide.",
+    "G_failure_injection": "Some existing tests inject claim, storage, and power-loss failures and passed inside unittest. The requested full injection matrix was not run.",
+    "H_storage_resource": "No 15-minute or 1-hour fleet simulation. No measured rows, latency, WAL, or log bytes.",
+    "I_ota_simulation": "Source-level only: signed verification and tampered payload rejection passed. Not a physical OTA.",
+    "J_physical_hil": "No contactor, meter, or Pi was attached. Mock GPIO is not physical proof.",
+    "K_endurance": "SMART, TBW, and multi-day write totals are UNKNOWN.",
+    "L_production_deployment": "Production database and production Pi were not contacted."
+  },
+  "verdict": {
+    "software_qualification": "CONDITIONAL",
+    "industrial_qualification": "FAIL",
+    "production_readiness": "BLOCKED"
+  }
+}

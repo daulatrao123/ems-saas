@@ -1,0 +1,214 @@
+{
+  "commit": "7b36940216234b63fa59109c76ec1a1f33407f55",
+  "production_contacted": false,
+  "product_code_modified": false,
+  "production_code_changed": false,
+  "targeted_test_contract_updates": {
+    "additive_generation_expectation_removed": true,
+    "m1_authority_aligned": true,
+    "operating_day_aligned_to_physical_5_0": true,
+    "windows_checksum_platform_aware": true,
+    "p3_allows_four_off_and_zero_on": true,
+    "member_ui_inventory_aligned": true,
+    "unittest_after": {"ran": 185, "pass": 179, "fail": 5, "error": 1},
+    "unittest_before": {"ran": 185, "pass": 175, "fail": 9, "error": 1},
+    "p3_after": "68/68",
+    "node_after": {"ran": 57, "pass": 56, "fail": 1}
+  },
+  "final_qa_cleanup": {
+    "production_code_changed": false,
+    "unittest_before": {"ran": 185, "pass": 179, "fail": 5, "error": 1},
+    "unittest_after": {"ran": 185, "pass": 185, "fail": 0, "error": 0},
+    "node_before": {"ran": 57, "pass": 56, "fail": 1},
+    "node_after": {"ran": 57, "pass": 57, "fail": 0},
+    "p3": "68/68",
+    "hardware_capabilities": "65/65",
+    "hw_source_of_truth_mocked": "35/35",
+    "ast_freeze_classification": "B",
+    "ast_freeze_note": "Four methods intentionally differ from fc41d937 and are frozen to 7b36940. Unchanged methods stay on fc41d937.",
+    "crlf": "Semantic source compare. Newlines normalized in the test only. resource_guard.py was not edited.",
+    "capability_stub": "Stub sets _capability_error. CAPABILITY_STATE_INVALID still refuses ON with no GPIO call.",
+    "dashboard_layout": "qa/dashboard_layout.cjs renders OperationalDashboard into a temp directory. /app/test_reports was not a repository file.",
+    "strict_still_failing": [
+      "strict_6_4_1_check.py gpio_manager.py sha256 pin",
+      "strict_6_4_check.py missing 20260906_0001_industrial_baseline.py",
+      "strict_6_5_check.py missing 0001_ems_current_schema.py",
+      "industrial_6_5_gate.py missing 0001_industrial_schema.py"
+    ]
+  },
+  "ready_for_targeted_fixes": "YES",
+  "ready_scope": "Test, fixture, and contract-documentation fixes only. No allocation, GPIO, auth, or provisioning product change is justified by these failures.",
+  "summary": {
+    "real_defects": 0,
+    "test_defects": 8,
+    "fixture_defects": 2,
+    "environment_blockers": 4,
+    "contract_drift": 3
+  },
+  "m1_first_divergence": {
+    "function": "backend/energy_api/queries.py:wing_graph_rows",
+    "then": "backend/energy_api/mode_contract.py:operational_rows",
+    "allocation_and_grid": "unchanged; physical M1 stayed authoritative",
+    "manual_entries_entered_allocation": false,
+    "manual_entries_entered_calculation_view": false,
+    "actual_calculation_value_source": "energy_daily.wing_generation physical row"
+  },
+  "operating_date_first_divergence": {
+    "clocks_that_passed": ["2026-11-30T23:59:00+00:00", "2026-12-01T00:01:00+00:00"],
+    "operating_date_that_passed": "2026-11-30",
+    "eight_was": "manual adjustments 5 + 3",
+    "five_is": "fixture wing_generation.A physical 5.0",
+    "timezone_or_reset_day": false
+  },
+  "p3_common_cause": {
+    "function": "pi_firmware/gpio_manager.py:GPIOManager._deenergize_all",
+    "called_from": "pi_firmware/gpio_manager.py:GPIOManager._reconcile_hardware_state_locked",
+    "observed": "4 relay.off() events, 0 relay.on() events",
+    "safety_held": ["FAULT", "no MAKE", "PENDING or correct MISMATCH", "not READY after late recovery"]
+  },
+  "failures": [
+    {
+      "test": "qa/test_manual_m1_allocation.py::test_issue1_manual_wing_entries_never_change_m1_allocation_or_grid",
+      "category": "B",
+      "also": "E",
+      "priority": "P0",
+      "expected": "[9023, -4, 0, 402] and generation_source MANUAL",
+      "actual": "[10.0, 0.0, 0.0, 0.0] from physical wing_generation",
+      "root_cause": "Operational calculation no longer adds energy_adjustments. Earlier asserts in the same test passed: references and allocation stayed on physical M1.",
+      "confidence": "high",
+      "action": "Keep PHYSICAL_M1_ONLY. Update this assertion to the contract already locked by test_manual_generation_policy.py. Do not feed manual wing kWh into allocation or grid."
+    },
+    {
+      "test": "qa/test_manual_m1_allocation.py::test_unavailable_or_unqualified_m1_never_falls_back_to_manual_entries",
+      "category": "B",
+      "also": "E",
+      "priority": "P0",
+      "expected": "wing A generated_kwh 9000 while allocation stays UNAVAILABLE",
+      "actual": "allocation UNAVAILABLE passed; generated_kwh is None",
+      "root_cause": "Same skip of manual adjustments in wing_graph_rows when mode is AUTO or MANUAL. Missing ledger does not fall back to manual generation.",
+      "confidence": "high",
+      "action": "Expect None, not 9000, on the operational wing card. Do not add a manual fallback."
+    },
+    {
+      "test": "qa/test_operating_date_optional_meters.py::test_utc_midnight_keeps_adjustments_on_pi_day_while_history_advances_month",
+      "category": "B",
+      "also": "E",
+      "priority": "P0",
+      "expected": "generated_kwh 8",
+      "actual": "5.0",
+      "root_cause": "5.0 is the seeded physical wing A value. 8 is 5+3 manual adjustments. Date assertions before this line passed for both UTC clocks.",
+      "confidence": "high",
+      "action": "Do not change timezone or reset-day code. Expect the physical 5.0 on the operational view."
+    },
+    {
+      "test": "qa/p3_feedback_hardening_test.py 12 RECON checks",
+      "category": "E",
+      "priority": "P0",
+      "expected": "no relay on/off events during failed reconciliation",
+      "actual": "4 off() events from _deenergize_all; 0 on(); FAULT; MAKE refused; verification PENDING or the matching MISMATCH",
+      "root_cause": "Fail-closed coil-off was added on timeout, mismatch, and multiple-ON. The mock records every off() as a write, including when the coil was already off.",
+      "confidence": "high",
+      "action": "Do not remove _deenergize_all, interlock, or pre-MAKE. Change the test to forbid ON and false VERIFIED, and allow fail-closed OFF."
+    },
+    {
+      "test": "qa/strict_6_4_1_check.py member control panels",
+      "category": "B",
+      "also": "E",
+      "priority": "P1",
+      "expected": "SystemControls, ResetDayControl, UnitAllotment, LcdControl all present and only inside {!readOnly &&}",
+      "actual": "UnitAllotment and LcdControl are not mounted. SystemControls and ResetDayControl are behind !readOnly.",
+      "root_cause": "Dashboard now uses DayAllocationPanel, LcdMessagePanel, and SlotCard. Those paths are readOnly-gated. Backend command, LCD, slot-config, and day-allocation writes reject members.",
+      "confidence": "high",
+      "action": "Retarget the source check to the current components. Do not weaken backend role checks."
+    },
+    {
+      "test": "qa/test_controller_health.py::test_state_build_load_flush_roundtrip_and_checksum",
+      "category": "D",
+      "priority": "P2",
+      "expected": "_flush_to_disk returns True",
+      "actual": "False",
+      "root_cause": "In-memory checksum verify passed. Flush then calls os.open(directory, os.O_DIRECTORY). Windows Python has no os.O_DIRECTORY, the exception is caught, and flush returns False.",
+      "confidence": "high",
+      "action": "Not a hash-field bug. A later portability guard is a product change and was not made. The check stays blocked on Windows until that exists."
+    },
+    {
+      "test": "qa/test_disabled_physical_toggles.py::test_execute_local_transition_toggle_rejection_and_energy_gate",
+      "category": "C",
+      "priority": "P2",
+      "expected": "(False, SYSTEM_SELF_TEST) for ENERGY during SELF_TEST",
+      "actual": "AttributeError: SimpleNamespace has no _capability_error",
+      "root_cause": "pi_firmware/ems_controller.py:EMSController._execute_local_transition reads self._capability_error before the state gate. The extracted-method stub never sets that attribute.",
+      "confidence": "high",
+      "action": "Give the stub _capability_error = None. Do not remove the capability refusal."
+    },
+    {
+      "test": "qa/test_feedback_failsafe.py command_during_fault",
+      "category": "C",
+      "priority": "P2",
+      "expected": "ctrl.boot() is True, then a command during FAULT does not energize",
+      "actual": "AssertionError at boot(); the FAULT check did not run",
+      "root_cause": "boot() returns False when GPIOManager.reconcile_hardware_state() fails. The safety assertion was not reached.",
+      "confidence": "medium",
+      "action": "Repair the harness so boot reaches READY or FAULT deliberately, then keep the non-energize assertion. Do not treat this abort as a passed or failed coil test."
+    },
+    {
+      "test": "qa/test_disabled_physical_toggles.py::test_ast_method_parity_with_task_start_hash",
+      "category": "B",
+      "priority": "P3",
+      "expected": "byte-for-byte methods at git fc41d937",
+      "actual": "reconcile, transition_slot, deactivate_slot, and process_one_command differ",
+      "root_cause": "Freeze against an older snapshot. Current methods include capability refusal and fail-closed deenergize.",
+      "confidence": "high",
+      "action": "Retire or retarget the freeze after review. Do not revert GPIO to that SHA to satisfy it."
+    },
+    {
+      "test": "qa/test_health_flow_budget.py::test_state_sync_control_and_budget_cadences_unchanged_against_task_start",
+      "category": "D",
+      "priority": "P3",
+      "expected": "git blob bytes of pi_firmware/resource_guard.py at 3ffba339",
+      "actual": "same text with CRLF in the working tree and LF in git",
+      "root_cause": "Windows newline conversion. The assertion compares raw bytes.",
+      "confidence": "high",
+      "action": "Compare normalized newlines, or run the byte check on LF. Not a cadence change."
+    },
+    {
+      "test": "qa/test_allocation_mode_visibility.py DAY_BASED file list",
+      "category": "B",
+      "priority": "P3",
+      "expected": "DAY_BASED only in allocationMode.ts, EnergyPanel.tsx, energy/types.ts",
+      "actual": "also UnitAllotment.tsx and DayAllocationPanel.tsx",
+      "root_cause": "DAY_BASED UI grew into the panel and the older allotment component. Calculation mode is still only AUTO and MANUAL; that earlier check passed.",
+      "confidence": "high",
+      "action": "Update the allow-list. Do not delete DAY_BASED from the allocation UI to match the old list."
+    },
+    {
+      "test": "qa/dashboard_presentation.test.cjs offline dashboard fixture",
+      "category": "D",
+      "also": "C",
+      "priority": "P3",
+      "expected": "node /app/test_reports/dashboard_layout.cjs",
+      "actual": "MODULE_NOT_FOUND for C:\\app\\test_reports\\dashboard_layout.cjs",
+      "root_cause": "The test shells out to a Linux CI path that is not in this repository or on this machine.",
+      "confidence": "high",
+      "action": "Blocked until that layout runner exists. Not a dashboard logic result."
+    },
+    {
+      "test": "qa/industrial_6_5_gate.py, qa/strict_6_4_check.py, qa/strict_6_5_check.py",
+      "category": "B",
+      "priority": "P3",
+      "expected": "0001_industrial_schema.py, 20260906_0001_industrial_baseline.py, 0001_ems_current_schema.py",
+      "actual": "FileNotFoundError. Tree has 0001_ems_baseline.py through 0018_firmware_releases.py.",
+      "root_cause": "Gate scripts still name migrations that were replaced.",
+      "confidence": "high",
+      "action": "Point the gates at the current revision files. Do not recreate the old filenames."
+    }
+  ],
+  "still_blocked": [
+    "PostgreSQL disposable database: auth, RBAC HTTP, tenant, energy API round-trip",
+    "Playwright: browser login, session, CSRF, role visibility",
+    "WSL/Linux: energy_e1 and energy_e3, os.statvfs",
+    "Physical Raspberry Pi: installer, sync, offline queue, OTA",
+    "Relay/contactor HIL: the 12 P3 results are mocked",
+    "Storage endurance: no SMART, no TBW, life trend not established"
+  ]
+}

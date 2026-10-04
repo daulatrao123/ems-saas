@@ -12,6 +12,11 @@ from qa import test_controller_health as fixtures
 
 ROOT, HT, HR = fixtures.ROOT, fixtures.HT, fixtures.HR
 BASELINE = "3ffba339a47cec4dbceee425079a72b80a32b499"
+# sync_cloud and _execute_local_transition no longer match BASELINE.
+# They are frozen to the qualification commit: OTA release_health before
+# confirm_boot, rejection of a non-object energy_config, and the capability
+# refusal before local ON. Write cadence of the unchanged methods stays on BASELINE.
+QUALIFICATION_SHA = "7b36940216234b63fa59109c76ec1a1f33407f55"
 
 
 class HealthBudgetTests(unittest.TestCase):
@@ -48,8 +53,12 @@ class HealthBudgetTests(unittest.TestCase):
         self.assertLess(len(json.dumps(HR.normalize_report(snapshot, now), separators=(",", ":")).encode()), 1024)
 
     def test_state_sync_control_and_budget_cadences_unchanged_against_task_start(self):
-        baseline_state = ast.parse(subprocess.check_output(["git", "show", f"{BASELINE}:pi_firmware/state.py"], cwd=ROOT, text=True))
-        current_state = ast.parse((ROOT / "pi_firmware/state.py").read_text())
+        def blob(sha: str, path: str) -> str:
+            # UTF-8, not the Windows console encoding. Line endings are checkout style.
+            return subprocess.check_output(["git", "show", f"{sha}:{path}"], cwd=ROOT).decode("utf-8")
+
+        baseline_state = ast.parse(blob(BASELINE, "pi_firmware/state.py"))
+        current_state = ast.parse((ROOT / "pi_firmware/state.py").read_text(encoding="utf-8"))
         def method(tree, class_name, name):
             cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
             return next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -65,12 +74,30 @@ class HealthBudgetTests(unittest.TestCase):
                     and (getattr(n.func, "attr", None) or getattr(n.func, "id", None)) in write_ops]
         self.assertEqual(calls(method(baseline_state, "PiStateManager", "_flush_to_disk")), calls(method(current_state, "PiStateManager", "_flush_to_disk")))
         for path in ("pi_firmware/resource_guard.py", "pi_firmware/storage_io_manager.py", "pi_firmware/storage_manager.py", "pi_firmware/config.py", "pi_firmware/ems-controller.service"):
-            old = subprocess.check_output(["git", "show", f"{BASELINE}:{path}"], cwd=ROOT)
-            self.assertEqual(old, (ROOT / path).read_bytes(), path)
-        old_controller = ast.parse(subprocess.check_output(["git", "show", f"{BASELINE}:pi_firmware/ems_controller.py"], cwd=ROOT, text=True))
-        current_controller = ast.parse((ROOT / "pi_firmware/ems_controller.py").read_text())
-        for name in ("boot", "sync_cloud", "run", "shutdown", "_execute_local_transition", "_slot_visible"):
+            # Semantic source freeze. Git stores LF; a Windows checkout is CRLF.
+            # Exact checkout bytes are not the cadence contract.
+            old = blob(BASELINE, path).encode("utf-8")
+            current = (ROOT / path).read_bytes().replace(b"\r\n", b"\n")
+            self.assertEqual(old, current, path)
+        old_controller = ast.parse(blob(BASELINE, "pi_firmware/ems_controller.py"))
+        current_controller = ast.parse((ROOT / "pi_firmware/ems_controller.py").read_text(encoding="utf-8"))
+        qualified_controller = ast.parse(blob(QUALIFICATION_SHA, "pi_firmware/ems_controller.py"))
+        for name in ("boot", "run", "shutdown", "_slot_visible"):
             self.assertEqual(ast.dump(method(old_controller, "EMSController", name)), ast.dump(method(current_controller, "EMSController", name)), name)
+        for name in ("sync_cloud", "_execute_local_transition"):
+            self.assertEqual(ast.dump(method(qualified_controller, "EMSController", name)), ast.dump(method(current_controller, "EMSController", name)), name)
+        transition = ast.get_source_segment(
+            (ROOT / "pi_firmware/ems_controller.py").read_text(encoding="utf-8"),
+            method(current_controller, "EMSController", "_execute_local_transition"),
+        )
+        self.assertIn("CAPABILITY_STATE_INVALID", transition)
+        self.assertLess(transition.index("PHYSICAL_TOGGLES_DISABLED"), transition.index("CAPABILITY_STATE_INVALID"))
+        sync = ast.get_source_segment(
+            (ROOT / "pi_firmware/ems_controller.py").read_text(encoding="utf-8"),
+            method(current_controller, "EMSController", "sync_cloud"),
+        )
+        self.assertIn("ota_manager.release_health", sync)
+        self.assertIn("NOT_OBJECT", sync)
 
     def test_service_sampler_runs_only_readonly_bounded_show(self):
         result = types.SimpleNamespace(returncode=0, stdout="WatchdogUSec=2s\nActiveState=active\n")

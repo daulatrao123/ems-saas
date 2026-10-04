@@ -16,6 +16,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TASK_START_SHA = "fc41d93750d3195f4a8e2b672187740521227d75"
+# Qualification commit. Four methods below no longer match fc41d937 because later
+# fail-closed work is the current contract. They stay frozen to this SHA.
+QUALIFICATION_SHA = "7b36940216234b63fa59109c76ec1a1f33407f55"
 
 
 def src_text(rel_path: str) -> str:
@@ -132,19 +135,29 @@ class ToggleDisableRegression(unittest.TestCase):
                 self.deactivate_calls += 1
                 return True
 
-        ctl = types.SimpleNamespace(state=State("READY"), gpio=Gpio())
+        # Current contract: _execute_local_transition reads _capability_error before the
+        # state gate. None leaves that gate clear. CAPABILITY_STATE_INVALID refuses ON
+        # with no GPIO call and no state write.
+        ctl = types.SimpleNamespace(state=State("READY"), gpio=Gpio(), _capability_error=None)
 
         success, reason = fn(ctl, "A", True, "TOGGLE")
         self.assertEqual((success, reason), (False, "PHYSICAL_TOGGLES_DISABLED"))
         self.assertEqual((ctl.state.system_state.value, ctl.state.saved), ("READY", 0))
         self.assertEqual((ctl.gpio.transition_calls, ctl.gpio.deactivate_calls), (0, 0))
 
-        ctl_blocked = types.SimpleNamespace(state=State("SELF_TEST"), gpio=Gpio())
+        ctl_blocked = types.SimpleNamespace(state=State("SELF_TEST"), gpio=Gpio(), _capability_error=None)
         success, reason = fn(ctl_blocked, "A", True, "ENERGY")
         self.assertEqual((success, reason), (False, "SYSTEM_SELF_TEST"))
         self.assertEqual(ctl_blocked.state.saved, 0)
 
-        ctl_ok = types.SimpleNamespace(state=State("READY"), gpio=Gpio())
+        ctl_capability = types.SimpleNamespace(
+            state=State("READY"), gpio=Gpio(), _capability_error="CAPABILITY_STATE_INVALID"
+        )
+        success, reason = fn(ctl_capability, "A", True, "ENERGY")
+        self.assertEqual((success, reason), (False, "CAPABILITY_STATE_INVALID"))
+        self.assertEqual((ctl_capability.gpio.transition_calls, ctl_capability.state.saved), (0, 0))
+
+        ctl_ok = types.SimpleNamespace(state=State("READY"), gpio=Gpio(), _capability_error=None)
         success, reason = fn(ctl_ok, "A", True, "ENERGY")
         self.assertEqual((success, reason), (True, None))
         self.assertEqual(ctl_ok.gpio.transition_calls, 1)
@@ -282,28 +295,49 @@ class ToggleDisableRegression(unittest.TestCase):
         self.assertIn("CT A:ON", lines[2])
         self.assertNotIn("TG", "\n".join(lines), "toggle label must be absent")
 
-    # task-start parity check: critical relay/qualification/reconciliation + cloud command methods unchanged
+    # Source freeze. fc41d937 still covers methods that did not change.
+    # Classification B: these four intentionally differ from that snapshot and are
+    # frozen to QUALIFICATION_SHA instead:
+    # - reconcile / transition_slot / deactivate_slot call _deenergize_all() on fault
+    #   paths, and transition_slot requalifies PENDING before MAKE until the feedback
+    #   budget expires (fail-closed; not the old single-sample veto).
+    # - process_one_command refuses FAULT and CAPABILITY_STATE_INVALID before any relay.
+    # Git blobs are decoded as UTF-8. Windows text mode would mojibake source comments.
     def test_ast_method_parity_with_task_start_hash(self):
-        def git_show(rel_path: str) -> str:
+        def git_show(sha: str, rel_path: str) -> str:
             return subprocess.check_output(
-                ["git", "show", f"{TASK_START_SHA}:{rel_path}"],
+                ["git", "show", f"{sha}:{rel_path}"],
                 cwd=str(ROOT),
-                text=True,
-            )
+            ).decode("utf-8")
+
+        def norm(segment: str) -> str:
+            return segment.replace("\r\n", "\n").strip()
 
         checks = [
-            ("pi_firmware/gpio_manager.py", "GPIOManager", ["_read_feedback_raw", "_reconcile_hardware_state_locked", "transition_slot", "deactivate_slot"]),
-            ("pi_firmware/ems_controller.py", "EMSController", ["_run_software_command", "_accept_cloud_command", "process_one_command"]),
+            (TASK_START_SHA, "pi_firmware/gpio_manager.py", "GPIOManager", ["_read_feedback_raw"]),
+            (TASK_START_SHA, "pi_firmware/ems_controller.py", "EMSController", ["_run_software_command", "_accept_cloud_command"]),
+            (QUALIFICATION_SHA, "pi_firmware/gpio_manager.py", "GPIOManager", ["_reconcile_hardware_state_locked", "transition_slot", "deactivate_slot"]),
+            (QUALIFICATION_SHA, "pi_firmware/ems_controller.py", "EMSController", ["process_one_command"]),
         ]
 
-        for rel_path, cls, methods in checks:
+        for sha, rel_path, cls, methods in checks:
             now_code = src_text(rel_path)
-            old_code = git_show(rel_path)
+            old_code = git_show(sha, rel_path)
             for method in methods:
-                with self.subTest(file=rel_path, method=method):
-                    now = class_method_source(now_code, cls, method).strip()
-                    old = class_method_source(old_code, cls, method).strip()
+                with self.subTest(file=rel_path, method=method, sha=sha):
+                    now = norm(class_method_source(now_code, cls, method))
+                    old = norm(class_method_source(old_code, cls, method))
                     self.assertEqual(now, old)
+                    if method in {"_reconcile_hardware_state_locked", "transition_slot", "deactivate_slot"}:
+                        self.assertIn("self._deenergize_all()", now)
+                        self.assertIn("SystemState.FAULT", now)
+                    if method == "transition_slot":
+                        self.assertIn("VerificationState.PENDING", now)
+                        self.assertIn("VerificationState.VERIFIED_OFF", now)
+                    if method == "process_one_command":
+                        self.assertIn("system is FAULT", now)
+                        self.assertIn("CAPABILITY_STATE_INVALID", now)
+                        self.assertLess(now.index("system is FAULT"), now.index("transition_slot"))
 
 
 if __name__ == "__main__":

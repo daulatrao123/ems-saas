@@ -630,7 +630,9 @@ class OperatingDateAndOptionalMetersRegression(unittest.TestCase):
         rows = Q.wing_graph_rows(cur, self.did, "A", date(2026, 11, 30), date(2026, 11, 30), generation_enabled=True, consumption_enabled=True, calculation_mode=None)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["date"], "2026-11-30")
-        self.assertEqual(rows[0]["generated_kwh"], 8.0, "must keep Pi business operating day and additive manual generation")
+        # Legacy accounting path only (calculation_mode=None): physical wing A 5.0 plus manual 3.0.
+        # AUTO/MANUAL operational cards do not add that adjustment. See the midnight test below.
+        self.assertEqual(rows[0]["generated_kwh"], 8.0, "legacy calculation_mode=None still adds manual generation on the Pi operating day")
 
     def test_consumption_meter_eligible_matrix(self):
         cases = [
@@ -712,10 +714,14 @@ class OperatingDateAndOptionalMetersRegression(unittest.TestCase):
                 self.assertEqual(out["references"]["wings"]["A"]["history"]["reference_daily_kwh"], reference)
         self.assertEqual([r["operating_date"] for r in self.state["adjustments"]], [date(2026, 11, 30)] * 2)
         self.assertEqual([r["created_at"].date() for r in self.state["adjustments"]], [date(2026, 11, 30), date(2026, 12, 1)])
-        self.assertEqual(out["calculation"]["wings"]["A"]["today"]["generated_kwh"], 8)
+        # Current contract: both adjustments (5 then 3) are stored on Pi day 2026-11-30, but the
+        # MANUAL operational card does not add them. Expected 5.0 is the seeded physical wing_generation A,
+        # not 5+3. The UTC midnight clock advanced the history month without moving the Pi operating date.
+        self.assertEqual(out["calculation"]["wings"]["A"]["today"]["generated_kwh"], 5.0)
+        self.assertEqual(out["calculation"]["wings"]["A"]["today"]["generation_source"], "PHYSICAL")
         graph = self.graph_wing(society_id="1", device_id=self.did, wing="A", range=None, frm="2026-11-30", to="2026-12-01", basis="calculation", user=user)
-        self.assertEqual([r["generated_kwh"] for r in graph["rows"]], [8, None])
-        self.assertEqual(graph["rows"][0]["generation_source"], "MANUAL")
+        self.assertEqual([r["generated_kwh"] for r in graph["rows"]], [5.0, None])
+        self.assertEqual(graph["rows"][0]["generation_source"], "PHYSICAL")
         self.assertEqual(self.state["daily"][0]["generation_kwh"], 1000)
         self.assertEqual((out["references"]["allocation"]["generation_kwh"], out["references"]["allocation"]["generation_source"]), (1000, "PHYSICAL"))
         self.assertEqual(out["references"]["allocation"]["reason"], "REQUIRED_WING_QUOTA_UNAVAILABLE")

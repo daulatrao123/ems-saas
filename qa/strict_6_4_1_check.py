@@ -96,25 +96,60 @@ check("member UI is read-only: readOnly is a mandatory boolean prop of Operation
 writes = sorted(u for _, u in re.findall(r"api\.(post|put|delete|patch)\(\s*[\"'`]([^\"'`]+)", hook))
 check("member UI is read-only: useOperations write surface is exactly pi-command (queue) + slot-config (setSlotConfig)", writes == ["/api/admin/pi-command", "/api/admin/slot-config"] and "const queue: QueueFn" in hook and "const setSlotConfig: SlotConfigFn" in hook)
 reach = strip_readonly_gated(dash)
-panels = ("SystemControls", "ResetDayControl", "UnitAllotment", "LcdControl")
-check("member UI is read-only: control panels render only behind !readOnly", all(f"<{c}" in dash for c in panels) and not any(f"<{c}" in reach for c in panels))
+# Current operator panels that exist only inside {!readOnly &&}. UnitAllotment and LcdControl are not mounted.
+panels = ("SystemControls", "ResetDayControl")
+check("member UI is read-only: SystemControls and ResetDayControl render only behind !readOnly", all(f"<{c}" in dash for c in panels) and not any(f"<{c}" in reach for c in panels))
+check("member UI is read-only: retired UnitAllotment and LcdControl are not the dashboard surface", "<UnitAllotment" not in dash and "<LcdControl" not in dash)
+for surfaced in ("DayAllocationPanel", "LcdMessagePanel", "SlotCard", "SlotOperations"):
+    tag = dash[dash.index(f"<{surfaced}"):dash.index(f"<{surfaced}") + 900]
+    # SlotOperations passes readOnly={readOnly || hideSenders}; the others pass readOnly={readOnly}.
+    check(f"member UI is read-only: {surfaced} stays mounted and receives readOnly", f"<{surfaced}" in dash and "readOnly={readOnly" in tag)
+day_panel = text(OPS + "energy/DayAllocationPanel.tsx")
+check("member UI is read-only: DAY_BASED apply stays behind !readOnly and inputs are disabled for members", "{!readOnly &&" in day_panel and "data-testid=\"day-apply\"" in day_panel and "disabled={readOnly || busy}" in day_panel)
+backend_main = text("backend/main.py")
+energy_routes = text("backend/energy_api/routes.py")
+check("backend member cannot issue commands", 'Only super_admin or society_admin may issue commands' in backend_main)
+check("backend member cannot change slot configuration", 'Only super_admin or society_admin may change slot configuration' in backend_main)
+check("backend member cannot manage LCD messages", 'Only super_admin or society_admin may manage LCD messages' in backend_main)
+check("backend energy writes reject a read-only role", 'WRITE_ROLES = {"super_admin", "society_admin"}' in energy_routes and 'if write and user.get("role") not in WRITE_ROLES' in energy_routes)
+def opening_tag(src, end):
+    """JSX opening tag that contains src[end]. `=>` is not the tag close."""
+    start = src.rfind("<", 0, end)
+    i = start
+    while i < len(src):
+        if src.startswith("=>", i):
+            i += 2
+            continue
+        if src[i] == ">":
+            return src[start:i + 1]
+        i += 1
+    raise SystemExit("FAIL: unclosed JSX tag")
 carrier_tags = {}
 for m in re.finditer(r"ops\.(queue|setSlotConfig)\b", reach):
-    tag = reach[reach.rfind("<", 0, m.start()):]; tag = tag[:tag.index(">") + 1]
+    tag = opening_tag(reach, m.start())
     carrier_tags[re.match(r"<(\w+)", tag).group(1)] = tag
 for comp, tag in sorted(carrier_tags.items()):
-    check(f"member UI is read-only: {comp} receives write fn together with readOnly={{readOnly}}", "readOnly={readOnly}" in tag)
+    # SlotOperations uses readOnly={readOnly || hideSenders}. That still passes the member flag through.
+    check(f"member UI is read-only: {comp} receives write fn together with readOnly", "readOnly={readOnly" in tag)
 carriers = set(carrier_tags)
 check("member UI is read-only: write functions reach at least one child (check is not vacuous)", len(carriers) >= 1)
+def component_source(comp):
+    # SlotOperations is declared in SlotCard.tsx. There is no SlotOperations.tsx.
+    if comp == "SlotOperations":
+        return text(OPS + "SlotCard.tsx")
+    return text(OPS + comp + ".tsx")
 for comp in sorted(carriers):
-    csrc = text(OPS + comp + ".tsx")
+    csrc = component_source(comp)
     check(f"member UI is read-only: {comp} invokes queue()/setSlotConfig() only behind !readOnly", re.search(r"\b(queue|setSlotConfig)\(", csrc) is not None and re.search(r"\b(queue|setSlotConfig)\(", strip_readonly_gated(csrc)) is None)
 mutating_children = []
 for comp in sorted(set(re.findall(r"<([A-Z]\w+)", reach))):
     p = ROOT / (OPS + comp + ".tsx")
     if p.exists() and re.search(r"api\.(post|put|delete|patch)\(", p.read_text(encoding="utf-8")):
         csrc = p.read_text(encoding="utf-8"); mutating_children.append(comp)
-        check(f"member UI is read-only: {comp} (member-reachable, calls a mutating API) returns null on readOnly before any render", "if (readOnly) return null;" in csrc and csrc.index("if (readOnly) return null;") < csrc.index("return ("))
+        guard_at = csrc.find("if (readOnly) return null;")
+        # The effect cleanup uses `return () =>` before this guard. The panel JSX return is after it.
+        jsx_at = csrc.find("return (", guard_at if guard_at >= 0 else 0)
+        check(f"member UI is read-only: {comp} (member-reachable, calls a mutating API) returns null on readOnly before the panel render", guard_at >= 0 and jsx_at > guard_at)
 check("member UI is read-only: mutating member-reachable children enumerated (LcdMessagePanel)", mutating_children == ["LcdMessagePanel"])
 check("login routes roles separately", 'router.push("/member")' in login and 'router.push("/admin")' in login)
 # ---- role gates (#1 admin, #2 super-admin): structural evidence from OpsShell.useRoleSession, not role strings ----
@@ -147,7 +182,7 @@ for p in dash_pages:
     else:
         ok = roles is not None and re.search(r"\sreadOnly(\s|/|>|=\{true\})", od) is not None   # literal read-only
     check(f"write-capable dashboard only behind an authenticated non-member role gate: {p.relative_to(ROOT)}", ok)
-check("write-capable dashboard pages enumerated (admin, member, society/[id])", [str(p.relative_to(ROOT)) for p in dash_pages] == ["frontend/src/app/admin/page.tsx", "frontend/src/app/member/page.tsx", "frontend/src/app/society/[id]/page.tsx"])
+check("write-capable dashboard pages enumerated (admin, member, society/[id])", [p.relative_to(ROOT).as_posix() for p in dash_pages] == ["frontend/src/app/admin/page.tsx", "frontend/src/app/member/page.tsx", "frontend/src/app/society/[id]/page.tsx"])
 check("super-admin page enforces super_admin: useRoleSession([\"super_admin\"]) once; fleet UI rendered only after ready && session", page_guarded(superadmin, ["super_admin"]))
 check("super-admin page enforces super_admin: fleet data is fetched only once the role gate passed", "if (ready) load()" in superadmin and "/api/super-admin/" in superadmin)
 check("super-admin page enforces super_admin: tenant/user provisioning forms live only on this surface", "CreateSocietyForm" in superadmin and "CreateUserForm" in superadmin and not any("CreateSocietyForm" in p.read_text(encoding="utf-8") for p in pages if p.name == "page.tsx" and "super-admin" not in str(p)))

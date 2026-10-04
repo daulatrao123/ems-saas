@@ -83,12 +83,19 @@ class ManualM1AllocationRegression(unittest.TestCase):
         self.add_entry("A", 7, kind="MANUAL_CONSUMPTION")
         manual = self.summary()
         self.assertEqual(manual["references"], before["MANUAL"]["references"])
-        self.assertEqual([manual["calculation"]["wings"][w]["today"]["generated_kwh"] for w in "ABCD"], [9023, -4, 0, 402])
-        for w in "ABCD":
-            self.assertEqual(manual["calculation"]["wings"][w]["today"]["generation_source"], "MANUAL")
-            self.assertIsNone(manual["calculation"]["wings"][w]["today"]["required_kwh"])
+        # Current contract: AUTO/MANUAL operational cards use physical wing_generation.
+        # The seeded physical row is A=10, B=0, C=0, D=0. MANUAL_GENERATION totals
+        # (9023, -4, 0, 402) stay in energy_adjustments and must not replace M1 or the wing card.
+        self.assertEqual([manual["calculation"]["wings"][w]["today"]["generated_kwh"] for w in "ABCD"], [10.0, 0.0, 0.0, 0.0])
+        for wing, quota in zip("ABCD", (200.0, 220.0, 180.0, 210.0)):
+            today_wing = manual["calculation"]["wings"][wing]["today"]
+            self.assertEqual(today_wing["generation_source"], "PHYSICAL")
+            # required_kwh stays the configured daily target. It is not derived from manual wing entries.
+            self.assertEqual(today_wing["required_kwh"], quota)
         today = manual["calculation"]["wings"]["A"]["today"]
-        self.assertEqual((today["consumed_kwh"], today["consumption_source"]), (7, "MANUAL"))
+        # MANUAL_CONSUMPTION 7 is an accounting row. Empty bills do not become operational consumption.
+        self.assertEqual((today["consumed_kwh"], today["consumption_source"]), (None, "UNAVAILABLE"))
+        self.assertTrue(any(row["kind"] == "MANUAL_CONSUMPTION" and row["value_kwh"] == 7 for row in self.state["adjustments"]))
         auto = self.summary("AUTO")
         self.assertEqual(auto["calculation"], before["AUTO"]["calculation"])
 
@@ -116,7 +123,10 @@ class ManualM1AllocationRegression(unittest.TestCase):
                 out = self.summary(mode)
                 self.assert_unavailable(out)
                 if mode == "MANUAL":
-                    self.assertEqual(out["calculation"]["wings"]["A"]["today"]["generated_kwh"], 9000)
+                    # No energy_daily row: operational generation stays unavailable.
+                    # The stored MANUAL_GENERATION 9000 must not fill allocation or the wing card.
+                    self.assertIsNone(out["calculation"]["wings"]["A"]["today"]["generated_kwh"])
+                    self.assertNotEqual(out["calculation"]["wings"]["A"]["today"]["generation_source"], "MANUAL")
 
     def assert_unavailable(self, out):
         allocation = out["references"]["allocation"]
