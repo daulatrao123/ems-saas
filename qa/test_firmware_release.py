@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +101,63 @@ class ReleaseContract(unittest.TestCase):
         busy = rel.install_decision(approved, device, {"id": "op-1", "state": "INSTALLING", "firmware_version": "7.1.0"})
         self.assertFalse(busy["install_allowed"])
         self.assertEqual(busy["operation_id"], "op-1")
+        same = rel.install_decision(dict(approved, version="7.0.0", notes="Controller Reliability Update"), device, None)
+        self.assertEqual(same["reason"], "VERSION_ALREADY_RUNNING")
+        self.assertEqual(same["available_firmware"], "7.0.0")
+        self.assertFalse(same["install_allowed"])
+        older = rel.install_decision(approved, device, None)
+        self.assertEqual(older["status"], "UPDATE_AVAILABLE")
+        self.assertEqual(older["release_notes"], "notes")
+
+    def test_maintenance_window_boundaries(self):
+        tz = "Asia/Kolkata"
+        day = datetime(2026, 10, 5, tzinfo=rel.ZoneInfo(tz))
+        closed = day.replace(hour=1, minute=59)
+        opened = day.replace(hour=2, minute=0)
+        late = day.replace(hour=3, minute=59)
+        shut = day.replace(hour=4, minute=0)
+        self.assertFalse(rel.maintenance_window_open(closed))
+        self.assertTrue(rel.maintenance_window_open(opened))
+        self.assertTrue(rel.maintenance_window_open(late))
+        self.assertFalse(rel.maintenance_window_open(shut))
+        with self.assertRaises(ValueError):
+            rel.parse_maintenance_clock("01:59")
+        with self.assertRaises(ValueError):
+            rel.parse_maintenance_clock("04:00")
+        self.assertEqual(rel.parse_maintenance_clock("02:00"), (2, 0))
+        self.assertEqual(rel.parse_maintenance_clock("03:59"), (3, 59))
+        scheduled = rel.scheduled_instant("2026-10-05", "02:00", tz)
+        one_minute_early = datetime(2026, 10, 4, 20, 29, tzinfo=timezone.utc)
+        at_open = datetime(2026, 10, 4, 20, 30, tzinfo=timezone.utc)
+        at_close = datetime(2026, 10, 4, 22, 30, tzinfo=timezone.utc)
+        self.assertFalse(rel.activation_permitted(one_minute_early, scheduled, tz))
+        self.assertTrue(rel.activation_permitted(at_open, scheduled, tz))
+        self.assertFalse(rel.activation_permitted(at_close, scheduled, tz))
+        self.assertTrue(rel.defer_pending_update(at_close, scheduled, tz, "SCHEDULED"))
+        self.assertFalse(rel.defer_pending_update(at_open, scheduled, tz, "SCHEDULED"))
+        next_window = datetime(2026, 10, 5, 20, 30, tzinfo=timezone.utc)
+        self.assertTrue(rel.activation_permitted(next_window, scheduled, tz))
+        other = rel.scheduled_instant("2026-10-06", "02:30", tz)
+        self.assertTrue(rel.activation_permitted(at_open, scheduled, tz))
+        self.assertFalse(rel.activation_permitted(at_open, other, tz))
+        self.assertNotEqual(scheduled, other)
+
+    def test_schedule_authorization_and_activation_gate(self):
+        cloud = (ROOT / "backend" / "firmware_ota.py").read_text(encoding="utf-8")
+        controller = (ROOT / "pi_firmware" / "ems_controller.py").read_text(encoding="utf-8")
+        ui = (ROOT / "frontend" / "src" / "components" / "ops" / "FirmwareUpdate.tsx").read_text(encoding="utf-8")
+        self.assertIn('require_role("super_admin")', cloud)
+        self.assertIn("This role cannot schedule firmware", cloud)
+        self.assertIn("OUTSIDE_MAINTENANCE_WINDOW", cloud)
+        self.assertIn("ota_operations (id, device_id", cloud)
+        self.assertIn("WHERE device_id=%s AND state = ANY(%s)", cloud)
+        self.assertLess(controller.index("maintenance_window_open"), controller.index("activate_staged"))
+        self.assertIn("outside the 02:00-04:00 maintenance window", controller)
+        self.assertNotIn("Update Now", ui)
+        self.assertNotIn("firmware/install", ui)
+        mapped = cloud.split("_STATE_FROM_PI", 1)[1].split("}", 1)[0]
+        self.assertNotIn("OFFLINE", mapped)
+        self.assertIn('"ACTIVE": "SUCCESS"', cloud)
 
 
 class SimulatedSlot(unittest.TestCase):

@@ -6,17 +6,19 @@ const path = require("node:path");
 
 const read = (rel) => fs.readFileSync(path.join(__dirname, "..", rel), "utf8");
 
-test("install firmware opens the existing confirmation dialog before any request", () => {
+test("firmware update is scheduled inside the maintenance window and has no immediate install action", () => {
   const src = read("frontend/src/components/ops/FirmwareUpdate.tsx");
-  assert.match(src, /Install firmware update\?/);
-  assert.match(src, /severity: "DANGER"/);
-  assert.match(src, /onConfirm: install/);
-  assert.match(src, /api\.post\(`\/api\/admin\/devices\/\$\{deviceId\}\/firmware\/install`/);
-  assert.doesNotMatch(src, /onClick=\{[^}]*api\.post/);
-  assert.match(src, /from "\.\/ConfirmDialog"/);
-  const dialog = read("frontend/src/components/ops/ConfirmDialog.tsx");
-  assert.match(dialog, /cancelRef\.current\?\.focus\(\)/);
-  assert.match(dialog, /requestCancel/);
+  assert.match(src, /Firmware update available/);
+  assert.match(src, /Latest firmware installed/);
+  assert.match(src, /firmware-view/);
+  assert.match(src, /firmware-notes/);
+  assert.match(src, /min="02:00"/);
+  assert.match(src, /max="03:59"/);
+  assert.match(src, /\/firmware\/schedule/);
+  assert.doesNotMatch(src, /Update Now/);
+  assert.doesNotMatch(src, /Install Firmware/);
+  assert.doesNotMatch(src, /firmware\/install/);
+  assert.doesNotMatch(src, /Improved OFF ALL/);
 });
 
 test("dashboard mounts one firmware panel through the shared confirmation state", () => {

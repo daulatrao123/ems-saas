@@ -8,19 +8,27 @@ type Release = { version: string; hardware_profile: string; status: string; pack
 export function FirmwareReleases() {
   const [rows, setRows] = useState<Release[]>([]);
   const [manifest, setManifest] = useState("");
+  const [title, setTitle] = useState("");
+  const [notes, setNotes] = useState("");
   const [error, setError] = useState("");
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const load = () => api.get("/api/super-admin/firmware/releases").then((res) => setRows(res.data.releases || [])).catch(() => setError("Firmware releases unavailable"));
   useEffect(() => { void load(); }, []);
   const create = async () => {
     const parsed = JSON.parse(manifest);
-    await api.post("/api/super-admin/firmware/releases", { manifest: parsed });
+    const published = [title.trim(), notes.trim()].filter(Boolean).join("\n\n");
+    if (published) parsed.notes = published;
+    await api.post("/api/super-admin/firmware/releases", { manifest: parsed, notes: published || parsed.notes || "" });
     setManifest("");
+    setTitle("");
+    setNotes("");
     await load();
   };
   return <section data-testid="firmware-releases" className="rounded-xl border border-gray-800 bg-gray-900/80 p-5 space-y-3">
     <h3 className="text-sm font-bold text-white">Firmware releases</h3>
-    <p className="text-[11px] text-gray-500">A release stays DRAFT until it is approved. Society admins can install only an approved release, and only on a device that already runs the multi-file OTA agent.</p>
+    <p className="text-[11px] text-gray-500">A release stays DRAFT until a super admin approves it. Society admins can view the published notes and schedule an update. They cannot upload or publish firmware. Activation stays inside 02:00 AM – 04:00 AM.</p>
+    <input data-testid="firmware-title" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Release title" className="w-full rounded-md border border-gray-700 bg-gray-950 p-2 text-xs text-gray-100" />
+    <textarea data-testid="firmware-release-notes" value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="What changed, bug fixes, reliability and compatibility notes" className="min-h-24 w-full rounded-md border border-gray-700 bg-gray-950 p-2 text-xs text-gray-100" />
     <textarea data-testid="firmware-manifest" value={manifest} onChange={(event) => setManifest(event.target.value)} placeholder="Signed release manifest JSON" className="min-h-28 w-full rounded-md border border-gray-700 bg-gray-950 p-2 font-mono text-xs text-gray-100" />
     <button type="button" data-testid="firmware-create" disabled={!manifest.trim()} className="rounded-md border border-amber-500/40 px-3 py-2 text-xs font-bold text-amber-200"
       onClick={() => setConfirm({

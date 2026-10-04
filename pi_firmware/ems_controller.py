@@ -812,6 +812,9 @@ class EMSController:
         if isinstance(offer, dict):
             operation_id = str(offer.get("operation_id") or "")
             desired = str(offer.get("firmware_version") or "").strip()
+            self._ota_timezone = str(offer.get("timezone") or firmware_release.DEFAULT_TIMEZONE)
+            if offer.get("activate") is False:
+                return
             pending = ota_manager.pending_info()
             if not operation_id or not desired or desired == self.firmware_version or self._restart_for_ota or not self._boot_confirmed:
                 return
@@ -835,6 +838,16 @@ class EMSController:
         self._ota_manifest = None
         self._ota_requested = desired
 
+    def _ota_activation_allowed(self):
+        """Fail closed. The device clock is interpreted in the society timezone from the cloud offer."""
+        from zoneinfo import ZoneInfo
+        tz_name = getattr(self, "_ota_timezone", None) or firmware_release.DEFAULT_TIMEZONE
+        try:
+            local_now = datetime.now(ZoneInfo(str(tz_name)))
+        except Exception:
+            return False
+        return firmware_release.maintenance_window_open(local_now)
+
     def _run_ota_if_requested(self):
         """Runs from the main loop only when no command is executing. One attempt per call."""
         version = self._ota_requested
@@ -842,6 +855,9 @@ class EMSController:
             return
         self._ota_requested = None
         if self.state.system_state != SystemState.READY:
+            return
+        if not self._ota_activation_allowed():
+            logger.critical("OTA %s refused: outside the 02:00-04:00 maintenance window.", version)
             return
         try:
             manifest = getattr(self, "_ota_manifest", None) or self.api.download_firmware(version)

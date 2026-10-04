@@ -13,6 +13,8 @@ import base64
 import hashlib
 import json
 import posixpath
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 AGENT = "multi-file-v1"
 SCHEMA_VERSION = 1
@@ -44,8 +46,12 @@ ENERGY_FILES = (
 )
 REQUIRED = TOP_LEVEL + ENERGY_FILES
 ALLOWED = frozenset(REQUIRED)
-IN_PROGRESS = frozenset({"REQUESTED", "DOWNLOADING", "VERIFYING", "STAGED", "INSTALLING", "RESTARTING", "HEALTH_CHECK", "ROLLING_BACK"})
-TERMINAL = frozenset({"SUCCESS", "FAILED", "ROLLED_BACK"})
+IN_PROGRESS = frozenset({"REQUESTED", "SCHEDULED", "WAITING", "DEFERRED", "DOWNLOADING", "VERIFYING", "STAGED", "INSTALLING", "RESTARTING", "HEALTH_CHECK", "ROLLING_BACK"})
+TERMINAL = frozenset({"SUCCESS", "FAILED", "ROLLED_BACK", "CANCELLED"})
+MAINTENANCE_OPEN_MINUTES = 2 * 60
+MAINTENANCE_CLOSE_MINUTES = 4 * 60
+DEFAULT_TIMEZONE = "Asia/Kolkata"
+PENDING_SCHEDULE = frozenset({"SCHEDULED", "WAITING", "DEFERRED"})
 RELEASE_STATUS = frozenset({"DRAFT", "APPROVED", "REVOKED"})
 
 
@@ -227,3 +233,52 @@ def install_decision(release: dict | None, device: dict, operation: dict | None)
         "reason": "",
     })
     return base
+
+
+def maintenance_window_open(local_dt) -> bool:
+    """02:00 inclusive through 04:00 exclusive in the supplied local clock."""
+    minutes = int(local_dt.hour) * 60 + int(local_dt.minute)
+    return MAINTENANCE_OPEN_MINUTES <= minutes < MAINTENANCE_CLOSE_MINUTES
+
+
+def parse_maintenance_clock(time_text: str) -> tuple[int, int]:
+    hour_text, minute_text = str(time_text or "").strip().split(":")
+    hour, minute = int(hour_text), int(minute_text)
+    if minute < 0 or minute > 59 or hour < 0 or hour > 23:
+        raise ValueError("OUTSIDE_MAINTENANCE_WINDOW")
+    if not maintenance_window_open(datetime(2026, 1, 1, hour, minute)):
+        raise ValueError("OUTSIDE_MAINTENANCE_WINDOW")
+    return hour, minute
+
+
+def scheduled_instant(date_text: str, time_text: str, tz_name: str = DEFAULT_TIMEZONE) -> datetime:
+    hour, minute = parse_maintenance_clock(time_text)
+    year, month, day = (int(part) for part in str(date_text).split("-"))
+    local = datetime(year, month, day, hour, minute, tzinfo=ZoneInfo(tz_name or DEFAULT_TIMEZONE))
+    return local.astimezone(timezone.utc)
+
+
+def activation_permitted(now_utc: datetime, scheduled_for_utc: datetime | None, tz_name: str = DEFAULT_TIMEZONE) -> bool:
+    """A new activation may start only inside the device-local maintenance window, and not before it was scheduled."""
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    if scheduled_for_utc is not None:
+        if scheduled_for_utc.tzinfo is None:
+            scheduled_for_utc = scheduled_for_utc.replace(tzinfo=timezone.utc)
+        if now_utc < scheduled_for_utc:
+            return False
+    local = now_utc.astimezone(ZoneInfo(tz_name or DEFAULT_TIMEZONE))
+    return maintenance_window_open(local)
+
+
+def defer_pending_update(now_utc: datetime, scheduled_for_utc: datetime | None, tz_name: str, state: str) -> bool:
+    """The scheduled window passed without activation. This is not success."""
+    if state not in PENDING_SCHEDULE or scheduled_for_utc is None:
+        return False
+    if activation_permitted(now_utc, scheduled_for_utc, tz_name):
+        return False
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    if scheduled_for_utc.tzinfo is None:
+        scheduled_for_utc = scheduled_for_utc.replace(tzinfo=timezone.utc)
+    return now_utc >= scheduled_for_utc
