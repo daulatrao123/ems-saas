@@ -43,6 +43,7 @@ FIRMWARE_FILES = (
     "api_client.py",
     "config.py",
     "config_hash.py",
+    "device_obs.py",
     "hardware_capabilities.py",
     "gpio_manager.py",
     "gpio_input_diag.py",
@@ -162,6 +163,8 @@ REQUIRED_FILES=(
   "firmware/api_client.py"
   "firmware/config.py"
   "firmware/config_hash.py"
+  "firmware/device_obs.py"
+  "firmware/firmware_release.py"
   "firmware/hardware_capabilities.py"
   "firmware/gpio_manager.py"
   "firmware/logger.py"
@@ -637,6 +640,8 @@ firmware/
   memory_manager.py
   offline_queue.py
   ota_manager.py
+  firmware_release.py
+  device_obs.py
   resource_guard.py
   smart_health.py
   state.py
@@ -651,6 +656,11 @@ systemd/
   ems-reboot.path
   ems-reboot.service
 """
+
+
+def validate_runtime_sources() -> None:
+    """Refuse package generation before any credential work if the runtime tree is incomplete."""
+    _validate_source_files()
 
 
 def _validate_source_files() -> None:

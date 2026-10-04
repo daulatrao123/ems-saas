@@ -17,6 +17,11 @@ class PreflightError(ValueError):
     pass
 
 
+# Import names used when the shipped controller and ota_manager load.
+# cryptography is imported by ota_manager at module import, which ems_controller does at startup.
+REQUIRED_PYTHON_MODULES = ("requests", "gpiozero", "lgpio", "minimalmodbus", "serial", "cryptography")
+
+
 def ota_conflicts(data_mount):
     root = Path(data_mount) / "ota"
     candidates = [root / "active.json", root / "meta.json", root / "slot_a", root / "slot_b"]
@@ -65,14 +70,17 @@ def check_installation(package, data_mount, firmware_dest, *, layout_only=False)
         source = package / "firmware" / part
         if source.is_symlink():
             raise PreflightError("Runtime symlinks are not supported.")
-        digest.update(name.encode() + b"\0" + source.read_bytes())
+        try:
+            content = source.read_bytes()
+        except OSError as exc:
+            raise PreflightError("Package is incomplete, missing firmware/" + name) from exc
+        digest.update(name.encode() + b"\0" + content)
     if digest.hexdigest() != info.get("runtime_sha256"):
         raise PreflightError("Runtime build fingerprint mismatch.")
     if not layout_only:
         check_storage(findmnt_value(data_mount, "FSTYPE"), findmnt_value(data_mount, "UUID"),
                       findmnt_value(data_mount, "UUID", fstab=True))
-        missing = [m for m in ("requests", "gpiozero", "lgpio", "minimalmodbus", "serial")
-                   if importlib.util.find_spec(m) is None]
+        missing = [m for m in REQUIRED_PYTHON_MODULES if importlib.util.find_spec(m) is None]
         if missing:
             raise PreflightError("Required Python dependencies unavailable: " + ", ".join(missing) + ". Prepare them separately; hardware libraries were not imported.")
         parent = firmware_dest.parent

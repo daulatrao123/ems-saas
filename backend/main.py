@@ -16,7 +16,7 @@ import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
-from provisioning import build_provisioning_zip, service_unit_sha256
+from provisioning import build_provisioning_zip, service_unit_sha256, validate_runtime_sources
 from energy_api import ingest as energy_ingest
 import health_read_model
 from energy_api.routes import create_router as create_energy_router
@@ -1087,6 +1087,7 @@ def provisioning_package(device_id: str, request: Request, user: dict = Depends(
     """Rotate the device credential (old key stops working) and return a ZIP installer containing the
     NEW key. The secret exists only in the ZIP body: not in JSON, not in logs, not in audit_log."""
     device_id = require_uuid(device_id, "device_id")
+    validate_runtime_sources()
     api_url = os.environ.get("EMS_PUBLIC_API_URL") or (str(request.base_url).rstrip("/") + "/api")
     conn = get_db()
     try:

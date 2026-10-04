@@ -18,6 +18,13 @@ from backend import provisioning as package
 from backend import provisioning_preflight as preflight
 
 
+def _bash():
+    git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+    if git_bash.is_file():
+        return str(git_bash)
+    return "bash"
+
+
 class ProvisioningP0Tests(unittest.TestCase):
     def setUp(self):
         guard = patch.object(socket, "socket", side_effect=AssertionError("Network forbidden"))
@@ -79,7 +86,7 @@ class ProvisioningP0Tests(unittest.TestCase):
     def test_installer_syntax_safe_order_no_deletion_or_storage_bootstrap(self):
         shell = self.archive.read(package.ROOT + "/install.sh").decode()
         # Parser only: absolutely no bash execution of the script.
-        parsed = subprocess.run(["bash", "-n"], input=shell, text=True, capture_output=True, check=False)
+        parsed = subprocess.run([_bash(), "-n"], input=shell, text=True, capture_output=True, check=False)
         self.assertEqual(parsed.returncode, 0, parsed.stderr)
         first = shell.index('/usr/bin/python3 "$HERE/tools/preflight.py"')
         stage = shell.index('STAGE="$(mktemp')
@@ -115,13 +122,15 @@ class ProvisioningP0Tests(unittest.TestCase):
         if corrupt: files["/pkg/firmware/ems_controller.py"] += b"\n# corrupted fixture\n"
         dirs = {"/", "/opt", "/opt/ems"} | ({"/data"} if data_exists else set())
         if ota: dirs.add("/data/ota/" + ota)
-        def read_bytes(path): return files[str(path)]
-        with patch.object(Path, "exists", lambda p: str(p) in dirs or str(p) in files), \
-             patch.object(Path, "is_dir", lambda p: str(p) in dirs), \
-             patch.object(Path, "is_symlink", lambda p: str(p) == symlink), \
+        def key(path):
+            return Path(str(path)).as_posix()
+        def read_bytes(path): return files[key(path)]
+        with patch.object(Path, "exists", lambda p: key(p) in dirs or key(p) in files), \
+             patch.object(Path, "is_dir", lambda p: key(p) in dirs), \
+             patch.object(Path, "is_symlink", lambda p: key(p) == symlink), \
              patch.object(Path, "read_bytes", read_bytes), \
              patch.object(Path, "read_text", lambda p: read_bytes(p).decode()), \
-             patch.object(Path, "stat", lambda p: SimpleNamespace(st_size=len(files[str(p)]))), \
+             patch.object(Path, "stat", lambda p: SimpleNamespace(st_size=len(files[key(p)]))), \
              patch.object(preflight, "findmnt_value", side_effect=lambda p, field, **kw: "ext4" if field == "FSTYPE" else "uuid-a"), \
              patch.object(preflight.importlib.util, "find_spec", side_effect=lambda name: None if name == missing_module else object()), \
              patch.object(preflight.shutil, "disk_usage", return_value=SimpleNamespace(free=free)):
@@ -140,7 +149,7 @@ class ProvisioningP0Tests(unittest.TestCase):
                 self.check_memory_layout(**params)
 
     def test_missing_dependencies_or_low_space_cannot_proceed(self):
-        for name in ("requests", "gpiozero", "lgpio", "minimalmodbus", "serial"):
+        for name in ("requests", "gpiozero", "lgpio", "minimalmodbus", "serial", "cryptography"):
             with self.subTest(name=name), self.assertRaisesRegex(preflight.PreflightError, "dependencies unavailable"):
                 self.check_memory_layout(missing_module=name)
         with self.assertRaisesRegex(preflight.PreflightError, "Insufficient space"):
