@@ -4,9 +4,11 @@ No live database. AllocationPolicy and energy_calculation_mode are not exercised
 """
 from __future__ import annotations
 
+import ast
 import logging
 import sys
 import tempfile
+import types
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -21,7 +23,7 @@ from energy_api import day_allocation as DA  # noqa: E402
 from energy_api.routes import create_router  # noqa: E402
 from config_hash import canonical_device_config  # noqa: E402
 from energy.allocation import verified_active  # noqa: E402
-from energy.day_based import DayBasedStrategy  # noqa: E402
+from energy.day_based import DayBasedStrategy, scheduled_usage  # noqa: E402
 from energy.meter_manager import EnergyEngine  # noqa: E402
 
 DID = "22222222-2222-2222-2222-222222222222"
@@ -53,6 +55,29 @@ class CycleMath(unittest.TestCase):
         with self.assertRaises(ValueError):
             DA.resolve_days("DAYS", {"A": True, "B": 12, "D": 8}, enabled, 30)
         self.assertEqual(DA.resolve_days("DAYS", {"A": 0, "B": 0, "C": 0, "D": 0}, ["A", "B", "C", "D"], 0), {"A": 0, "B": 0, "C": 0, "D": 0})
+
+    def test_scheduled_usage_counts_started_days_without_feedback(self):
+        days = {"A": 9, "B": 12, "C": 9, "D": 0}
+        enabled = ["A", "B", "C", "D"]
+        def abc(day):
+            usage = scheduled_usage(date(2026, 10, day), 1, days, enabled)
+            return {wing: usage[wing] for wing in "ABC"}
+
+        self.assertEqual(abc(1), {"A": 1, "B": 0, "C": 0})
+        self.assertEqual(abc(5), {"A": 5, "B": 0, "C": 0})
+        self.assertEqual(scheduled_usage(date(2026, 10, 9), 1, days, enabled)["A"], 9)
+        self.assertEqual(abc(9), {"A": 9, "B": 0, "C": 0})
+        self.assertEqual(abc(10), {"A": 9, "B": 1, "C": 0})
+        self.assertEqual(abc(21), {"A": 9, "B": 12, "C": 0})
+        self.assertEqual(abc(22), {"A": 9, "B": 12, "C": 1})
+        self.assertEqual(abc(30), {"A": 9, "B": 12, "C": 9})
+        self.assertEqual(scheduled_usage("2026-10-05", 1, days, enabled), scheduled_usage(date(2026, 10, 5), 1, days, enabled))
+        self.assertEqual(scheduled_usage(date(2026, 10, 5), 1, days, enabled)["D"], 0)
+        again = scheduled_usage(date(2026, 10, 5), 1, days, enabled)
+        self.assertEqual(again, scheduled_usage(date(2026, 10, 5), 1, days, enabled))
+        skipped = scheduled_usage(date(2026, 10, 10), 1, days, ["A", "C"])
+        self.assertEqual(skipped, {"A": 9, "C": 1})
+        self.assertNotIn("B", skipped)
 
     def test_schedule_and_status(self):
         days = {"A": 10, "B": 12, "C": 8}
@@ -267,6 +292,33 @@ class DayStrategy(unittest.TestCase):
             wings["A"]["target_days"] = 30
             decision = strategy.evaluate({"operating_date": "2026-04-20", "reset_day": 15, "verified_active": "UNKNOWN", "wings": wings})
             self.assertIsNone(decision["action"])
+            installed = strategy.evaluate({"operating_date": "2026-04-20", "reset_day": 15, "verified_active": "UNKNOWN", "feedback_hardware_installed": True, "wings": wings})
+            self.assertIsNone(installed["action"])
+
+    def test_no_feedback_hardware_follows_calendar_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            strategy = DayBasedStrategy(str(Path(tmp) / "day_based.json"), lambda: True)
+            wings = {code: {"ems_enabled": True, "target_days": {"A": 9, "B": 12, "C": 9, "D": 0}[code]} for code in "ABCD"}
+            ctx = {"operating_date": "2026-10-05", "reset_day": 1, "verified_active": "UNKNOWN", "feedback_hardware_installed": False, "wings": wings}
+            first = strategy.evaluate(ctx)
+            self.assertEqual(first["action"], "ACTIVATE")
+            self.assertEqual(first["slot"], "A")
+            self.assertEqual(strategy.after_execution("ACTIVATE", "A", False, "UNKNOWN", feedback_hardware_installed=False), [])
+            self.assertIsNone(strategy.state["last_applied"])
+            strategy.after_execution("ACTIVATE", "A", True, "UNKNOWN", feedback_hardware_installed=False)
+            self.assertEqual(strategy.state["last_applied"], "A")
+            self.assertIsNone(strategy.evaluate(ctx)["action"])
+            held = strategy.after_execution("ACTIVATE", "A", True, "UNKNOWN")
+            self.assertEqual(held, [])
+            self.assertEqual(strategy.state["last_applied"], "A")
+            nxt = strategy.evaluate({**ctx, "operating_date": "2026-10-10"})
+            self.assertEqual(nxt["action"], "DEACTIVATE")
+            self.assertEqual(nxt["slot"], "A")
+            strategy.after_execution("DEACTIVATE", "A", True, "UNKNOWN", feedback_hardware_installed=False)
+            self.assertIsNone(strategy.state["last_applied"])
+            activated = strategy.evaluate({**ctx, "operating_date": "2026-10-10"})
+            self.assertEqual(activated["action"], "ACTIVATE")
+            self.assertEqual(activated["slot"], "B")
 
 
 class _BatchCursor:
@@ -379,6 +431,17 @@ class DayFeedbackScope(unittest.TestCase):
                 decision = engine.evaluate_allocation("READY", self.wings(disabled or " "))
                 self.assertIsNone(decision["action"], feedback)
 
+    def test_no_feedback_hardware_commands_the_scheduled_wing(self):
+        feedback = {code: "UNKNOWN" for code in "ABCD"}
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self.engine(tmp, feedback)
+            decision = engine.evaluate_allocation("READY", self.wings(), feedback_hardware_installed=False)
+            self.assertEqual(decision["action"], "ACTIVATE")
+            self.assertEqual(decision["slot"], "A")
+            engine.allocation_result("ACTIVATE", "A", True)
+            self.assertEqual(engine.day_strategy.state["last_applied"], "A")
+            self.assertIsNone(engine.evaluate_allocation("READY", self.wings(), feedback_hardware_installed=False)["action"])
+
     def test_auto_still_uses_every_wing_and_the_allocation_policy(self):
         feedback = {"A": "OFF", "B": "OFF", "C": "OFF", "D": "UNKNOWN"}
         self.assertEqual(verified_active(feedback), "UNKNOWN")
@@ -423,6 +486,117 @@ class ContractText(unittest.TestCase):
         slots["A"]["target_days"] = 0
         after = canonical_device_config("EMS-4CH-v1", False, 15, slots)
         self.assertEqual(after["slots"]["A"]["target_days"], 0)
+
+
+def _controller_method(name, clock=None):
+    source = (ROOT / "pi_firmware" / "ems_controller.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "EMSController":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == name:
+                    segment = ast.get_source_segment(source, item)
+                    namespace = {"SUPPORTED_SLOTS": ("A", "B", "C", "D"), "datetime": clock or datetime}
+                    exec(segment, namespace)
+                    return namespace[name]
+    raise AssertionError(name)
+
+
+class _UsageSlot:
+    def __init__(self, feedback="OFF"):
+        self.used_days = 0
+        self.feedback_state = types.SimpleNamespace(value=feedback)
+
+
+class _UsageState:
+    def __init__(self):
+        self.slots = {code: _UsageSlot() for code in "ABCD"}
+        self.last_usage_date = None
+        self.last_reset_period = "2026-09"
+        self.active_slot = None
+        self.saves = 0
+
+    def save_state(self, immediate=False):
+        self.saves += 1
+        return True
+
+    def set_last_usage_date(self, value, immediate=False):
+        self.last_usage_date = str(value) if value else None
+        self.save_state(immediate)
+
+    def set_last_reset_period(self, value, immediate=False):
+        self.last_reset_period = value
+        self.save_state(immediate)
+
+    def reset_days(self, immediate=False):
+        for slot in self.slots.values():
+            slot.used_days = 0
+        self.save_state(immediate)
+
+    def increment_used_day(self, slot_code, immediate=False):
+        self.slots[slot_code].used_days += 1
+        self.save_state(immediate)
+
+
+class DayBasedUsageAccounting(unittest.TestCase):
+    def controller(self, installed, mode, feedback="OFF"):
+        state = _UsageState()
+        for slot in state.slots.values():
+            slot.feedback_state = types.SimpleNamespace(value=feedback)
+        ctl = types.SimpleNamespace(
+            device_config={
+                "feedback_hardware_installed": installed,
+                "reset_day": 1,
+                "slots": {code: {"disabled": code == "D", "target_days": {"A": 9, "B": 12, "C": 9, "D": 0}[code]} for code in "ABCD"},
+            },
+            energy=types.SimpleNamespace(config={"allocation_mode": mode}),
+            state=state,
+            _last_usage_day=None,
+        )
+        for name in ("_day_based_calendar_usage", "_apply_unverified_day_usage", "_slot_visible", "_update_daily_usage"):
+            setattr(ctl, name, types.MethodType(_controller_method(name), ctl))
+        return ctl
+
+    def test_no_feedback_day_based_stores_calendar_usage_and_does_not_increment_per_call(self):
+        ctl = self.controller(False, "DAY_BASED")
+        apply_usage = _controller_method("_apply_unverified_day_usage")
+        self.assertNotIn("increment_used_day", apply_usage.__code__.co_names)
+        self.assertNotIn("feedback_state", apply_usage.__code__.co_names)
+        self.assertTrue(ctl._apply_unverified_day_usage(date(2026, 10, 5)))
+        self.assertEqual({code: ctl.state.slots[code].used_days for code in "ABC"}, {"A": 5, "B": 0, "C": 0})
+        saves = ctl.state.saves
+        self.assertFalse(ctl._apply_unverified_day_usage(date(2026, 10, 5)))
+        self.assertEqual(ctl.state.slots["A"].used_days, 5)
+        self.assertEqual(ctl.state.saves, saves)
+        clock = type("Clock", (), {"now": staticmethod(lambda tz=None: datetime(2026, 10, 5, 12, tzinfo=timezone.utc))})
+        ctl._update_daily_usage = types.MethodType(_controller_method("_update_daily_usage", clock), ctl)
+        ctl.state.slots["A"].used_days = 0
+        ctl._last_usage_day = None
+        ctl._update_daily_usage()
+        self.assertEqual(ctl.state.slots["A"].used_days, 5)
+        after = ctl.state.saves
+        ctl._update_daily_usage()
+        self.assertEqual(ctl.state.slots["A"].used_days, 5)
+        self.assertEqual(ctl.state.saves, after)
+
+    def test_feedback_installed_still_counts_only_a_verified_on_day(self):
+        ctl = self.controller(True, "DAY_BASED", feedback="ON")
+        ctl.state.active_slot = "A"
+        ctl._update_daily_usage()
+        self.assertEqual(ctl.state.slots["A"].used_days, 1)
+        ctl._update_daily_usage()
+        self.assertEqual(ctl.state.slots["A"].used_days, 1)
+        off = self.controller(True, "DAY_BASED", feedback="OFF")
+        off.state.active_slot = "A"
+        off._update_daily_usage()
+        self.assertEqual(off.state.slots["A"].used_days, 0)
+
+    def test_auto_and_manual_without_feedback_do_not_use_the_calendar(self):
+        for mode in ("AUTO", "MANUAL"):
+            ctl = self.controller(False, mode)
+            ctl.state.active_slot = "A"
+            ctl._update_daily_usage()
+            self.assertEqual({code: ctl.state.slots[code].used_days for code in "ABC"}, {"A": 0, "B": 0, "C": 0}, mode)
 
 
 if __name__ == "__main__":

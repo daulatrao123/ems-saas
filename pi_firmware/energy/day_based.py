@@ -50,6 +50,36 @@ def scheduled_wing(days, index, enabled):
     return None
 
 
+def scheduled_usage(operating_date, reset_day, days, enabled):
+    """Days started in this cycle for each enabled wing, including the current cycle day.
+
+    No contactor reading is consulted. Disabled wings are omitted. An enabled wing
+    with no positive target is 0. The current day counts as soon as it starts.
+    """
+    if isinstance(operating_date, str):
+        operating_date = date.fromisoformat(operating_date)
+    index = cycle_day_index(operating_date, reset_day)
+    usage = {}
+    cursor = 1
+    for wing in WINGS:
+        if wing not in enabled:
+            continue
+        count = int(days.get(wing, 0) or 0)
+        if count <= 0:
+            usage[wing] = 0
+            continue
+        start = cursor
+        end = cursor + count - 1
+        cursor += count
+        if index < start:
+            usage[wing] = 0
+        elif index > end:
+            usage[wing] = count
+        else:
+            usage[wing] = index - start + 1
+    return usage
+
+
 def _written_form(state):
     """Bytes-equivalent form of the dict atomic_write_json would store."""
     return json.dumps(state, separators=(",", ":"))
@@ -97,7 +127,8 @@ class DayBasedStrategy:
         operating_date = ctx["operating_date"]
         if self.state.get("operating_date") != operating_date:
             self._save_state(operating_date=operating_date, paused=False, scheduled=None)
-        if self.state.get("paused"):
+        # Pause is a verified-feedback override. Without feedback hardware the calendar stays in charge.
+        if self.state.get("paused") and ctx.get("feedback_hardware_installed", True) is not False:
             return {"action": None, "slot": None, "events": events}
         enabled, days = [], {}
         for wing in WINGS:
@@ -112,6 +143,8 @@ class DayBasedStrategy:
             return {"action": None, "slot": None, "events": events}
         scheduled = scheduled_wing(days, index, enabled)
         self._save_state(scheduled=scheduled)
+        if ctx.get("feedback_hardware_installed", True) is False:
+            return self._command_from_calendar(scheduled, events)
         verified = ctx.get("verified_active")
         if verified in ("MULTIPLE", "UNKNOWN"):
             return {"action": None, "slot": None, "events": events}
@@ -126,7 +159,30 @@ class DayBasedStrategy:
         events.append(("energy_allocation_paused", f"DAY_BASED manual override verified={verified or 'NONE'} scheduled={scheduled or 'NONE'}"))
         return {"action": None, "slot": None, "events": events}
 
-    def after_execution(self, action, slot, success, verified_now):
+    def _command_from_calendar(self, scheduled, events):
+        """No feedback hardware: follow the schedule through the existing ACTIVATE/DEACTIVATE actions.
+
+        last_applied is the last successful command, not a contactor reading. A different
+        scheduled wing deactivates the previous wing first; the next evaluation activates it.
+        """
+        last = self.state.get("last_applied")
+        if last == scheduled:
+            return {"action": None, "slot": None, "events": events}
+        if last:
+            return {"action": "DEACTIVATE", "slot": last, "events": events}
+        if scheduled:
+            return {"action": "ACTIVATE", "slot": scheduled, "events": events}
+        return {"action": None, "slot": None, "events": events}
+
+    def after_execution(self, action, slot, success, verified_now, feedback_hardware_installed=True):
+        if feedback_hardware_installed is False:
+            if action == "ACTIVATE" and success:
+                self._save_state(last_applied=slot)
+                return [("energy_allocation_transition_verified", f"day-based wing {slot} commanded")]
+            if action == "DEACTIVATE" and success:
+                self._save_state(last_applied=None)
+                return [("energy_allocation_transition_verified", f"day-based wing {slot} commanded OFF")]
+            return []
         if action == "ACTIVATE" and success and verified_now == slot:
             self._save_state(last_applied=slot)
             return [("energy_allocation_transition_verified", f"day-based wing {slot} verified")]

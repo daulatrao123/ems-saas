@@ -5,7 +5,7 @@ import { QueueFn, SlotConfigFn } from "./useOperations";
 import { btn, input, label, panel, tone } from "./DashboardHeader";
 import { LastResponse } from "./LastResponse";
 import { WingEnergyCard } from "./energy/WingEnergyCard";
-import { AllocationMode, allocationVisibility, dayBasedPresentation } from "./allocationMode";
+import { AllocationMode, DayBasedWingPresentation, allocationVisibility, dayBasedPresentation } from "./allocationMode";
 import type { Confirm } from "./ConfirmDialog";
 import { AllocationConfig, CalculationMode, ComparisonSeries, WingCode, WingSummary, WINGS } from "./energy/types";
 
@@ -13,6 +13,14 @@ type Props = { device: Device; code: WingCode; slot?: Slot; queue: QueueFn; setS
   lastCmd?: CommandRow; lastResponse?: Response | null; wing?: WingSummary; allocation: AllocationConfig | null; activeGenerationWing?: string; allotmentInput?: ReactNode;
   mode?: CalculationMode; allocationMode: AllocationMode; manualControlLabel: string; comparison?: ComparisonSeries; excessEnabled?: boolean;
   operatingDate?: string | null; resetDay?: number | null };
+function calendarDaysUsed(row: DayBasedWingPresentation | null): number | null {
+  // Includes the cycle day that has already started. Matches pi_firmware scheduled_usage.
+  if (!row || row.assignedDays == null || row.cycleDayIndex == null || row.status === "UNAVAILABLE") return null;
+  if (row.status === "COMPLETED") return row.assignedDays;
+  if (row.status === "CURRENT" && row.completedDays != null) return Math.min(row.assignedDays, row.completedDays + 1);
+  if (row.status === "UPCOMING" || row.status === "EXCLUDED") return 0;
+  return null;
+}
 const telemetry = (v: string | undefined, offline: boolean) => offline ? "UNKNOWN (offline)" : v === "ON" || v === "OFF" ? v : "UNKNOWN";
 const numberOrNull = (v: number | undefined) => v != null && Number.isFinite(v) ? v : null;
 
@@ -68,13 +76,20 @@ export function SlotCard({ device, code, slot, queue, setSlotConfig, isPending, 
 }
 
 // Existing days editing and command evidence remain available, outside energy cards.
-export function SlotOperations({ device, code, slot, queue, isPending, readOnly, ask, lastCmd, lastResponse, allotmentInput }: Pick<Props, "device" | "code" | "slot" | "queue" | "isPending" | "readOnly" | "ask" | "lastCmd" | "lastResponse" | "allotmentInput">) {
+export function SlotOperations({ device, code, slot, queue, isPending, readOnly, ask, lastCmd, lastResponse, allotmentInput, allocationMode = "AUTO", operatingDate = null, resetDay = null }: Pick<Props, "device" | "code" | "slot" | "queue" | "isPending" | "readOnly" | "ask" | "lastCmd" | "lastResponse" | "allotmentInput" | "allocationMode" | "operatingDate" | "resetDay">) {
   const [days, setDays] = useState(String(slot?.target_days ?? ""));
   const [seenTarget, setSeenTarget] = useState(slot?.target_days);
   if (seenTarget !== slot?.target_days) { setSeenTarget(slot?.target_days); setDays(String(slot?.target_days ?? "")); }
   const n = Number(days); const validDays = Number.isInteger(n) && n >= 0 && n <= 31;
-  // used_days is the legacy quota counter. The calendar schedule follows target_days and does not advance this counter.
-  const used = numberOrNull(slot?.used_days), target = numberOrNull(slot?.target_days);
+  // used_days is the legacy quota counter. With feedback hardware it moves only when that wing's contactor feedback is ON.
+  // Day allocation without feedback hardware follows the calendar presentation: a started cycle day counts, with no contactor wait.
+  const calendarAuthority = allocationVisibility(allocationMode).dayAllocation && device.feedback_hardware_installed === false;
+  const scheduled = calendarAuthority ? dayBasedPresentation({
+    operatingDate, resetDay,
+    wings: WINGS.map((wingCode) => ({ wing: wingCode, enabled: device.slots[wingCode]?.disabled === false, assignedDays: device.slots[wingCode]?.target_days })),
+  }).wings.find((row) => row.wing === code) ?? null : null;
+  const calendarUsed = calendarDaysUsed(scheduled);
+  const used = calendarAuthority ? calendarUsed : numberOrNull(slot?.used_days), target = numberOrNull(slot?.target_days);
   const remaining = target != null && used != null ? Math.max(0, target - used) : null;
   const busyDays = isPending(device.id, "set_days", code);
   return (
@@ -85,6 +100,7 @@ export function SlotOperations({ device, code, slot, queue, isPending, readOnly,
         <div><dt className={label}>Used</dt><dd data-testid={`slot-used-${code}`}>{used == null ? "UNAVAILABLE" : `${used} D`}</dd></div>
         <div><dt className={label}>Days Left</dt><dd data-testid={`slot-remaining-${code}`}>{remaining == null ? "UNAVAILABLE" : `${remaining} D`}</dd></div>
       </dl>
+      {calendarAuthority && calendarUsed != null && <p data-testid={`slot-usage-source-${code}`} className="text-[10px] text-gray-500">No contactor feedback installed. Used days follow the calendar schedule.</p>}
       <LastResponse embedded scope={`slot-lastcmd-${code}`} row={lastCmd?.slot === code ? lastCmd : null} last={lastResponse?.slot === code && lastResponse.device_id === device.id ? lastResponse : null} />
       {!readOnly && slot && !slot.disabled && (
         <div className="flex items-center gap-2 border-t border-[#1e2a3a] pt-3">

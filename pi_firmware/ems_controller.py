@@ -940,9 +940,60 @@ class EMSController:
             and not bool(cfg.get("disabled", False))
         )
 
+    def _day_based_calendar_usage(self):
+        """Calendar used-days apply only to DAY_BASED when contactor feedback is not installed."""
+        if bool(self.device_config.get("feedback_hardware_installed", False)):
+            return False
+        config = getattr(getattr(self, "energy", None), "config", None) or {}
+        return str(config.get("allocation_mode") or "AUTO").upper() == "DAY_BASED"
+
+    def _apply_unverified_day_usage(self, operating):
+        """DAY_BASED without feedback hardware: store calendar used-days for this operating date.
+
+        The value comes from the date and reset day, not from how many times this runs.
+        The same date writes the same counters. Does not read contactor feedback.
+        Returns True when a stored counter changed.
+        """
+        from energy.day_based import scheduled_usage
+
+        reset_day = max(1, min(28, int(self.device_config.get("reset_day", 15))))
+        slots = self.device_config.get("slots", {})
+        enabled, days = [], {}
+        for slot in SUPPORTED_SLOTS:
+            cfg = slots.get(slot, {})
+            if bool(cfg.get("disabled", False)):
+                continue
+            enabled.append(slot)
+            days[slot] = int(cfg.get("target_days") or 0)
+        try:
+            usage = scheduled_usage(operating, reset_day, days, enabled)
+        except (TypeError, ValueError):
+            return False
+        changed = False
+        for slot, count in usage.items():
+            slot_state = self.state.slots.get(slot)
+            if slot_state is None:
+                continue
+            count = max(0, int(count))
+            if int(slot_state.used_days) != count:
+                slot_state.used_days = count
+                changed = True
+        if changed:
+            self.state.save_state(immediate=False)
+        return changed
+
     def _update_daily_usage(self):
         now = datetime.now().astimezone()
         marker = now.date().isoformat()
+        if self._day_based_calendar_usage():
+            changed = self._apply_unverified_day_usage(now.date())
+            if self._last_usage_day != marker:
+                self.state.set_last_usage_date(marker, immediate=False)
+                changed = True
+            if changed and self.state.save_state(immediate=True):
+                self._last_usage_day = marker
+            return
+
         if self._last_usage_day == marker:
             return
 
@@ -1522,6 +1573,7 @@ class EMSController:
                 system_state=self.state.system_state.value,
                 wings={s: {"ems_enabled": not bool(self.device_config.get("slots", {}).get(s, {}).get("disabled", True)),
                            "target_days": int(self.device_config.get("slots", {}).get(s, {}).get("target_days") or 0)} for s in SUPPORTED_SLOTS},
+                feedback_hardware_installed=bool(self.device_config.get("feedback_hardware_installed", False)),
             )
         except Exception as exc:
             logger.error("Energy allocation evaluation failed: %s", exc)

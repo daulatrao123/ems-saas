@@ -59,7 +59,8 @@ export function OperationalDashboard({ societyId, readOnly, backHref }: { societ
   const renderDayControls = (inputs: Record<string, ReactNode> = {}, hideSenders = false) => device && (
     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
       {logicalWings.map((c) => <SlotOperations key={`${device.id}:${c}`} device={device} code={c} slot={device.slots[c]} queue={ops.queue} isPending={ops.isPending} readOnly={readOnly || hideSenders} ask={setConfirm}
-        lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} allotmentInput={inputs[c]} />)}
+        lastCmd={lastFor(c)} lastResponse={last?.slot === c ? last : null} allotmentInput={inputs[c]} allocationMode={allocationMode}
+        operatingDate={energy.summary?.as_of_operating_date ?? null} resetDay={energy.summary?.reset_day ?? null} />)}
     </div>
   );
   return (

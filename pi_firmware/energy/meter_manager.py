@@ -249,7 +249,7 @@ class EnergyEngine:
             self._days_in_flight, self._events_in_flight = [], 0
 
     # ---------------------------------------------------------------- allocation policy (E3) — decisions only
-    def evaluate_allocation(self, system_state, wings):
+    def evaluate_allocation(self, system_state, wings, feedback_hardware_installed=True):
         """AUTO uses AllocationPolicy unchanged. DAY_BASED uses the calendar strategy. MANUAL does not act."""
         feedback = self.feedback()
         with self._lock:
@@ -260,11 +260,14 @@ class EnergyEngine:
             if mode == "DAY_BASED":
                 today = self.ledger.snapshot_today()
                 self._last_strategy = "day"
+                installed = bool(feedback_hardware_installed)
+                self._feedback_hardware_installed = installed
                 enabled = [wing for wing in ("A", "B", "C", "D") if (wings.get(wing) or {}).get("ems_enabled")]
                 self._day_enabled = enabled
                 decision = self.day_strategy.evaluate({
                     "operating_date": today["operating_date"], "reset_day": self.reset_day(),
                     "verified_active": verified_active(feedback, enabled), "wings": wings,
+                    "feedback_hardware_installed": installed,
                 })
                 self.day_strategy.persist()
                 return decision
@@ -286,7 +289,8 @@ class EnergyEngine:
         with self._lock:
             if self._last_strategy == "day":
                 events = self.day_strategy.after_execution(
-                    action, slot, success, verified_active(self.feedback(), self._day_enabled))
+                    action, slot, success, verified_active(self.feedback(), self._day_enabled),
+                    feedback_hardware_installed=getattr(self, "_feedback_hardware_installed", True))
                 self.day_strategy.persist()
                 return events
             events = self.allocation.after_execution(action, slot, success, verified_active(self.feedback()))
