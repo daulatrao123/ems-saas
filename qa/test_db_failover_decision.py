@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from db_routing import (  # noqa: E402
     Action, ConfigError, DbConfig, FenceProof, HealthState, ProbeKind, PromotionEvidence,
     active_target, classify_probe_error, decide, load_db_config,
-    resolve_authoritative_url, verify_promotion_evidence,
+    resolve_authoritative_url, verify_promotion_evidence, FENCE_METHODS,
 )
 
 NEON = "postgresql://u:p@neon.example/ems?sslmode=require"
@@ -35,6 +35,19 @@ def healthy_standby(**over):
              is_read_only=True, fenced=False)
     s.update(over)
     return HealthState(**s)
+
+
+# Every fence method is refused in this build (see FENCE_METHODS). Boundary tests
+# assert that the fence refusal is the ONLY reason left, which keeps lag and
+# freshness boundaries checked without treating the fence as proven.
+FENCE_REFUSAL = "refused: a single-connection read-only probe"
+
+
+def non_fence_reasons(ok, reasons):
+    """Assert the fence refusal is present, then return every OTHER reason."""
+    assert not ok, "expected refusal from the fence gate"
+    assert any(FENCE_REFUSAL in r for r in reasons), reasons
+    return tuple(r for r in reasons if FENCE_REFUSAL not in r)
 
 
 class LegacyConfigTests(unittest.TestCase):
@@ -127,11 +140,12 @@ class RoutingTests(unittest.TestCase):
     def _standby_env(self):
         return {"DATABASE_URL": NEON, "DATABASE_STANDBY_URL": AIVEN, "DATABASE_ACTIVE": "standby"}
 
-    def test_standby_writable_only_with_verified_evidence(self):
+    def test_otherwise_valid_evidence_still_refused_by_write_probe(self):
         env = self._standby_env()
-        url = active_target(load_db_config(env), env, self._verified_evidence(),
-                            now=self.NOW, expected_epoch=5)
-        self.assertEqual(url, AIVEN)
+        with self.assertRaises(ConfigError) as ctx:
+            active_target(load_db_config(env), env, self._verified_evidence(),
+                          now=self.NOW, expected_epoch=5)
+        self.assertIn("write_probe_read_only", str(ctx.exception))
 
     def test_refused_without_evidence_object(self):
         env = self._standby_env()
@@ -230,8 +244,11 @@ class VerifyPromotionEvidenceTests(unittest.TestCase):
                                          max_replication_lag_s=max_lag,
                                          expected_epoch=expected_epoch)
 
-    def test_complete_evidence_passes(self):
-        self.assertEqual(self._verify(self._ev()), (True, ()))
+    def test_complete_evidence_refused_by_write_probe_fence(self):
+        ok, reasons = self._verify(self._ev())
+        self.assertFalse(ok)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn(FENCE_REFUSAL, reasons[0])
 
     def test_none_evidence_refused(self):
         ok, reasons = self._verify(None)
@@ -256,10 +273,18 @@ class VerifyPromotionEvidenceTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("fence method" in r for r in reasons))
 
-    def test_provider_fence_with_receipt_passes(self):
+    def test_provider_fence_with_receipt_refused(self):
+        # A receipt string is an unverified claim; it must never authorize promotion.
         ev = self._ev(fence=FenceProof("provider_endpoint_disabled", self.NOW - 5, 4, 5,
                                        receipt_id="RCPT-9"))
-        self.assertEqual(self._verify(ev), (True, ()))
+        ok, reasons = self._verify(ev)
+        self.assertFalse(ok)
+        self.assertTrue(any("unverifiable" in r for r in reasons))
+
+    def test_provider_fence_without_receipt_refused_direct(self):
+        ev = self._ev(fence=FenceProof("provider_endpoint_disabled", self.NOW - 5, 4, 5))
+        ok, _ = self._verify(ev)
+        self.assertFalse(ok)
 
     def test_fence_epoch_not_advancing_refused(self):
         ev = self._ev(fence=FenceProof("write_probe_read_only", self.NOW - 5, 5, 5))
@@ -294,7 +319,10 @@ class VerifyPromotionEvidenceTests(unittest.TestCase):
             self.assertTrue(any("change ticket" in r for r in reasons), repr(ticket))
 
     def test_padded_change_ticket_accepted(self):
-        self.assertEqual(self._verify(self._ev(operator_change_id="  CHG-2  ")), (True, ()))
+        ok, reasons = self._verify(self._ev(operator_change_id="  CHG-2  "))
+        self.assertFalse(ok)
+        self.assertFalse(any("change ticket" in r for r in reasons))
+        self.assertTrue(any(FENCE_REFUSAL in r for r in reasons))
 
     def test_all_failures_are_reported_together(self):
         ev = self._ev(candidate_in_recovery=True, operator_change_id=None, fence=None)
@@ -376,12 +404,11 @@ class NonFiniteAndLagBoundaryTests(unittest.TestCase):
 
     def test_valid_ceiling_with_missing_lag_still_refused_for_lag_only(self):
         ok, reasons = self._verify(self._ev(candidate_replication_lag_s=None), max_lag=30.0)
-        self.assertFalse(ok)
-        self.assertEqual(reasons, ("candidate lag unknown",))
+        self.assertEqual(non_fence_reasons(ok, reasons), ("candidate lag unknown",))
 
     def test_zero_ceiling_is_valid_boundary(self):
-        ok, _ = self._verify(self._ev(candidate_replication_lag_s=0.0), max_lag=0.0)
-        self.assertTrue(ok)
+        self.assertEqual(non_fence_reasons(*self._verify(
+            self._ev(candidate_replication_lag_s=0.0), max_lag=0.0)), ())
 
     def test_nan_candidate_lag_refused_with_reason(self):
         ok, reasons = self._verify(self._ev(candidate_replication_lag_s=self.NAN))
@@ -419,8 +446,8 @@ class NonFiniteAndLagBoundaryTests(unittest.TestCase):
     # --- replication-lag ceiling boundaries ---
 
     def test_lag_exactly_at_ceiling_passes(self):
-        self.assertEqual(self._verify(self._ev(candidate_replication_lag_s=30.0), max_lag=30.0),
-                         (True, ()))
+        self.assertEqual(non_fence_reasons(*self._verify(
+            self._ev(candidate_replication_lag_s=30.0), max_lag=30.0)), ())
 
     def test_lag_just_above_ceiling_refused(self):
         ok, reasons = self._verify(self._ev(candidate_replication_lag_s=30.000001), max_lag=30.0)
@@ -432,21 +459,22 @@ class NonFiniteAndLagBoundaryTests(unittest.TestCase):
         self.assertFalse(ok)
 
     def test_zero_lag_zero_ceiling_passes(self):
-        self.assertEqual(self._verify(self._ev(candidate_replication_lag_s=0.0), max_lag=0.0),
-                         (True, ()))
+        self.assertEqual(non_fence_reasons(*self._verify(
+            self._ev(candidate_replication_lag_s=0.0), max_lag=0.0)), ())
 
     # --- freshness boundaries (existing check, boundary pinned) ---
 
     def test_observation_exactly_at_max_age_passes(self):
         ev = self._ev(candidate_observed_at=self.NOW - 60.0)
-        self.assertEqual(self._verify(ev), (True, ()))
+        self.assertEqual(non_fence_reasons(*self._verify(ev)), ())
 
     def test_observation_just_older_than_max_age_refused(self):
         ok, _ = self._verify(self._ev(candidate_observed_at=self.NOW - 60.000001))
         self.assertFalse(ok)
 
     def test_observation_at_now_passes(self):
-        self.assertEqual(self._verify(self._ev(candidate_observed_at=self.NOW)), (True, ()))
+        self.assertEqual(non_fence_reasons(*self._verify(
+            self._ev(candidate_observed_at=self.NOW))), ())
 
     # --- every failure is reported, with explicit reasons ---
 
@@ -463,7 +491,7 @@ class NonFiniteAndLagBoundaryTests(unittest.TestCase):
     def test_forward_direction_standby_promotion_requires_all_gates(self):
         ok, _ = self._verify(self._ev(candidate_replication_lag_s=self.NAN))
         self.assertFalse(ok)
-        self.assertEqual(self._verify(self._ev()), (True, ()))
+        self.assertEqual(non_fence_reasons(*self._verify(self._ev())), ())
 
     def test_reverse_direction_fence_epoch_must_advance(self):
         # Failing back: the old standby-side writer must be fenced at the new epoch.
@@ -503,7 +531,8 @@ class DecisionNonFiniteLagTests(unittest.TestCase):
     def test_standby_lag_at_ceiling_is_candidate(self):
         d = decide(DbConfig(NEON, AIVEN, False, 3, 30.0, 5.0), self._fenced_down(),
                    self._standby(30.0))
-        self.assertIs(d.action, Action.PROMOTION_CANDIDATE)
+        self.assertIs(d.action, Action.HOLD)
+        self.assertTrue(any("not independently verified" in r for r in d.reasons))
 
     def test_standby_lag_above_ceiling_holds(self):
         d = decide(DbConfig(NEON, AIVEN, False, 3, 30.0, 5.0), self._fenced_down(),
@@ -605,6 +634,46 @@ class AuthoritativeTargetTests(unittest.TestCase):
         self.assertIn("psycopg.connect(DB_TARGET_URL", src)
 
 
+class StandbyResolutionRegressionTests(unittest.TestCase):
+    """resolve_authoritative_url() must never return the standby without evidence."""
+
+    def test_standby_active_with_verified_flag_and_promotion_evidence_env_is_refused(self):
+        env = {
+            "DATABASE_URL": NEON,
+            "DATABASE_STANDBY_URL": AIVEN,
+            "DATABASE_ACTIVE": "standby",
+            "DATABASE_STANDBY_PROMOTION_VERIFIED": "on",
+            "PROMOTION_EVIDENCE": '{"fence": "write_probe_read_only", "epoch": 1}',
+        }
+        with self.assertRaises(ConfigError) as ctx:
+            resolve_authoritative_url(env)
+        self.assertNotIn(AIVEN, str(ctx.exception))
+        self.assertNotIn(NEON, str(ctx.exception))
+
+    def test_standby_active_never_returns_aiven_for_any_promotion_env_value(self):
+        for raw in ("", "1", "on", "true", "yes", "verified", "provider_endpoint_disabled"):
+            env = {
+                "DATABASE_URL": NEON,
+                "DATABASE_STANDBY_URL": AIVEN,
+                "DATABASE_ACTIVE": "standby",
+                "DATABASE_STANDBY_PROMOTION_VERIFIED": "on",
+                "PROMOTION_EVIDENCE": raw,
+            }
+            with self.subTest(promotion_evidence=raw):
+                with self.assertRaises(ConfigError):
+                    resolve_authoritative_url(env)
+
+    def test_primary_routing_still_works_when_active_is_primary(self):
+        env = {
+            "DATABASE_URL": NEON,
+            "DATABASE_STANDBY_URL": AIVEN,
+            "DATABASE_ACTIVE": "primary",
+            "DATABASE_STANDBY_PROMOTION_VERIFIED": "on",
+            "PROMOTION_EVIDENCE": '{"fence": "write_probe_read_only"}',
+        }
+        self.assertEqual(resolve_authoritative_url(env), NEON)
+
+
 class ClassificationTests(unittest.TestCase):
     class Err(Exception):
         def __init__(self, msg, sqlstate=None):
@@ -644,13 +713,13 @@ class DecisionSymmetryTests(unittest.TestCase):
     def test_neon_primary_down_promotes_aiven_candidate(self):
         d = decide(cfg(), HealthState(ProbeKind.UNAVAILABLE, 3, fenced=True),
                    healthy_standby(), active_is_original_primary=True)
-        self.assertIs(d.action, Action.PROMOTION_CANDIDATE)
+        self.assertIs(d.action, Action.HOLD)
 
     def test_aiven_primary_down_promotes_neon_candidate(self):
         # Same function, roles swapped: the "active" is Aiven, standby is Neon.
         d = decide(cfg(), HealthState(ProbeKind.UNAVAILABLE, 3, fenced=True),
                    healthy_standby(), active_is_original_primary=False)
-        self.assertIs(d.action, Action.PROMOTION_CANDIDATE)
+        self.assertIs(d.action, Action.HOLD)
 
     def test_failback_candidate_when_original_primary_recovers(self):
         d = decide(cfg(), HealthState(ProbeKind.OK), healthy_standby(), active_is_original_primary=False)
@@ -667,9 +736,10 @@ class FailoverGateTests(unittest.TestCase):
         d = decide(cfg(), down(n=2), healthy_standby(fenced=True))
         self.assertIs(d.action, Action.RETRY)
 
-    def test_threshold_with_all_gates_met_is_candidate_not_automatic(self):
+    def test_threshold_with_all_gates_met_still_holds_without_provider_fence(self):
         d = decide(cfg(), self.fenced_down(), healthy_standby())
-        self.assertIs(d.action, Action.PROMOTION_CANDIDATE)
+        self.assertIs(d.action, Action.HOLD)
+        self.assertTrue(any("automatic promotion disabled" in r for r in d.reasons))
 
     def test_unfenced_active_holds(self):
         d = decide(cfg(), down(), healthy_standby())
@@ -738,11 +808,142 @@ class NeverFailoverTests(unittest.TestCase):
         self.assertIs(d.action, Action.RETRY)
 
 
+class DecideFencingEvidenceTests(unittest.TestCase):
+    """decide() must never yield PROMOTION_CANDIDATE. Caller-supplied fencing
+    evidence (missing, false, true, or forged) is not provider-side proof."""
+
+    def test_missing_fence_holds(self):
+        d = decide(cfg(), HealthState(ProbeKind.UNAVAILABLE, 3), healthy_standby())
+        self.assertIs(d.action, Action.HOLD)
+
+    def test_false_fence_holds(self):
+        d = decide(cfg(), HealthState(ProbeKind.UNAVAILABLE, 3, fenced=False), healthy_standby())
+        self.assertIs(d.action, Action.HOLD)
+        self.assertTrue(any("not verified fenced" in r for r in d.reasons))
+
+    def test_true_fence_still_holds(self):
+        # fenced=True is caller-controlled and must not authorize promotion.
+        d = decide(cfg(), HealthState(ProbeKind.UNAVAILABLE, 3, fenced=True), healthy_standby())
+        self.assertIs(d.action, Action.HOLD)
+        self.assertTrue(any("not independently verified" in r for r in d.reasons))
+
+    def test_forged_fence_evidence_cannot_authorize(self):
+        # Forged FenceProof objects (receipt-looking strings, fresh timestamps,
+        # valid epochs) plus fenced=True and every other gate passing.
+        now = 1_000_000.0
+        forged = [
+            FenceProof("provider_endpoint_disabled", now - 1, 4, 5, receipt_id="RCPT-FORGED"),
+            FenceProof("write_probe_read_only", now - 1, 4, 5),
+            FenceProof("made_up_method", now - 1, 4, 5, receipt_id="X"),
+        ]
+        for fence in forged:
+            with self.subTest(method=fence.method):
+                ev = PromotionEvidence(
+                    candidate_observed_at=now - 1, candidate_in_recovery=False,
+                    candidate_read_write=True, candidate_replication_lag_s=0.0,
+                    fence=fence, operator_change_id="CHG-FORGED")
+                ok, _ = verify_promotion_evidence(ev, now=now, max_age_s=60.0,
+                                                  max_replication_lag_s=30.0,
+                                                  expected_epoch=5)
+                self.assertFalse(ok)
+                d = decide(cfg(), HealthState(ProbeKind.UNAVAILABLE, 3, fenced=True),
+                           healthy_standby())
+                self.assertIs(d.action, Action.HOLD)
+
+    def test_decide_never_returns_promotion_candidate(self):
+        import itertools
+        kinds = [ProbeKind.OK, ProbeKind.UNAVAILABLE, ProbeKind.TIMEOUT, ProbeKind.AUTH,
+                 ProbeKind.UNKNOWN]
+        for kind, fenced, orig, hold in itertools.product(
+                kinds, (False, True), (True, False), (False, True)):
+            with self.subTest(kind=kind, fenced=fenced, orig=orig, hold=hold):
+                d = decide(cfg(), HealthState(kind, 9, fenced=fenced), healthy_standby(),
+                           active_is_original_primary=orig, operator_hold=hold)
+                self.assertIsNot(d.action, Action.PROMOTION_CANDIDATE)
+
+    def test_decide_has_no_evidence_parameter(self):
+        import inspect
+        params = inspect.signature(decide).parameters
+        self.assertNotIn("evidence", params)
+        self.assertNotIn("fence", params)
+
+
 class LegacyBehaviourTests(unittest.TestCase):
     def test_no_standby_means_no_failover_plan_needed(self):
         # Legacy config produces no standby; routing still yields the primary URL.
         c = load_db_config({"DATABASE_URL": NEON})
         self.assertEqual(active_target(c, {"DATABASE_URL": NEON}), NEON)
+
+
+class FenceMethodRefusalTests(unittest.TestCase):
+    """Neither fence method may authorize promotion, even with otherwise-valid evidence."""
+    NOW = 1_000_000.0
+
+    def _valid_ev(self, fence):
+        return PromotionEvidence(
+            candidate_observed_at=self.NOW - 5, candidate_in_recovery=False,
+            candidate_read_write=True, candidate_replication_lag_s=0.5,
+            fence=fence, operator_change_id="CHG-FENCE")
+
+    def _verify(self, ev, expected_epoch=5):
+        return verify_promotion_evidence(ev, now=self.NOW, max_age_s=60.0,
+                                         max_replication_lag_s=30.0,
+                                         expected_epoch=expected_epoch)
+
+    def _standby_env(self):
+        return {"DATABASE_URL": NEON, "DATABASE_STANDBY_URL": AIVEN,
+                "DATABASE_ACTIVE": "standby"}
+
+    def test_no_fence_method_is_accepted(self):
+        self.assertEqual(FENCE_METHODS, frozenset())
+        self.assertNotIn("write_probe_read_only", FENCE_METHODS)
+        self.assertNotIn("provider_endpoint_disabled", FENCE_METHODS)
+
+    def test_write_probe_alone_cannot_authorize_with_valid_evidence(self):
+        fence = FenceProof("write_probe_read_only", self.NOW - 5, old_epoch=4, new_epoch=5)
+        ok, reasons = self._verify(self._valid_ev(fence))
+        self.assertFalse(ok)
+        self.assertTrue(any("write_probe_read_only refused" in r for r in reasons))
+        self.assertFalse(any("not recognised" in r for r in reasons))
+
+    def test_provider_disabled_with_receipt_cannot_authorize(self):
+        fence = FenceProof("provider_endpoint_disabled", self.NOW - 5, 4, 5,
+                           receipt_id="RCPT-LOOKS-VALID")
+        ok, reasons = self._verify(self._valid_ev(fence))
+        self.assertFalse(ok)
+        self.assertTrue(any("provider_endpoint_disabled refused" in r for r in reasons))
+
+    def test_provider_disabled_without_receipt_cannot_authorize(self):
+        fence = FenceProof("provider_endpoint_disabled", self.NOW - 5, 4, 5)
+        ok, _ = self._verify(self._valid_ev(fence))
+        self.assertFalse(ok)
+
+    def test_active_target_refuses_write_probe_with_valid_evidence(self):
+        fence = FenceProof("write_probe_read_only", self.NOW - 5, old_epoch=4, new_epoch=5)
+        env = self._standby_env()
+        with self.assertRaises(ConfigError):
+            active_target(load_db_config(env), env, self._valid_ev(fence),
+                          now=self.NOW, expected_epoch=5)
+
+    def test_active_target_refuses_provider_disabled_with_valid_evidence(self):
+        fence = FenceProof("provider_endpoint_disabled", self.NOW - 5, 4, 5,
+                           receipt_id="RCPT-1")
+        env = self._standby_env()
+        with self.assertRaises(ConfigError):
+            active_target(load_db_config(env), env, self._valid_ev(fence),
+                          now=self.NOW, expected_epoch=5)
+
+    def test_fence_gate_is_the_only_blocker_for_valid_evidence(self):
+        # Control: with the write-probe method temporarily allowed, the same
+        # otherwise-valid evidence passes. So the refusal above comes from the
+        # fence gate alone, not from a defect in the other fixtures.
+        from unittest import mock
+        import db_routing
+        fence = FenceProof("write_probe_read_only", self.NOW - 5, old_epoch=4, new_epoch=5)
+        with mock.patch.object(db_routing, "FENCE_METHODS",
+                               frozenset({"write_probe_read_only"})):
+            self.assertEqual(self._verify(self._valid_ev(fence)), (True, ()))
+        self.assertFalse(self._verify(self._valid_ev(fence))[0])
 
 
 if __name__ == "__main__":

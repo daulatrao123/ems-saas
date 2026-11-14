@@ -10,9 +10,10 @@ What this module does NOT do:
   * It never promotes a database, never changes replication, never fences
     a writer. Those are provider operations performed by an operator.
   * It performs no I/O at import time.
-  * Automatic promotion is never returned as an action. The most it can
-    return is PROMOTION_CANDIDATE, which means "an operator may consider
-    promotion now"; the operator still runs the promotion runbook.
+  * Automatic promotion is never returned as an action. decide() never returns
+    PROMOTION_CANDIDATE in this build: a caller-supplied HealthState.fenced flag
+    cannot authorize it, and no independently verified provider fence exists.
+    Promotion authority is only in verify_promotion_evidence() / active_target().
 
 Symmetry: the decision function is written in terms of "active" and
 "standby" roles, not provider names. Neon-primary and Aiven-primary are
@@ -237,12 +238,15 @@ class FenceProof:
     """Proof that the old writer cannot accept writes.
 
     method is one of:
-      'write_probe_read_only': a fresh write attempt against the old writer was
-          rejected with SQLSTATE 25006 (read_only_sql_transaction), observed by the
-          monitor over its own connection.
-      'provider_endpoint_disabled': the provider API reported the old endpoint
-          disabled; receipt_id must name the provider's receipt.
+      'write_probe_read_only': a write attempt on ONE connection from the monitor
+          was rejected with SQLSTATE 25006. This does NOT prove global writer
+          fencing: other connections, sessions and endpoints may still accept writes.
+          Refused as promotion authority.
+      'provider_endpoint_disabled': a provider API reported the old endpoint
+          disabled. No Neon provider fencing operation with a verifiable receipt is
+          implemented in this build, so the claim cannot be verified. Refused.
     An unreachable old writer is NOT a fence: it may come back and accept writes.
+    No method currently authorizes promotion; see FENCE_METHODS.
     """
     method: str
     observed_at: float
@@ -262,7 +266,28 @@ class PromotionEvidence:
     operator_change_id: Optional[str]            # change ticket naming this promotion
 
 
-FENCE_METHODS = frozenset({"write_probe_read_only", "provider_endpoint_disabled"})
+# Fence methods that may authorize promotion. EMPTY on purpose:
+#  * 'write_probe_read_only' proves only that one monitor connection was refused
+#    a write. It does not fence other connections, sessions or endpoints, so it
+#    cannot prove global Neon writer fencing.
+#  * 'provider_endpoint_disabled' rests on a provider receipt string. No documented
+#    Neon fencing operation with an independently verifiable receipt exists in this
+#    build, so the claim is unverifiable and refused.
+# Automatic promotion therefore stays disabled until a documented provider-side
+# fencing operation produces an independently verifiable receipt.
+FENCE_METHODS: frozenset = frozenset()
+
+# Refusal reason for each known method that is not in FENCE_METHODS.
+FENCE_REFUSAL_REASONS = {
+    "write_probe_read_only": (
+        "write_probe_read_only refused: a single-connection read-only probe does "
+        "not prove global writer fencing"
+    ),
+    "provider_endpoint_disabled": (
+        "provider_endpoint_disabled refused: provider fence receipts are "
+        "unverifiable in this build"
+    ),
+}
 
 
 def verify_promotion_evidence(
@@ -336,10 +361,10 @@ def verify_promotion_evidence(
     if f is None:
         reasons.append("old writer fence not verified")
     else:
-        if f.method not in FENCE_METHODS:
+        if f.method in FENCE_REFUSAL_REASONS and f.method not in FENCE_METHODS:
+            reasons.append(FENCE_REFUSAL_REASONS[f.method])
+        elif f.method not in FENCE_METHODS:
             reasons.append("fence method not recognised")
-        if f.method == "provider_endpoint_disabled" and not f.receipt_id:
-            reasons.append("provider fence has no receipt")
         if not math.isfinite(f.observed_at):
             reasons.append("fence observation timestamp not finite")
         elif clock_ok and window_ok and (
@@ -458,12 +483,20 @@ def decide(
         reasons.append(
             f"standby lag {standby.replication_lag_s:.1f}s > max {cfg.max_replication_lag_s:.1f}s"
         )
+    # HealthState.fenced is a caller-supplied boolean. It is recorded for
+    # diagnostics only and is never evidence of provider-side fencing, so it
+    # cannot satisfy any gate here, whatever its value.
     if not active.fenced:
         reasons.append("active writer not verified fenced")
+    else:
+        reasons.append(
+            "caller-supplied fenced flag is not independently verified provider fencing"
+        )
 
-    if reasons:
-        return Decision(Action.HOLD, tuple(reasons))
-
-    return Decision(Action.PROMOTION_CANDIDATE, (
-        "active unreachable past threshold; standby healthy, fresh, and active fenced",
-    ))
+    # Terminal fail-closed result. Without a verified provider-side Neon fence
+    # (none exists in this build) the decision is always non-promotion, even
+    # when every other gate passes. PROMOTION_CANDIDATE is therefore unreachable
+    # from this function; promotion authority lives only in active_target() and
+    # verify_promotion_evidence().
+    reasons.append("no independently verified provider-side fence; automatic promotion disabled")
+    return Decision(Action.HOLD, tuple(reasons))
