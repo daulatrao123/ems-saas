@@ -42,9 +42,10 @@ from slowapi.errors import RateLimitExceeded
 # CONFIG
 # ================================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is required.")
+# Central DB routing: the single authoritative target, shared with Alembic.
+# Raises ConfigError (a RuntimeError) at startup on missing or conflicting config.
+from db_routing import resolve_authoritative_url
+DB_TARGET_URL = resolve_authoritative_url(os.environ)
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
@@ -279,7 +280,7 @@ VALID_COMMANDS = {
 ALEMBIC_INI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alembic.ini")
 
 def get_db():
-    conn = psycopg.connect(DATABASE_URL, connect_timeout=10, row_factory=dict_row)
+    conn = psycopg.connect(DB_TARGET_URL, connect_timeout=10, row_factory=dict_row)
     conn.autocommit = False
     return conn
 

@@ -1,7 +1,14 @@
 from logging.config import fileConfig
 import os
+import sys
 from sqlalchemy import engine_from_config, pool, text
 from alembic import context
+
+# Resolve the database through the same routing module as the application.
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BACKEND_DIR not in sys.path:
+    sys.path.append(_BACKEND_DIR)
+from db_routing import resolve_authoritative_url  # noqa: E402
 
 config = context.config
 if config.config_file_name is not None:
@@ -26,10 +33,9 @@ def normalize_database_url(raw: str) -> str:
     return raw
 
 
-database_url = os.getenv("DATABASE_URL")
-if not database_url:
-    raise RuntimeError("DATABASE_URL environment variable is required for Alembic migrations.")
-database_url = normalize_database_url(database_url)
+# Same authoritative target as main.py (fails closed on missing/conflicting config,
+# and never selects an unpromoted standby).
+database_url = normalize_database_url(resolve_authoritative_url(os.environ))
 config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 target_metadata = None
