@@ -1094,6 +1094,9 @@ def provisioning_package(device_id: str, request: Request, user: dict = Depends(
     """Rotate the device credential (old key stops working) and return a ZIP installer containing the
     NEW key. The secret exists only in the ZIP body: not in JSON, not in logs, not in audit_log."""
     device_id = require_uuid(device_id, "device_id")
+    # PREFLIGHT (no credential issued yet): every source file, the service-account rules and both
+    # packaged service copies are validated here. A refusal raises before issue_device_credential runs,
+    # so nothing is revoked or inserted. The same function is reused inside build_provisioning_zip.
     validate_runtime_sources()
     api_url = os.environ.get("EMS_PUBLIC_API_URL") or (str(request.base_url).rstrip("/") + "/api")
     conn = get_db()

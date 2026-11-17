@@ -2,7 +2,13 @@
 
 bash -n parses shell text without executing it. All installation paths, mount
 queries, dependency discovery and disk capacity are in-memory mocked below.
+
+Endpoint tests (EndpointCredentialOrderingTests) execute the REAL provisioning_package
+function from backend/main.py, extracted by AST, with fake database, credential and
+audit collaborators. main.py is not imported, so psycopg and the other backend
+dependencies are not required and no database, device, network or credential is used.
 """
+import ast
 import hashlib
 import io
 import json
@@ -23,6 +29,308 @@ def _bash():
     if git_bash.is_file():
         return str(git_bash)
     return "bash"
+
+
+# Regression tests for service-account validation (daulat123). These call the production
+# validator on mutated unit text; they never touch a database, device, or credential.
+GOOD_UNIT = (package.FIRMWARE_DIR / "ems-controller.service").read_text()
+
+
+class ServiceAccountValidationTests(unittest.TestCase):
+    """Documented behaviour of _validate_service_unit (backend/provisioning.py).
+
+    - Directives are normalized (whitespace around '=' is ignored), so 'User = pi',
+      'User =pi' and 'User= pi' are refused exactly like 'User=pi'.
+    - Account directives are honoured only inside [Service]; one in any other section is refused.
+    - Each of User, Group and SupplementaryGroups must appear exactly once in [Service]
+      with its required value (daulat123, daulat123, 'gpio i2c').
+    - Commented lines (# or ;) are ignored: a commented-out 'User=pi' is not a false positive.
+    """
+
+    def assertRejected(self, text):
+        with self.assertRaises(RuntimeError):
+            package._validate_service_unit(text)
+
+    def test_correct_daulat123_configuration_passes(self):
+        package._validate_service_unit(GOOD_UNIT)
+        lines = [ln.strip() for ln in GOOD_UNIT.splitlines()]
+        for line in package.REQUIRED_SERVICE_LINES:
+            self.assertIn(line, lines)
+
+    def test_user_pi_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("User=daulat123", "User=pi"))
+
+    def test_user_with_spaces_around_equals_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("User=daulat123", "User = pi"))
+
+    def test_user_space_before_equals_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("User=daulat123", "User =pi"))
+
+    def test_user_space_after_equals_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("User=daulat123", "User= pi"))
+
+    def test_group_pi_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("Group=daulat123", "Group=pi"))
+
+    def test_group_with_spaces_around_equals_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("Group=daulat123", "Group = pi"))
+
+    def test_group_space_after_equals_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("Group=daulat123", "Group= pi"))
+
+    def test_supplementary_groups_with_spaces_around_equals_is_accepted_when_value_is_required(self):
+        # Whitespace around '=' is normalized, so this is the same required semantic value.
+        package._validate_service_unit(GOOD_UNIT.replace("SupplementaryGroups=gpio i2c", "SupplementaryGroups = gpio i2c"))
+
+    def test_supplementary_groups_with_spaces_but_wrong_value_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("SupplementaryGroups=gpio i2c", "SupplementaryGroups = gpio"))
+
+    def test_extra_legacy_user_line_is_rejected(self):
+        self.assertRejected(GOOD_UNIT + "\nUser=pi\n")
+
+    def test_duplicate_user_directive_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("User=daulat123", "User=daulat123\nUser=daulat123"))
+
+    def test_duplicate_user_directive_with_legacy_value_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("User=daulat123", "User=daulat123\nUser = pi"))
+
+    def test_duplicate_group_directive_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("Group=daulat123", "Group=daulat123\nGroup=daulat123"))
+
+    def test_duplicate_supplementary_groups_directive_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("SupplementaryGroups=gpio i2c", "SupplementaryGroups=gpio i2c\nSupplementaryGroups=gpio i2c"))
+
+    def test_account_directive_in_another_section_is_rejected(self):
+        self.assertRejected(GOOD_UNIT + "\n[Install]\nUser=pi\n")
+
+    def test_commented_legacy_directives_do_not_trigger_false_positive(self):
+        package._validate_service_unit(GOOD_UNIT + "\n# User=pi\n; Group=pi\n")
+
+    def test_missing_supplementary_groups_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("SupplementaryGroups=gpio i2c", ""))
+
+    def test_wrong_supplementary_groups_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("SupplementaryGroups=gpio i2c", "SupplementaryGroups=gpio"))
+
+    def test_wrong_working_directory_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("WorkingDirectory=/mnt/ems-data", "WorkingDirectory=/opt/ems/pi_firmware"))
+
+    def test_wrong_gpio_factory_is_rejected(self):
+        self.assertRejected(GOOD_UNIT.replace("Environment=GPIOZERO_PIN_FACTORY=lgpio", "Environment=GPIOZERO_PIN_FACTORY=rpigpio"))
+
+    def test_modified_packaged_duplicate_is_rejected(self):
+        bad = GOOD_UNIT.replace("User=daulat123", "User=pi").encode()
+        with self.assertRaises(RuntimeError):
+            package._validate_packaged_service_copies({
+                "firmware/ems-controller.service": GOOD_UNIT.encode(),
+                "systemd/ems-controller.service": bad,
+            })
+
+    def test_identical_packaged_copies_pass(self):
+        data = GOOD_UNIT.encode()
+        package._validate_packaged_service_copies({"firmware/ems-controller.service": data, "systemd/ems-controller.service": data})
+
+
+class _FakeCursor:
+    def __init__(self, log, device_row):
+        self.log = log
+        self.device_row = device_row
+
+    def execute(self, sql, params=None):
+        self.log.append(("execute", sql.split()[0]))
+
+    def fetchone(self):
+        return self.device_row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeConn:
+    def __init__(self, log, device_row):
+        self.log = log
+        self.device_row = device_row
+
+    def cursor(self, **kwargs):
+        return _FakeCursor(self.log, self.device_row)
+
+    def commit(self):
+        self.log.append(("commit",))
+
+    def rollback(self):
+        self.log.append(("rollback",))
+
+    def close(self):
+        self.log.append(("close",))
+
+
+def _load_provisioning_endpoint():
+    """Return the real provisioning_package function from backend/main.py without importing main.py."""
+    main_path = Path(__file__).resolve().parents[1] / "backend" / "main.py"
+    tree = ast.parse(main_path.read_text(encoding="utf-8"), filename=str(main_path))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "provisioning_package":
+            node.decorator_list = []  # drop @app.get(...) which needs FastAPI
+            module = ast.Module(body=[node], type_ignores=[])
+            return module
+    raise AssertionError("provisioning_package not found in backend/main.py")
+
+
+DEVICE_ID = "11111111-1111-1111-1111-111111111111"
+
+
+class EndpointCredentialOrderingTests(unittest.TestCase):
+    """Run the real endpoint with fakes. Asserts validation, credential issuance, package build and commit order.
+
+    No real database, credential, device, network or psycopg is used. The fake connection
+    records commit, rollback and close; the fake issuer records every issuance.
+    """
+
+    def setUp(self):
+        guard = patch.object(socket, "socket", side_effect=AssertionError("Network forbidden"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.log = []
+        self.issued = []
+        self.device_row = {"name": "OFFLINE-PI", "society_id": 1}
+        self.namespace = self._namespace()
+
+    def _namespace(self):
+        from types import SimpleNamespace as NS
+        log = self.log
+        issued = self.issued
+        device_row = self.device_row
+        test = self
+
+        def fake_get_db():
+            return _FakeConn(log, device_row)
+
+        def fake_issue(cur, device_id, user, origin, **kwargs):
+            log.append(("issue_device_credential", origin))
+            issued.append(origin)
+            return {"key_id": "FIXTURE-KEY", "api_key": "NOT-A-LIVE-CREDENTIAL"}
+
+        def fake_log_audit(cur, user, society_id, action, details):
+            log.append(("log_audit", action))
+
+        def fake_require_uuid(value, what):
+            return value
+
+        def fake_require_role(*roles):
+            return lambda: {"role": "super_admin", "username": "test"}
+
+        def fake_depends(dep):
+            return dep
+
+        def fake_build(device_id, device_name, key_id, api_key, api_url):
+            log.append(("build_provisioning_zip",))
+            return b"ZIPBYTES"
+
+        def fake_service_unit_sha256():
+            return "0" * 64
+
+        def fake_validate_runtime_sources():
+            log.append(("validate_runtime_sources",))
+
+        class _HTTPException(Exception):
+            def __init__(self, status_code, detail=""):
+                super().__init__(detail)
+                self.status_code = status_code
+
+        class _Response:
+            def __init__(self, content=b"", media_type=None, headers=None):
+                self.content = content
+
+        class _Request:
+            base_url = "https://example.invalid/"
+
+        ns = {
+            "dict_row": object(),  # stands in for psycopg.rows.dict_row; the fake cursor ignores it
+            "os": SimpleNamespace(environ={"EMS_PUBLIC_API_URL": "https://example.invalid/api"}),
+            "Request": _Request,
+            "Depends": fake_depends,
+            "require_role": fake_require_role,
+            "require_uuid": fake_require_uuid,
+            "get_db": fake_get_db,
+            "issue_device_credential": fake_issue,
+            "log_audit": fake_log_audit,
+            "build_provisioning_zip": fake_build,
+            "service_unit_sha256": fake_service_unit_sha256,
+            "validate_runtime_sources": fake_validate_runtime_sources,
+            "HTTPException": _HTTPException,
+            "Response": _Response,
+            "__builtins__": __builtins__,
+        }
+        return ns
+
+    def _run_endpoint(self):
+        module = _load_provisioning_endpoint()
+        code = compile(module, "backend/main.py::provisioning_package", "exec")
+        exec(code, self.namespace)
+        fn = self.namespace["provisioning_package"]
+        return fn(DEVICE_ID, _Request_stub(), user={"role": "super_admin"})
+
+    def test_a_runtime_validation_failure_refuses_before_credential_and_commit(self):
+        def refuse():
+            self.log.append(("validate_runtime_sources",))
+            raise RuntimeError("stale service unit")
+        self.namespace["validate_runtime_sources"] = refuse
+        with self.assertRaisesRegex(RuntimeError, "stale service unit"):
+            self._run_endpoint()
+        self.assertEqual(self.issued, [], "issue_device_credential must not be called")
+        self.assertFalse([e for e in self.log if e[0] == "commit"], "commit must not be called")
+        self.assertFalse([e for e in self.log if e[0] == "issue_device_credential"])
+        self.assertFalse([e for e in self.log if e[0] == "build_provisioning_zip"])
+
+    def test_b_package_source_validation_failure_refuses_before_credential_and_commit(self):
+        # validate_runtime_sources is the shared preflight: source files and both service copies.
+        def refuse_source():
+            self.log.append(("validate_runtime_sources",))
+            raise FileNotFoundError("missing source files")
+        self.namespace["validate_runtime_sources"] = refuse_source
+        with self.assertRaises(FileNotFoundError):
+            self._run_endpoint()
+        self.assertEqual(self.issued, [])
+        self.assertFalse([e for e in self.log if e[0] == "commit"])
+        self.assertFalse([e for e in self.log if e[0] == "issue_device_credential"])
+
+    def test_b2_service_account_refusal_from_real_preflight_refuses_before_issuance(self):
+        # Use the real shared preflight against a tampered unit to prove the endpoint refuses before issuance.
+        def real_preflight_on_bad_unit():
+            self.log.append(("validate_runtime_sources",))
+            package._validate_service_unit(GOOD_UNIT.replace("User=daulat123", "User = pi"))
+        self.namespace["validate_runtime_sources"] = real_preflight_on_bad_unit
+        with self.assertRaises(RuntimeError):
+            self._run_endpoint()
+        self.assertEqual(self.issued, [])
+        self.assertFalse([e for e in self.log if e[0] == "commit"])
+
+    def test_c_zip_construction_failure_after_issuance_rolls_back_and_never_commits(self):
+        def fail_build(*args, **kwargs):
+            self.log.append(("build_provisioning_zip",))
+            raise RuntimeError("zip assembly failed")
+        self.namespace["build_provisioning_zip"] = fail_build
+        with self.assertRaisesRegex(RuntimeError, "zip assembly failed"):
+            self._run_endpoint()
+        self.assertEqual(self.issued, ["provisioning"], "credential was issued before the post-issuance failure")
+        self.assertIn(("rollback",), self.log, "rollback must run after post-issuance failure")
+        self.assertFalse([e for e in self.log if e[0] == "commit"], "commit must not run")
+        self.assertIn(("close",), self.log)
+
+    def test_d_successful_flow_issues_builds_then_commits(self):
+        response = self._run_endpoint()
+        self.assertEqual(self.issued, ["provisioning"])
+        order = [e[0] for e in self.log if e[0] in ("validate_runtime_sources", "issue_device_credential", "build_provisioning_zip", "commit")]
+        self.assertEqual(order, ["validate_runtime_sources", "issue_device_credential", "build_provisioning_zip", "commit"])
+        self.assertFalse([e for e in self.log if e[0] == "rollback"])
+        self.assertEqual(response.content, b"ZIPBYTES")
+
+
+def _Request_stub():
+    return SimpleNamespace(base_url="https://example.invalid/")
 
 
 class ProvisioningP0Tests(unittest.TestCase):

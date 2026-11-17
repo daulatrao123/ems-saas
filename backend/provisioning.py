@@ -19,8 +19,15 @@ FIRMWARE_DIR = Path(__file__).resolve().parent.parent / "pi_firmware"
 # A package is REFUSED (HTTP 500, credential NOT rotated) if the source unit lacks any of them.
 REQUIRED_SERVICE_LINES = (
     "WorkingDirectory=/mnt/ems-data",
+    "User=daulat123",
+    "Group=daulat123",
+    "SupplementaryGroups=gpio i2c",
     "Environment=GPIOZERO_PIN_FACTORY=lgpio",
 )
+
+# Account directives must each appear exactly once with the required value; any other
+# User=/Group=/SupplementaryGroups= line (e.g. a legacy User=pi) is refused.
+SERVICE_ACCOUNT_PREFIXES = ("User=", "Group=", "SupplementaryGroups=")
 
 # Field-diagnosed: any DeviceAllow= line makes lgpio fail with "can not open gpiochip" for User=daulat123.
 # Device access comes from SupplementaryGroups=gpio i2c; never re-add DeviceAllow.
@@ -660,8 +667,18 @@ systemd/
 
 
 def validate_runtime_sources() -> None:
-    """Refuse package generation before any credential work if the runtime tree is incomplete."""
+    """Shared PREFLIGHT for package generation. Run before any credential is issued.
+
+    Covers everything that can be checked without a newly issued credential: every required source
+    file, the controller unit's account and WorkingDirectory rules, and both packaged service copies
+    (firmware/ and systemd/), which are built from the same bytes. build_provisioning_zip() calls
+    the same functions, so there is one validation implementation.
+
+    NOT covered here: failures that occur after issuance while assembling the ZIP. The endpoint
+    keeps its transaction rollback for those.
+    """
     _validate_source_files()
+    _validate_packaged_service_copies(_packaged_service_copies())
 
 
 def _validate_source_files() -> None:
@@ -692,18 +709,117 @@ def _validate_source_files() -> None:
     _validate_service_unit((FIRMWARE_DIR / "ems-controller.service").read_text())
 
 
-def _validate_service_unit(text: str) -> None:
-    """Refuse to package a controller unit that would crash-loop on the Pi."""
+def parse_service_unit(text: str) -> dict[str, list[tuple[str, str]]]:
+    """Parse a systemd unit into {section: [(key, value), ...]}.
 
-    lines = {ln.strip() for ln in text.splitlines()}
-    missing = [req for req in REQUIRED_SERVICE_LINES if req not in lines]
-    working_dirs = sorted(ln for ln in lines if ln.startswith("WorkingDirectory="))
-    forbidden = sorted(ln for ln in lines if ln.startswith(FORBIDDEN_SERVICE_PREFIXES))
+    systemd tolerates whitespace around '=' and ignores lines whose first non-blank
+    character is '#' or ';'. Keys are case-sensitive; keys and values are stripped.
+    Directives outside any [Section] are ignored. A trailing backslash joins the next line.
+    """
+    sections: dict[str, list[tuple[str, str]]] = {}
+    current = None
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if pending:
+            line = (pending + " " + line).strip()
+            pending = ""
+        if not line or line[0] in "#;":
+            continue
+        if line.endswith("\\"):
+            pending = line[:-1].rstrip()
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            sections.setdefault(current, [])
+            continue
+        if current is None or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        sections[current].append((key.strip(), value.strip()))
+    return sections
 
-    if missing or forbidden or working_dirs != ["WorkingDirectory=/mnt/ems-data"]:
+
+ACCOUNT_KEYS = ("User", "Group", "SupplementaryGroups")
+REQUIRED_ACCOUNT_VALUES = {
+    "User": "daulat123",
+    "Group": "daulat123",
+    "SupplementaryGroups": "gpio i2c",
+}
+
+
+def _validate_service_unit(text: str, label: str = "pi_firmware/ems-controller.service") -> None:
+    """Refuse to package a controller unit that would crash-loop or run under the wrong account.
+
+    Documented behaviour (see qa/test_provisioning_p0.py):
+    - Directives are normalized by parse_service_unit, so 'User = pi', 'User =pi' and
+      'User= pi' are all read as User=pi and refused.
+    - Account directives are honoured ONLY inside [Service]. An account directive in any other
+      section is refused.
+    - Inside [Service], each of User, Group and SupplementaryGroups must appear exactly once
+      with its required value. Missing, duplicate and legacy values are refused.
+    - Commented lines (# or ;) are ignored, so a commented 'User=pi' causes no false positive.
+    - WorkingDirectory must be exactly /mnt/ems-data and no DeviceAllow= may be present.
+    """
+    sections = parse_service_unit(text)
+    service = sections.get("Service", [])
+    problems: list[str] = []
+
+    for section, pairs in sections.items():
+        if section == "Service":
+            continue
+        for key, value in pairs:
+            if key in ACCOUNT_KEYS:
+                problems.append(f"[{section}] {key}={value} (account directive outside [Service])")
+
+    for key in ACCOUNT_KEYS:
+        values = [v for k, v in service if k == key]
+        required = REQUIRED_ACCOUNT_VALUES[key]
+        if not values:
+            problems.append(f"missing {key}={required}")
+        elif len(values) > 1:
+            problems.append(f"duplicate {key} directives {values}")
+        elif values[0] != required:
+            problems.append(f"{key}={values[0]} (required {key}={required})")
+
+    for req in REQUIRED_SERVICE_LINES:
+        if req.partition("=")[0] in ACCOUNT_KEYS:
+            continue
+        key, _, value = req.partition("=")
+        if (key, value) not in service:
+            problems.append(f"missing {req}")
+
+    forbidden = sorted(f"{k}={v}" for k, v in service if f"{k}=".startswith(FORBIDDEN_SERVICE_PREFIXES))
+    if forbidden:
+        problems.append(f"forbidden {forbidden}")
+    working_dirs = sorted(f"{k}={v}" for k, v in service if k == "WorkingDirectory")
+    if working_dirs != ["WorkingDirectory=/mnt/ems-data"]:
+        problems.append(f"WorkingDirectory={working_dirs}")
+
+    if problems:
         raise RuntimeError(
-            "Refusing to build Pi provisioning package: pi_firmware/ems-controller.service is stale. "
-            f"missing={missing} forbidden={forbidden} WorkingDirectory={working_dirs}"
+            f"Refusing to build Pi provisioning package: {label} is stale or wrong-account. "
+            + "; ".join(problems)
+        )
+
+
+def _packaged_service_copies() -> dict[str, bytes]:
+    """Read the controller unit ONCE; every packaged copy is built from these exact bytes."""
+    data = (FIRMWARE_DIR / "ems-controller.service").read_bytes()
+    return {
+        "firmware/ems-controller.service": data,
+        "systemd/ems-controller.service": data,
+    }
+
+
+def _validate_packaged_service_copies(copies: dict[str, bytes]) -> None:
+    """Validate every packaged copy of the controller unit, not only the source file."""
+    for arcname, data in copies.items():
+        _validate_service_unit(data.decode(), label=arcname)
+    if len(set(copies.values())) != 1:
+        raise RuntimeError(
+            "Refusing to build Pi provisioning package: packaged ems-controller.service copies differ: "
+            + ", ".join(sorted(copies))
         )
 
 
@@ -726,6 +842,8 @@ def build_provisioning_zip(
     """
 
     _validate_source_files()
+    service_copies = _packaged_service_copies()
+    _validate_packaged_service_copies(service_copies)
 
     env = (
         f"EMS_API_URL={api_url}\n"
@@ -791,7 +909,7 @@ def build_provisioning_zip(
                 device_id=device_id,
                 key_id=key_id,
                 api_url=api_url,
-                service_sha256=service_unit_sha256(),
+                service_sha256=hashlib.sha256(service_copies["systemd/ems-controller.service"]).hexdigest(),
             ).encode(),
         )
 
@@ -801,23 +919,31 @@ def build_provisioning_zip(
 
         for filename in FIRMWARE_FILES:
 
-            source = FIRMWARE_DIR / filename
-
             add(
                 f"firmware/{filename}",
-                source.read_bytes(),
+                (FIRMWARE_DIR / filename).read_bytes(),
                 0o755 if filename.endswith(".sh") else 0o644,
             )
 
         # setup_pi.sh resolves units next to itself. Preserve its source bytes,
         # but supply those existing dependencies at BOTH documented locations.
+        # The controller unit uses the exact bytes that were validated above.
         for filename in SYSTEMD_FILES:
-            add(f"firmware/{filename}", (FIRMWARE_DIR / filename).read_bytes())
+            data = service_copies["systemd/ems-controller.service"] if filename == "ems-controller.service" else (FIRMWARE_DIR / filename).read_bytes()
+            add(f"firmware/{filename}", data)
 
         runtime_files = sorted([*FIRMWARE_FILES, *SYSTEMD_FILES])
+        # Snapshot every runtime file ONCE. The fingerprint is computed from these exact
+        # bytes, so it describes what is packaged, not a later filesystem read.
+        runtime_bytes: dict[str, bytes] = {}
+        for filename in runtime_files:
+            if filename == "ems-controller.service":
+                runtime_bytes[filename] = service_copies["systemd/ems-controller.service"]
+            else:
+                runtime_bytes[filename] = (FIRMWARE_DIR / filename).read_bytes()
         fingerprint = hashlib.sha256()
         for filename in runtime_files:
-            fingerprint.update(filename.encode() + b"\0" + (FIRMWARE_DIR / filename).read_bytes())
+            fingerprint.update(filename.encode() + b"\0" + runtime_bytes[filename])
         add("BUILD_INFO.json", json.dumps({
             "package_schema": 2,
             "runtime_files": runtime_files,
@@ -835,10 +961,11 @@ def build_provisioning_zip(
         for filename in SYSTEMD_FILES:
 
             source = FIRMWARE_DIR / filename
+            data = service_copies["systemd/ems-controller.service"] if filename == "ems-controller.service" else source.read_bytes()
 
             add(
                 f"systemd/{filename}",
-                source.read_bytes(),
+                data,
             )
 
         # Written last so install.sh can `sha256sum -c` every other file in the package.
