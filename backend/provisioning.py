@@ -15,14 +15,14 @@ FIRMWARE_DIR = Path(__file__).resolve().parent.parent / "pi_firmware"
 
 # The controller unit MUST run from the writable data mount with the lgpio pin factory:
 # lgpio creates its notification pipe in the working directory, and /opt/ems/pi_firmware is
-# read-only for the `pi` user. Without these lines the service crash-loops on GPIO init.
+# read-only for the service account (daulat123). Without these lines the service crash-loops on GPIO init.
 # A package is REFUSED (HTTP 500, credential NOT rotated) if the source unit lacks any of them.
 REQUIRED_SERVICE_LINES = (
     "WorkingDirectory=/mnt/ems-data",
     "Environment=GPIOZERO_PIN_FACTORY=lgpio",
 )
 
-# Field-diagnosed: any DeviceAllow= line makes lgpio fail with "can not open gpiochip" for User=pi.
+# Field-diagnosed: any DeviceAllow= line makes lgpio fail with "can not open gpiochip" for User=daulat123.
 # Device access comes from SupplementaryGroups=gpio i2c; never re-add DeviceAllow.
 FORBIDDEN_SERVICE_PREFIXES = ("DeviceAllow=",)
 
@@ -314,8 +314,9 @@ if digest.hexdigest() != info["runtime_sha256"]:
     raise SystemExit("ERROR: staged firmware fingerprint mismatch; active installation unchanged")
 PY
 
-if [[ -z "$PREFIX" ]] && getent passwd pi >/dev/null 2>&1; then
-  chown -R root:pi "$STAGE"
+# Firmware is owned by root and never writable by the service account (daulat123).
+if [[ -z "$PREFIX" ]]; then
+  chown -R root:root "$STAGE"
 fi
 
 INSTALL_STARTED=1

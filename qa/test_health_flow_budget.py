@@ -73,12 +73,19 @@ class HealthBudgetTests(unittest.TestCase):
             return [ast.dump(n) for n in ast.walk(node) if isinstance(n, ast.Call)
                     and (getattr(n.func, "attr", None) or getattr(n.func, "id", None)) in write_ops]
         self.assertEqual(calls(method(baseline_state, "PiStateManager", "_flush_to_disk")), calls(method(current_state, "PiStateManager", "_flush_to_disk")))
-        for path in ("pi_firmware/resource_guard.py", "pi_firmware/storage_io_manager.py", "pi_firmware/storage_manager.py", "pi_firmware/config.py", "pi_firmware/ems-controller.service"):
+        for path in ("pi_firmware/resource_guard.py", "pi_firmware/storage_io_manager.py", "pi_firmware/storage_manager.py", "pi_firmware/config.py"):
             # Semantic source freeze. Git stores LF; a Windows checkout is CRLF.
             # Exact checkout bytes are not the cadence contract.
             old = blob(BASELINE, path).encode("utf-8")
             current = (ROOT / path).read_bytes().replace(b"\r\n", b"\n")
             self.assertEqual(old, current, path)
+        # Approved service-account change (daulat123 replaces the removed pi account).
+        # Only these two lines may differ from the frozen baseline; everything else stays frozen.
+        old_unit = blob(BASELINE, "pi_firmware/ems-controller.service").replace("\r\n", "\n")
+        current_unit = (ROOT / "pi_firmware/ems-controller.service").read_bytes().decode("utf-8").replace("\r\n", "\n")
+        approved_unit = old_unit.replace("\nUser=pi\nGroup=pi\n", "\nUser=daulat123\nGroup=daulat123\n")
+        self.assertNotEqual(old_unit, approved_unit, "baseline no longer contains the pi account lines")
+        self.assertEqual(approved_unit, current_unit, "ems-controller.service differs from baseline beyond the approved daulat123 User/Group change")
         old_controller = ast.parse(blob(BASELINE, "pi_firmware/ems_controller.py"))
         current_controller = ast.parse((ROOT / "pi_firmware/ems_controller.py").read_text(encoding="utf-8"))
         qualified_controller = ast.parse(blob(QUALIFICATION_SHA, "pi_firmware/ems_controller.py"))

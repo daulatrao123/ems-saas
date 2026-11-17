@@ -61,8 +61,8 @@ check("firmware download validates device credentials", "authenticate_pi({}, x_d
 check("feedback capability is enforced in dashboard", 'bool(c["feedback_enabled"]) and bool(dev["feedback_hardware_installed"])' in backend)
 check("storage device is explicit", "EMS_DATA_DEVICE" in setup)
 check("setup never formats the data device", "NO FORMAT OPERATION WILL BE PERFORMED" in setup)
-check("data mount permissions are root:pi 0770", "chown root:pi" in setup and "chmod 0770" in setup)
-check("systemd service runs as pi", "User=pi" in unit and "Group=pi" in unit)
+check("data mount permissions are root:daulat123 0770", "chown root:\"$EMS_GROUP\"" in setup and "EMS_GROUP=\"daulat123\"" in setup and "chmod 0770" in setup)
+check("systemd service runs as daulat123", "User=daulat123" in unit and "Group=daulat123" in unit)
 check("systemd requires EMS data mount", "RequiresMountsFor=/mnt/ems-data" in unit)
 # ---- member read-only invariant: structural evidence, not UI wording -------------------------------------
 # Member page -> OperationalDashboard(readOnly) -> useOperations (the only write surface). We prove:

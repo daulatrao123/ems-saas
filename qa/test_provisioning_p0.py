@@ -102,6 +102,18 @@ class ProvisioningP0Tests(unittest.TestCase):
         self.assertIn('INSTALL_SUCCESS=1', shell)
         self.assertLess(shell.index('mv "$STAGE" "$FW_DST"'), shell.index('"$HERE/ems-controller.env" \\\n  "$ENV_DST"'))
 
+    def test_installer_ownership_and_service_account_match_daulat123(self):
+        shell = self.archive.read(package.ROOT + "/install.sh").decode()
+        unit = self.archive.read(package.ROOT + "/systemd/ems-controller.service").decode()
+        # The Pi has no 'pi' account: the staged firmware must be root:root, never root:pi.
+        self.assertIn('chown -R root:root "$STAGE"', shell)
+        self.assertNotIn("root:pi", shell)
+        self.assertNotIn("getent passwd pi", shell)
+        # The controller runs as the existing daulat123 account, not pi.
+        self.assertIn("User=daulat123", unit.splitlines())
+        self.assertIn("Group=daulat123", unit.splitlines())
+        self.assertNotIn("User=pi", unit.splitlines())
+
     def test_storage_policy_and_findmnt_fail_closed(self):
         preflight.check_storage("ext4", "uuid-a", "uuid-a")
         for fs, actual, configured in (("", "a", "a"), ("vfat", "a", "a"), ("ext4", "", "a"),

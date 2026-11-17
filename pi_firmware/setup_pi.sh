@@ -21,8 +21,14 @@ fi
 
 UUID="$(blkid -s UUID -o value "$DEVICE" 2>/dev/null || true)"
 FSTYPE="$(blkid -s TYPE -o value "$DEVICE" 2>/dev/null || true)"
-if ! getent group pi >/dev/null 2>&1; then
-  echo "ERROR: required OS group 'pi' does not exist." >&2
+EMS_USER="daulat123"
+EMS_GROUP="daulat123"
+if ! getent passwd "$EMS_USER" >/dev/null 2>&1; then
+  echo "ERROR: required OS account '$EMS_USER' does not exist." >&2
+  exit 4
+fi
+if ! getent group "$EMS_GROUP" >/dev/null 2>&1; then
+  echo "ERROR: required OS group '$EMS_GROUP' does not exist." >&2
   exit 4
 fi
 
@@ -57,13 +63,13 @@ RuntimeMaxUse=10M
 ForwardToSyslog=no
 EOF
 
-# Service runs as pi and therefore needs group-write access.
-chown root:pi "$DATA_MOUNT"
+# Service runs as daulat123 and therefore needs group-write access.
+chown root:"$EMS_GROUP" "$DATA_MOUNT"
 chmod 0770 "$DATA_MOUNT"
 
 install -m 0644 "$(dirname "$0")/ems-controller.service" /etc/systemd/system/ems-controller.service
 # Reboot-on-request: root-owned path unit runs a FIXED `systemctl reboot` when the controller
-# (user pi, NoNewPrivileges) drops the content-free marker /mnt/ems-data/reboot.request.
+# (user daulat123, NoNewPrivileges) drops the content-free marker /mnt/ems-data/reboot.request.
 install -m 0644 "$(dirname "$0")/ems-reboot.path" /etc/systemd/system/ems-reboot.path
 install -m 0644 "$(dirname "$0")/ems-reboot.service" /etc/systemd/system/ems-reboot.service
 systemctl daemon-reload

@@ -6,8 +6,8 @@ RequiresMountsFor=/mnt/ems-data
 
 [Service]
 Type=simple
-User=pi
-Group=pi
+User=daulat123
+Group=daulat123
 SupplementaryGroups=gpio i2c
 
 WorkingDirectory=/mnt/ems-data

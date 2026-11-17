@@ -33,8 +33,8 @@ def main():
     if "status IN ('EXECUTING', 'HARDWARE_VERIFIED', 'UNKNOWN_AFTER_REBOOT')" not in queue: fail("reboot recovery set missing")
     if 'status=\'DELIVERED\'' not in queue or 'UNKNOWN_AFTER_REBOOT' not in queue: fail("normal queue safety markers missing")
     if 'persist EXECUTING before touching hardware' not in controller: fail("pre-hardware persistence safety invariant missing")
-    if 'User=pi' not in (ROOT / "pi_firmware/ems-controller.service").read_text(): fail("least privilege service missing")
-    if 'Group=pi' not in (ROOT / "pi_firmware/ems-controller.service").read_text(): fail("least privilege group missing")
+    if 'User=daulat123' not in (ROOT / "pi_firmware/ems-controller.service").read_text(): fail("least privilege service missing")
+    if 'Group=daulat123' not in (ROOT / "pi_firmware/ems-controller.service").read_text(): fail("least privilege group missing")
     if 'EMS_DATA_DEVICE' not in (ROOT / "pi_firmware/setup_pi.sh").read_text(): fail("explicit data device provisioning missing")
     print("PASS: 6.5.0 static industrial hardening invariants")
 
